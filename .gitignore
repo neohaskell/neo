@@ -1,1 +1,4 @@
 /target
+.cargo_check.log
+.cargo_test.log
+test-project/

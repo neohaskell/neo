@@ -1,17 +1,31 @@
 use crate::output::OutputMode;
 use crate::prereqs;
 use crate::config::NeoConfig;
+use crate::subprocess::nix;
+use crate::commands::watch_common;
 
-pub async fn run(_watch: bool, output_mode: &mut OutputMode) -> miette::Result<()> {
+pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()> {
     prereqs::require_nix().await?;
     prereqs::warn_direnv(output_mode).await;
     
-    let _config = NeoConfig::load("neo.json")?;
+    let config = NeoConfig::load("neo.json")?;
     
     if output_mode.is_ci() {
-        println!("[info] Running build");
+        println!("[info] Reconciling project artifacts...");
+    }
+    crate::reconcile::run(".", &config).await?;
+    
+    if watch {
+        watch_common::run_watch("build", output_mode).await?;
     } else {
-        println!("Running build");
+        if output_mode.is_ci() {
+            println!("[info] Running build...");
+        }
+        nix::build(output_mode).await?;
+        
+        if output_mode.is_ci() {
+            println!("[ok] Build successful");
+        }
     }
     
     Ok(())

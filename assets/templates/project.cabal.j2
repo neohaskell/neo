@@ -1,0 +1,26 @@
+cabal-version:      3.0
+name:               {{ name }}
+version:            {{ version }}
+{% if description %}description:        {{ description }}{% endif %}
+license:            {{ license }}
+author:             {{ author }}
+category:           Development
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+executable {{ name }}
+    import:           warnings
+    main-is:          Main.hs
+    other-modules:
+{% for module in modules %}
+        {{ module }}
+{% endfor %}
+    build-depends:
+        base ^>=4.17.2.1,
+{% for dep, ver in dependencies %}
+        {{ dep }} {{ ver }},
+{% endfor %}
+    hs-source-dirs:   src
+    default-language: Haskell2010

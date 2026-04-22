@@ -1,5 +1,6 @@
 use ratatui::style::{Color, Modifier, Style};
 
+#[derive(Clone)]
 pub struct Theme {
     pub primary: Color,
     pub success: Color,
@@ -53,5 +54,37 @@ impl Theme {
 
     pub fn style_accent(&self) -> Style {
         Style::default().fg(self.accent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_neo_theme_colors() {
+        let theme = Theme::neo();
+        assert_eq!(theme.primary, Color::from_u32(0x0050E0D0));
+        assert_eq!(theme.success, Color::from_u32(0x0066D96E));
+        assert_eq!(theme.error, Color::from_u32(0x00FF6B6B));
+    }
+
+    #[test]
+    fn test_theme_styles() {
+        let theme = Theme::neo();
+        
+        let error_style = theme.style_error();
+        assert_eq!(error_style.fg, Some(theme.error));
+        assert!(error_style.add_modifier.contains(Modifier::BOLD));
+
+        let success_style = theme.style_success();
+        assert_eq!(success_style.fg, Some(theme.success));
+        assert!(success_style.add_modifier.contains(Modifier::BOLD));
+
+        assert_eq!(theme.style_primary().fg, Some(theme.primary));
+        assert_eq!(theme.style_accent().fg, Some(theme.accent));
+        assert_eq!(theme.style_muted().fg, Some(theme.muted));
+        assert_eq!(theme.style_text().fg, Some(theme.text));
+        assert_eq!(theme.style_warning().fg, Some(theme.warning));
     }
 }

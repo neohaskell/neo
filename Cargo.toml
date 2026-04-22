@@ -35,6 +35,7 @@ nucleo = "0.5"
 
 # File watching
 notify = "7"
+walkdir = "2"
 
 # Semver
 semver = "1"
@@ -45,6 +46,7 @@ minijinja = "2"
 # Archive
 flate2 = "1"
 tar = "0.4"
+tempfile = "3"
 
 # Git
 gix = { version = "0.70", default-features = false, features = ["basic", "index"] }
@@ -53,4 +55,3 @@ gix = { version = "0.70", default-features = false, features = ["basic", "index"
 insta = { version = "1", features = ["yaml"] }
 assert_cmd = "2"
 predicates = "3"
-tempfile = "3"

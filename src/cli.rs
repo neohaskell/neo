@@ -62,4 +62,60 @@ pub struct LockArgs {
 pub enum LockSubcommand {
     /// Install the git pre-commit lock hook
     Install,
+    /// Check if any locked files are being committed (used by pre-commit hook)
+    Check,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_parse_new() {
+        let cli = Cli::try_parse_from(["neo", "new", "my-project"]).unwrap();
+        match cli.command {
+            Some(Commands::New { project_name }) => assert_eq!(project_name, Some("my-project".into())),
+            _ => panic!("Expected New command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ci_flag() {
+        let cli = Cli::try_parse_from(["neo", "--ci", "build"]).unwrap();
+        assert!(cli.ci);
+        match cli.command {
+            Some(Commands::Build { .. }) => (),
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_run() {
+        let cli = Cli::try_parse_from(["neo", "run", "--watch"]).unwrap();
+        match cli.command {
+            Some(Commands::Run { watch }) => assert!(watch),
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_test() {
+        let cli = Cli::try_parse_from(["neo", "test"]).unwrap();
+        match cli.command {
+            Some(Commands::Test { watch }) => assert!(!watch),
+            _ => panic!("Expected Test command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_lock() {
+        let cli = Cli::try_parse_from(["neo", "lock", "MyDomain"]).unwrap();
+        match cli.command {
+            Some(Commands::Lock(args)) => {
+                assert_eq!(args.search, Some("MyDomain".to_string()));
+            }
+            _ => panic!("Expected Lock command"),
+        }
+    }
 }

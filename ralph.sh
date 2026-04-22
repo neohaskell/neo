@@ -10,7 +10,11 @@ while [ $ITER -le $MAX_ITER ]; do
     echo "🔄 Iteration $ITER / $MAX_ITER"
     echo "========================================"
     
-    # 1. Run the agent
+    # 1. Verify Test Coverage
+    echo "🕵️  [Agent] Verifying test coverage for completed tasks..."
+    gemini -p "Please review STATE.md and verify that all completed features have comprehensive unit tests and integration tests. If any tests are missing for what has been implemented, write them now and verify they pass with 'cargo test'." --approval-mode yolo
+
+    # 2. Run the agent
     echo "🤖 [Agent] Executing workflow..."
     
     if [ -f .test_failures.log ]; then
@@ -21,7 +25,11 @@ while [ $ITER -le $MAX_ITER ]; do
         gemini -p "Please execute the workflow defined in AGENTS.md. Read the current STATE.md and NEXT_STEP.md, implement the changes according to IMPLEMENTATION_PLAN.md, and then update STATE.md and NEXT_STEP.md." --approval-mode yolo
     fi
     
-    # 2. Verify / Test
+    # 3. Implement Tests
+    echo "🤖 [Agent] Implementing tests..."
+    gemini -p "Please implement comprehensive unit tests and integration tests for the features you just built. Verify they run locally using 'cargo test'." --approval-mode yolo
+    
+    # 4. Verify / Test
     echo "🧪 [Test] Verifying build and tests..."
     
     # We run the tests and capture output

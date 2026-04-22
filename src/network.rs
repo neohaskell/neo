@@ -1,0 +1,179 @@
+use std::collections::HashMap;
+use std::path::Path;
+use miette::IntoDiagnostic;
+use serde::Deserialize;
+use semver::Version;
+use crate::errors::NeoError;
+
+#[derive(Debug, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCommit {
+    sha: String,
+}
+
+pub async fn fetch_neo_sha(version: &str) -> miette::Result<String> {
+    if std::env::var("NEO_SKIP_NETWORK").is_ok() {
+        return Ok("deadbeef".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("NeoCLI")
+        .build()
+        .map_err(NeoError::NetworkError)?;
+
+    // If version is "latest", fetch the default branch's latest commit
+    // Otherwise, try to fetch the tag
+    let url = if version == "latest" || version == "main" {
+        "https://api.github.com/repos/NeoHaskell/NeoHaskell/commits/main".to_string()
+    } else {
+        format!("https://api.github.com/repos/NeoHaskell/NeoHaskell/commits/{}", version)
+    };
+
+    let response = client.get(&url).send().await.map_err(NeoError::NetworkError)?;
+    if !response.status().is_success() {
+        return Err(NeoError::GitError(format!("Failed to fetch NeoHaskell SHA for version {}: {}", version, response.status())).into());
+    }
+
+    let commit: GitHubCommit = response.json().await.into_diagnostic()?;
+    Ok(commit.sha)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NeoPackages {
+    pub packages: HashMap<String, NeoPackageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NeoPackageMetadata {
+    pub description: String,
+    pub repository: String,
+    pub versions: HashMap<String, NeoPackageVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct NeoPackageVersion {
+    pub sha: String,
+    pub tag: String,
+}
+
+pub async fn fetch_package_registry() -> miette::Result<NeoPackages> {
+    if std::env::var("NEO_SKIP_NETWORK").is_ok() {
+        return Ok(NeoPackages {
+            packages: HashMap::new(),
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("NeoCLI")
+        .build()
+        .map_err(NeoError::NetworkError)?;
+
+    let url = "https://raw.githubusercontent.com/NeoHaskell/packages/main/registry.json";
+    let response = client.get(url).send().await.map_err(NeoError::NetworkError)?;
+    
+    if !response.status().is_success() {
+        return Ok(NeoPackages { packages: HashMap::new() });
+    }
+
+    let registry: NeoPackages = response.json().await.into_diagnostic()?;
+    Ok(registry)
+}
+
+pub async fn check_for_updates() -> miette::Result<Option<String>> {
+    if std::env::var("NEO_SKIP_NETWORK").is_ok() {
+        return Ok(None);
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("NeoCLI")
+        .build()
+        .map_err(NeoError::NetworkError)?;
+
+    let url = "https://api.github.com/repos/NeoHaskell/neocli/releases/latest";
+    let response = client.get(url).send().await.map_err(NeoError::NetworkError)?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let release: GitHubRelease = response.json().await.into_diagnostic()?;
+    let latest_version_str = release.tag_name.trim_start_matches('v');
+    let latest_version = Version::parse(latest_version_str).into_diagnostic()?;
+    
+    let current_version = Version::parse(env!("CARGO_PKG_VERSION")).into_diagnostic()?;
+
+    if latest_version > current_version {
+        Ok(Some(latest_version.to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn fetch_starter_template(dest: &Path) -> miette::Result<()> {
+    if std::env::var("NEO_SKIP_NETWORK").is_ok() {
+        // Create a dummy src/Main.hs for tests
+        let src_dir = dest.join("src");
+        std::fs::create_dir_all(&src_dir).into_diagnostic()?;
+        std::fs::write(
+            src_dir.join("Main.hs"),
+            "module Main where\n\nmain :: IO ()\nmain = putStrLn \"Hello, Neo!\"\n",
+        )
+        .into_diagnostic()?;
+        return Ok(());
+    }
+
+    let url = "https://github.com/NeoHaskell/neo-starter/archive/refs/heads/main.tar.gz";
+    
+    let client = reqwest::Client::builder()
+        .user_agent("NeoCLI")
+        .build()
+        .map_err(NeoError::NetworkError)?;
+
+    let response = client.get(url).send().await.map_err(NeoError::NetworkError)?;
+    let bytes = response.bytes().await.into_diagnostic()?;
+    
+    let tar_gz = flate2::read::GzDecoder::new(&bytes[..]);
+    let mut archive = tar::Archive::new(tar_gz);
+    
+    // The tarball has a top-level directory like "neo-starter-main/"
+    // We want to extract its contents into dest
+    let temp_dir = tempfile::tempdir().into_diagnostic()?;
+    archive.unpack(temp_dir.path()).into_diagnostic()?;
+    
+    // Move contents from temp_dir/neo-starter-main/* to dest/
+    let entries = std::fs::read_dir(temp_dir.path()).into_diagnostic()?;
+    let first_entry = entries.into_iter().next().ok_or_else(|| miette::miette!("Empty tarball"))?.into_diagnostic()?;
+    let root_path = first_entry.path();
+    
+    for entry in std::fs::read_dir(root_path).into_diagnostic()? {
+        let entry = entry.into_diagnostic()?;
+        let file_name = entry.file_name();
+        let dest_path = dest.join(file_name);
+        std::fs::rename(entry.path(), dest_path).into_diagnostic()?;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_check_for_updates() {
+        unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
+        let _ = check_for_updates().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_starter_template() {
+        unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
+        let dir = tempdir().unwrap();
+        fetch_starter_template(dir.path()).await.unwrap();
+        assert!(dir.path().join("src/Main.hs").exists());
+    }
+}

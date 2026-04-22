@@ -2408,6 +2408,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-big-text",
+ "walkdir",
 ]
 
 [[package]]

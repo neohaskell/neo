@@ -22,3 +22,22 @@ impl<'a> Widget for Mascot<'a> {
         Paragraph::new(text).render(area, buf);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn test_mascot_render() {
+        let theme = Theme::neo();
+        let widget = Mascot::new(&theme);
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        
+        // Check that something was rendered (non-empty cells)
+        let non_empty = buf.content().iter().filter(|c| c.symbol() != " ").count();
+        assert!(non_empty > 0);
+    }
+}

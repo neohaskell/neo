@@ -29,6 +29,14 @@ pub enum NeoError {
     )]
     NixNotFound,
 
+    #[error("Git is required but not found")]
+    #[diagnostic(
+        code(neo::git_missing),
+        url("https://git-scm.com/downloads"),
+        help("Install Git: https://git-scm.com/downloads")
+    )]
+    GitNotFound,
+
     #[error("Failed to fetch the starter template")]
     #[diagnostic(
         code(neo::network),
@@ -43,8 +51,44 @@ pub enum NeoError {
     #[error("Git error: {0}")]
     #[diagnostic(code(neo::git_error))]
     GitError(String),
+
+    #[error("Template error: {0}")]
+    #[diagnostic(code(neo::template_error))]
+    TemplateError(String),
     
-    #[error("Subprocess execution failed: {0}")]
-    #[diagnostic(code(neo::subprocess))]
-    SubprocessError(String),
+    #[error("Subprocess execution failed: {command}")]
+    #[diagnostic(
+        code(neo::subprocess),
+        help("Check the output above for more details.")
+    )]
+    SubprocessError { command: String, output: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_messages() {
+        let err = NeoError::NoWorkspace;
+        assert!(err.to_string().contains("No `neo.json` found"));
+
+        let err = NeoError::DirectoryExists { name: "test".to_string() };
+        assert!(err.to_string().contains("Directory `test` already exists"));
+
+        let err = NeoError::InvalidConfig { line: 10, col: 5, reason: "unexpected comma".to_string() };
+        assert_eq!(err.to_string(), "Failed to parse `neo.json` at line 10, column 5: unexpected comma");
+
+        let err = NeoError::NixNotFound;
+        assert_eq!(err.to_string(), "Nix is required but not found");
+
+        let err = NeoError::SubprocessError { 
+            command: "fail".to_string(), 
+            output: "some output".to_string() 
+        };
+        assert_eq!(err.to_string(), "Subprocess execution failed: fail");
+
+        let err = NeoError::GitError("git failed".to_string());
+        assert_eq!(err.to_string(), "Git error: git failed");
+    }
 }
