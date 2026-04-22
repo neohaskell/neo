@@ -49,6 +49,7 @@ fn test_neo_new_ci() {
     // Verify neo.json content
     let config_content = std::fs::read_to_string(project_path.join("neo.json")).unwrap();
     assert!(config_content.contains(project_name));
+    assert!(config_content.contains("\"neo-version\": \"main\""));
 }
 
 #[test]

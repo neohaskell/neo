@@ -53,7 +53,7 @@ mod tests {
         let json = r#"{
             "name": "test-project",
             "version": "0.1.0",
-            "neo-version": "0.1.0",
+            "neo-version": "main",
             "description": "A test project",
             "author": "NeoHaskell Team",
             "license": "MIT",
@@ -67,7 +67,7 @@ mod tests {
         let config = NeoConfig::load(file.path()).unwrap();
         assert_eq!(config.name, "test-project");
         assert_eq!(config.version, "0.1.0");
-        assert_eq!(config.neo_version, "0.1.0");
+        assert_eq!(config.neo_version, "main");
         assert_eq!(config.description, Some("A test project".to_string()));
         assert_eq!(config.author, Some("NeoHaskell Team".to_string()));
         assert_eq!(config.license, "MIT");
@@ -82,7 +82,7 @@ mod tests {
         let json = r#"{
             "name": "test-project",
             "version": "0.1.0",
-            "neo-version": "0.1.0"
+            "neo-version": "main"
         }"#;
         file.write_all(json.as_bytes()).unwrap();
 
@@ -97,7 +97,7 @@ mod tests {
         let json = r#"{
             "name": "test-project",
             "version": "0.1.0",
-            "neo-version": "0.1.0",
+            "neo-version": "main",
             "unknown_field": "some value"
         }"#;
         file.write_all(json.as_bytes()).unwrap();

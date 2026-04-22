@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    neo.url = "github:NeoHaskell/neo/{{ neo_sha }}";
+    neo.url = "https://github.com/NeoHaskell/neo/archive/{{ neo_sha }}.tar.gz";
   };
 
   outputs = { self, nixpkgs, flake-utils, neo }:

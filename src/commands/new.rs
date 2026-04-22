@@ -30,7 +30,7 @@ impl Default for ProjectConfig {
         Self {
             name: "my-neo-app".to_string(),
             version: "0.1.0".to_string(),
-            neo_version: "0.1.0".to_string(),
+            neo_version: "main".to_string(),
             description: "A new NeoHaskell project".to_string(),
             author: "Anonymous".to_string(),
             license: "MIT".to_string(),
@@ -429,7 +429,7 @@ mod tests {
         let action = state.update(event.clone()).unwrap();
         assert!(matches!(action, Action::Continue));
         assert_eq!(state.current_step, Step::Version);
-        assert_eq!(state.input_buffer, "0.1.0");
+        assert_eq!(state.input_buffer, "0.1.0"); // This is project version, which is still 0.1.0
 
         // Transition to Description
         let action = state.update(event.clone()).unwrap();

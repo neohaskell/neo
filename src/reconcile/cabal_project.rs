@@ -55,7 +55,7 @@ mod tests {
         let config = ResolvedConfig {
             name: "test-project".to_string(),
             version: "0.1.0".to_string(),
-            neo_version: "0.1.0".to_string(),
+            neo_version: "main".to_string(),
             neo_sha: "abc1234".to_string(),
             description: None,
             author: None,

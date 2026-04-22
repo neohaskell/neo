@@ -1,62 +1,106 @@
 #!/usr/bin/env bash
 
+# ralph.sh - The Manual Testing Focused Development Loop
+# Usage: ./ralph.sh [max_iterations]
+
 MAX_ITER="${1:-10}"
 ITER=1
 
-echo "🚀 Starting RALPH Loop (Max iterations: $MAX_ITER)"
+echo "🚀 Starting RALPH Loop (Manual Testing Focus)"
+echo "📍 Max iterations: $MAX_ITER"
 
 while [ $ITER -le $MAX_ITER ]; do
-    echo "========================================"
+    echo ""
+    echo "================================================================================"
     echo "🔄 Iteration $ITER / $MAX_ITER"
-    echo "========================================"
-    
-    # 1. Verify Test Coverage
-    echo "🕵️  [Agent] Verifying test coverage for completed tasks..."
-    gemini -p "Please review STATE.md and verify that all completed features have comprehensive unit tests and integration tests. If any tests are missing for what has been implemented, write them now and verify they pass with 'cargo test'." --approval-mode yolo
+    echo "================================================================================"
+
+    # 1. Prepare Prompt
+    # We check if there were previous failures to prioritize fixing them
+    if [ -f .test_failures.log ]; then
+        EXTRA_INSTRUCTION="The previous iteration had automated test failures. Please read .test_failures.log and FIX them first. Then proceed with the manual testing workflow."
+    else
+        EXTRA_INSTRUCTION="Focus on the current goal in NEXT_STEP.md."
+    fi
+
+    echo "🤖 [Agent] Invoking Ralph..."
 
     # 2. Run the agent
-    echo "🤖 [Agent] Executing workflow..."
+    # We use tee to capture output for the "HUMAN_ASSISTANCE_REQUIRED" check
+    gemini -m gemini-3-flash -p "
+    You are Ralph, an autonomous coding agent. 
+    Follow the workflow in AGENTS.md strictly.
     
-    if [ -f .test_failures.log ]; then
-        echo "⚠️ Found test failures from previous iteration. Asking agent to fix them."
-        gemini -p "The previous build/tests failed. Please read .test_failures.log, fix the issues in the code, and then verify with 'cargo check' and 'cargo test'. Continue following the standard workflow in AGENTS.md." --approval-mode yolo
-        rm .test_failures.log
-    else
-        gemini -p "Please execute the workflow defined in AGENTS.md. Read the current STATE.md and NEXT_STEP.md, implement the changes according to IMPLEMENTATION_PLAN.md, and then update STATE.md and NEXT_STEP.md." --approval-mode yolo
+    PRIMARY FOCUS: 
+    Test the CLI manually by hand in a shell. Run 'cargo run -- <command>' and verify the behavior, TUI, and side effects. 
+    Fix any bugs you find during this process immediately. 
+    Do not stop until the CLI works as expected for the current task.
+    
+    $EXTRA_INSTRUCTION
+    
+    Current Task (from NEXT_STEP.md):
+    $(cat NEXT_STEP.md)
+    
+    IMPORTANT: 
+    If you find a bug that requires human design decisions, or if you are stuck, 
+    you MUST include the string 'HUMAN_ASSISTANCE_REQUIRED' in your response and explain why.
+    " --approval-mode yolo 2>&1 | tee .agent_output.log
+
+    # 3. Check for Human Assistance Flag
+    if grep -q "HUMAN_ASSISTANCE_REQUIRED" .agent_output.log; then
+        echo ""
+        echo "⚠️  [STOP] Ralph has requested human assistance."
+        echo "Please review the output above and provide guidance."
+        rm .agent_output.log
+        exit 0
     fi
+    # We keep .agent_output.log for a bit longer to check for completion
+
+    # 4. Automated Safety Net
+    echo "🧪 [Verify] Running automated checks..."
     
-    # 3. Implement Tests
-    echo "🤖 [Agent] Implementing tests..."
-    gemini -p "Please implement comprehensive unit tests and integration tests for the features you just built. Verify they run locally using 'cargo test'." --approval-mode yolo
+    cargo check > .cargo_check.log 2>&1
+    CHECK_STATUS=$?
     
-    # 4. Verify / Test
-    echo "🧪 [Test] Verifying build and tests..."
-    
-    # We run the tests and capture output
-    if cargo check > .cargo_check.log 2>&1 && cargo test > .cargo_test.log 2>&1; then
-        echo "✅ Tests passed!"
-        rm -f .cargo_check.log .cargo_test.log
+    cargo test > .cargo_test.log 2>&1
+    TEST_STATUS=$?
+
+    if [ $CHECK_STATUS -eq 0 ] && [ $TEST_STATUS -eq 0 ]; then
+        echo "✅ Build and automated tests passed!"
+        rm -f .cargo_check.log .cargo_test.log .test_failures.log
         
-        # Check if the agent marked the task as done
-        # Heuristic: if NEXT_STEP.md contains "done" or "complete"
-        # We can just let it loop, or break if NEXT_STEP.md is empty or explicitly says "DONE"
-        if grep -q -i "^done" NEXT_STEP.md; then
-            echo "🎉 Agent indicated completion in NEXT_STEP.md. Exiting RALPH loop."
+        # Check if the agent marked the entire project as done
+        if grep -q "ALL_TASKS_COMPLETED" NEXT_STEP.md || grep -q "ALL_TASKS_COMPLETED" .agent_output.log; then
+            echo "🎉 ALL TASKS COMPLETED! Exiting RALPH loop."
             break
         fi
+
+        # Heuristic: If NEXT_STEP.md no longer has any unchecked tasks [ ]
+        # (Assuming the agent follows the checkbox convention)
+        if grep -q "\[ \]" NEXT_STEP.md; then
+            echo "⏭️  Moving to next task in NEXT_STEP.md..."
+        else
+            # If there are no checkboxes at all, but it says 'done'
+            if grep -q -i "done" NEXT_STEP.md; then
+                 echo "🎉 Task marked as done. Exiting RALPH loop."
+                 break
+            fi
+        fi
     else
-        echo "❌ Tests failed! Saving logs for the next iteration to fix."
+        echo "❌ Automated checks failed. Logs saved for next iteration."
         cat .cargo_check.log .cargo_test.log > .test_failures.log
         rm -f .cargo_check.log .cargo_test.log
         
-        echo "--- Test Failure Output ---"
-        cat .test_failures.log
-        echo "---------------------------"
+        echo "--- Error Snippet ---"
+        tail -n 20 .test_failures.log
+        echo "--------------------"
     fi
-    
+
     ITER=$((ITER + 1))
-    echo "⏳ Waiting a moment before the next iteration..."
+    rm -f .agent_output.log
+    echo "⏳ Cooling down (2s)..."
     sleep 2
 done
 
+echo ""
 echo "🏁 RALPH Loop finished."

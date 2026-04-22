@@ -10,36 +10,37 @@ struct GitHubRelease {
     tag_name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct GitHubCommit {
-    sha: String,
-}
+
 
 pub async fn fetch_neo_sha(version: &str) -> miette::Result<String> {
     if std::env::var("NEO_SKIP_NETWORK").is_ok() {
         return Ok("deadbeef".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent("NeoCLI")
-        .build()
-        .map_err(NeoError::NetworkError)?;
-
-    // If version is "latest", fetch the default branch's latest commit
-    // Otherwise, try to fetch the tag
-    let url = if version == "latest" || version == "main" {
-        "https://api.github.com/repos/NeoHaskell/NeoHaskell/commits/main".to_string()
+    let target = if version == "latest" || version == "main" {
+        "main"
     } else {
-        format!("https://api.github.com/repos/NeoHaskell/NeoHaskell/commits/{}", version)
+        version
     };
 
-    let response = client.get(&url).send().await.map_err(NeoError::NetworkError)?;
-    if !response.status().is_success() {
-        return Err(NeoError::GitError(format!("Failed to fetch NeoHaskell SHA for version {}: {}", version, response.status())).into());
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", "https://github.com/NeoHaskell/neo", target])
+        .output()
+        .await
+        .map_err(|e| NeoError::GitError(format!("Failed to run git ls-remote: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(NeoError::GitError(format!("git ls-remote failed: {}", stderr)).into());
     }
 
-    let commit: GitHubCommit = response.json().await.into_diagnostic()?;
-    Ok(commit.sha)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| NeoError::GitError(format!("No SHA found for version {}", version)))?;
+
+    Ok(sha.to_string())
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,9 +7,14 @@ Follow this strict workflow for every session:
 1. **Read Current State**: Begin by reading `STATE.md` to understand the current progress, what has already been scaffolded, and the overall context of the project.
 2. **Execute Next Step**: Read `NEXT_STEP.md` to find your current objective and action items. This is your primary goal.
 3. **Consult Implementation Plan**: As you implement the next step, continuously reference `IMPLEMENTATION_PLAN.md` to understand the architectural rules, expected file structures, TUI guidelines, and error handling strategies. This document is your technical source of truth for *how* the feature should be implemented.
-4. **Verify Your Work**: Run `cargo check` (and `cargo test` if applicable) to ensure your implementation compiles and is structurally sound.
-5. **Update State Log**: Once you have successfully completed the tasks in `NEXT_STEP.md`, append a brief log entry to the bottom of the `STATE.md` file summarizing what you implemented, fixed, and verified. 
-6. **Determine Next Step**: Update `NEXT_STEP.md` with the subsequent logical task from `IMPLEMENTATION_PLAN.md` so the next agent session knows exactly what to pick up.
+4. **Verify Your Work**: 
+    - First, run `cargo check` to ensure your implementation compiles.
+    - Second, **test the CLI manually by hand in a shell**. Run `cargo run -- <command>` with various flags and inputs to ensure it behaves correctly and looks right (TUI).
+    - Third, run `cargo test` to ensure no regressions were introduced.
+    - If you find bugs during manual testing, fix them immediately.
+5. **Human Assistance**: If you encounter a bug that requires human design decisions, or if you are stuck and cannot resolve a problem after several attempts, explicitly state 'HUMAN_ASSISTANCE_REQUIRED' and stop.
+6. **Update State Log**: Once you have successfully completed the tasks in `NEXT_STEP.md` and verified them manually, append a brief log entry to the bottom of the `STATE.md` file.
+7. **Determine Next Step**: Update `NEXT_STEP.md` with the subsequent logical task from `IMPLEMENTATION_PLAN.md`.
 
 **Key Reminders**:
 - Adhere to the `miette` error handling conventions defined in `src/errors.rs`.

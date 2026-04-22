@@ -60,7 +60,7 @@ mod tests {
         let config = NeoConfig {
             name: "my-project".to_string(),
             version: "0.1.0".to_string(),
-            neo_version: "0.1.0".to_string(),
+            neo_version: "main".to_string(),
             description: Some("A test project".to_string()),
             author: Some("Neo".to_string()),
             license: "Apache-2.0".to_string(),

@@ -150,6 +150,12 @@ mod tests {
         
         let result = GhciSession::read_until_prompt(&mut cursor).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Error reading GHCi output"));
+        let err = result.unwrap_err();
+        if let Some(NeoError::SubprocessError { command, output }) = err.downcast_ref::<NeoError>() {
+            assert_eq!(command, "GHCi output reading");
+            assert!(output.contains("Error reading GHCi output"));
+        } else {
+            panic!("Expected NeoError::SubprocessError, got {:?}", err);
+        }
     }
 }

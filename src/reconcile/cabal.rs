@@ -54,7 +54,7 @@ mod tests {
         let config = ResolvedConfig {
             name: "test-deps".to_string(),
             version: "0.1.0".to_string(),
-            neo_version: "0.1.0".to_string(),
+            neo_version: "main".to_string(),
             neo_sha: "abc".to_string(),
             description: None,
             author: None,
@@ -88,7 +88,7 @@ mod tests {
         let config = ResolvedConfig {
             name: "test-modules".to_string(),
             version: "0.1.0".to_string(),
-            neo_version: "0.1.0".to_string(),
+            neo_version: "main".to_string(),
             neo_sha: "abc".to_string(),
             description: None,
             author: None,
