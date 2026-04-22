@@ -8,9 +8,3 @@ source-repository-package
 {% for dep in file_dependencies %}
 packages: {{ dep.path }}
 {% endfor %}
-
--- NeoHaskell Framework
-source-repository-package
-    type: git
-    location: https://github.com/NeoHaskell/neo
-    tag: {{ neo_sha }}

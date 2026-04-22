@@ -10,6 +10,8 @@ use crate::theme::Theme;
 use crate::app::{State, Action};
 use std::time::SystemTime;
 
+use crate::tui::spinner::Spinner;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchStatus {
     Running,
@@ -23,7 +25,9 @@ pub struct WatchState {
     pub output: Vec<String>,
     pub last_updated: SystemTime,
     pub command_name: String,
+    #[allow(dead_code)]
     pub should_quit: bool,
+    pub frame: usize,
 }
 
 impl WatchState {
@@ -35,6 +39,7 @@ impl WatchState {
             last_updated: SystemTime::now(),
             command_name,
             should_quit: false,
+            frame: 0,
         }
     }
 
@@ -73,9 +78,8 @@ impl State for WatchState {
         let content_area = chunks[1];
         match self.status {
             WatchStatus::Running => {
-                let p = Paragraph::new("Running...")
-                    .style(self.theme.style_primary());
-                frame.render_widget(p, content_area);
+                let spinner = Spinner::new(&self.theme, self.frame).with_label("Running...");
+                frame.render_widget(spinner, content_area);
             }
             WatchStatus::Success => {
                 let p = Paragraph::new(vec![
@@ -125,7 +129,7 @@ impl State for WatchState {
     }
 
     fn tick(&mut self) {
-        // Handle animations if any
+        self.frame += 1;
     }
 }
 

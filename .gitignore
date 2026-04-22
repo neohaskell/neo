@@ -2,3 +2,7 @@
 .cargo_check.log
 .cargo_test.log
 test-project/
+my-test-project/
+dummy/
+result
+.agent_output.log

@@ -11,7 +11,10 @@ pub enum NeoError {
     NoWorkspace,
 
     #[error("Failed to parse `neo.json` at line {line}, column {col}: {reason}")]
-    #[diagnostic(code(neo::invalid_config))]
+    #[diagnostic(
+        code(neo::invalid_config),
+        help("Verify that your neo.json follows the correct JSON schema.")
+    )]
     InvalidConfig { line: usize, col: usize, reason: String },
 
     #[error("Directory `{name}` already exists")]
@@ -45,15 +48,24 @@ pub enum NeoError {
     NetworkError(#[source] reqwest::Error),
 
     #[error("I/O error: {0}")]
-    #[diagnostic(code(neo::io_error))]
+    #[diagnostic(
+        code(neo::io_error),
+        help("Ensure you have the necessary permissions and that the disk is not full.")
+    )]
     IoError(#[from] std::io::Error),
 
     #[error("Git error: {0}")]
-    #[diagnostic(code(neo::git_error))]
+    #[diagnostic(
+        code(neo::git_error),
+        help("Make sure you are in a git repository and that git is properly configured.")
+    )]
     GitError(String),
 
     #[error("Template error: {0}")]
-    #[diagnostic(code(neo::template_error))]
+    #[diagnostic(
+        code(neo::template_error),
+        help("Check your template syntax and ensure all required variables are provided.")
+    )]
     TemplateError(String),
     
     #[error("Subprocess execution failed: {command}")]

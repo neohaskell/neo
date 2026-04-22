@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use walkdir::WalkDir;
 
 pub struct HurlResult {
+    #[allow(dead_code)]
     pub file: PathBuf,
     pub success: bool,
     pub duration: std::time::Duration,

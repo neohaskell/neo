@@ -11,11 +11,17 @@ pub struct Banner<'a> {
     pub theme: &'a Theme,
     pub title: &'a str,
     pub subtitle: &'a str,
+    pub frame: usize,
 }
 
 impl<'a> Banner<'a> {
     pub fn new(theme: &'a Theme, title: &'a str, subtitle: &'a str) -> Self {
-        Self { theme, title, subtitle }
+        Self { theme, title, subtitle, frame: 0 }
+    }
+
+    pub fn with_frame(mut self, frame: usize) -> Self {
+        self.frame = frame;
+        self
     }
 }
 
@@ -30,7 +36,7 @@ impl<'a> Widget for Banner<'a> {
             .split(area);
 
         // Render Mascot
-        let mascot = Mascot::new(self.theme);
+        let mascot = Mascot::new(self.theme).with_frame(self.frame);
         mascot.render(chunks[0], buf);
 
         // Render Title

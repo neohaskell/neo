@@ -33,6 +33,9 @@ pub async fn resolve(config: &NeoConfig) -> miette::Result<ResolvedConfig> {
     // 2. Resolve dependencies
     let mut resolved_deps = Vec::new();
     for (name, version) in &config.dependencies {
+        if name == "neo" {
+            continue;
+        }
         resolved_deps.push(resolve_dependency(name, version).await?);
     }
 
@@ -84,4 +87,33 @@ async fn resolve_dependency(name: &str, constraint: &str) -> miette::Result<Reso
         name: name.to_string(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_resolve_excludes_neo() {
+        let mut deps = HashMap::new();
+        deps.insert("base".to_string(), ">= 4.14".to_string());
+        deps.insert("neo".to_string(), "latest".to_string());
+
+        let config = NeoConfig {
+            name: "test-project".to_string(),
+            version: "0.1.0".to_string(),
+            neo_version: "main".to_string(),
+            description: None,
+            author: None,
+            license: "MIT".to_string(),
+            dependencies: deps,
+        };
+
+        unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
+        let resolved = resolve(&config).await.unwrap();
+        
+        assert_eq!(resolved.dependencies.len(), 1);
+        assert_eq!(resolved.dependencies[0].name, "base");
+    }
 }

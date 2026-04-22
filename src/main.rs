@@ -32,6 +32,16 @@ async fn main() -> miette::Result<()> {
     let mut output_mode = if is_ci {
         OutputMode::Ci
     } else {
+        // Check terminal size
+        if let Ok((cols, _)) = ratatui::crossterm::terminal::size() {
+            if cols < 60 {
+                println!("\n  {} Terminal is too narrow ({} columns).", 
+                    ratatui::style::Stylize::bold(ratatui::style::Stylize::yellow("⚠")),
+                    cols
+                );
+                println!("  NeoCLI looks best in terminals at least 60 columns wide.\n");
+            }
+        }
         OutputMode::Interactive
     };
     
@@ -48,7 +58,7 @@ async fn main() -> miette::Result<()> {
 
     let result = app::dispatch(cli.command, &mut output_mode, update_status.clone()).await;
 
-    if let Err(e) = &result {
+    if let Err(_e) = &result {
         if matches!(output_mode, OutputMode::Interactive) {
             // Just use miette's default formatting which is already nice
             // We don't need to spin up a terminal just for the error box

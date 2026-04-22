@@ -13,6 +13,42 @@ pub fn init(path: &Path) -> miette::Result<()> {
         return Err(NeoError::GitError(String::from_utf8_lossy(&output.stderr).to_string()).into());
     }
     
+    // Configure local user for tests/CI if not set
+    let _ = Command::new("git").args(["config", "user.email", "neo@example.com"]).current_dir(path).output();
+    let _ = Command::new("git").args(["config", "user.name", "NeoCLI"]).current_dir(path).output();
+    
+    Ok(())
+}
+
+pub fn add_all(path: &Path) -> miette::Result<()> {
+    let output = Command::new("git")
+        .arg("add")
+        .arg(".")
+        .current_dir(path)
+        .output()
+        .map_err(|e| NeoError::GitError(format!("Failed to execute git add: {}", e)))?;
+        
+    if !output.status.success() {
+        return Err(NeoError::GitError(String::from_utf8_lossy(&output.stderr).to_string()).into());
+    }
+    
+    Ok(())
+}
+
+pub fn commit(path: &Path, message: &str) -> miette::Result<()> {
+    let output = Command::new("git")
+        .arg("commit")
+        .arg("--no-verify")
+        .arg("-m")
+        .arg(message)
+        .current_dir(path)
+        .output()
+        .map_err(|e| NeoError::GitError(format!("Failed to execute git commit: {}", e)))?;
+        
+    if !output.status.success() {
+        return Err(NeoError::GitError(String::from_utf8_lossy(&output.stderr).to_string()).into());
+    }
+    
     Ok(())
 }
 

@@ -44,11 +44,13 @@ pub async fn fetch_neo_sha(version: &str) -> miette::Result<String> {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct NeoPackages {
     pub packages: HashMap<String, NeoPackageMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct NeoPackageMetadata {
     pub description: String,
     pub repository: String,
@@ -56,11 +58,13 @@ pub struct NeoPackageMetadata {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct NeoPackageVersion {
     pub sha: String,
     pub tag: String,
 }
 
+#[allow(dead_code)]
 pub async fn fetch_package_registry() -> miette::Result<NeoPackages> {
     if std::env::var("NEO_SKIP_NETWORK").is_ok() {
         return Ok(NeoPackages {

@@ -50,6 +50,15 @@ fn test_neo_new_ci() {
     let config_content = std::fs::read_to_string(project_path.join("neo.json")).unwrap();
     assert!(config_content.contains(project_name));
     assert!(config_content.contains("\"neo-version\": \"main\""));
+
+    // Verify git commit exists
+    let git_log = std::process::Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(&project_path)
+        .output()
+        .unwrap();
+    let log_stdout = String::from_utf8_lossy(&git_log.stdout);
+    assert!(log_stdout.contains("Initial commit from NeoCLI"));
 }
 
 #[test]

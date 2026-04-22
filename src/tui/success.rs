@@ -10,11 +10,45 @@ use crate::tui::mascot::Mascot;
 pub struct SuccessDisplay<'a> {
     theme: &'a Theme,
     message: &'a str,
+    frame: usize,
 }
+
+use miette::IntoDiagnostic;
 
 impl<'a> SuccessDisplay<'a> {
     pub fn new(theme: &'a Theme, message: &'a str) -> Self {
-        Self { theme, message }
+        Self { theme, message, frame: 0 }
+    }
+
+    pub fn with_frame(mut self, frame: usize) -> Self {
+        self.frame = frame;
+        self
+    }
+
+    pub async fn show_one_shot(
+        theme: &Theme,
+        message: &str,
+        terminal: &mut crate::output::DefaultTerminal,
+    ) -> miette::Result<()> {
+        for i in 0..25 {
+            terminal.draw(|f| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(12), // Banner
+                        Constraint::Min(0),      // Content
+                    ])
+                    .split(f.area());
+
+                let banner = crate::tui::banner::Banner::new(theme, "NEO", "Success!").with_frame(i);
+                f.render_widget(banner, chunks[0]);
+
+                let success = SuccessDisplay::new(theme, message).with_frame(i);
+                f.render_widget(success, chunks[1]);
+            }).into_diagnostic()?;
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        }
+        Ok(())
     }
 }
 
@@ -29,7 +63,7 @@ impl<'a> Widget for SuccessDisplay<'a> {
             .split(area);
 
         // Render Mascot
-        let mascot = Mascot::new(self.theme);
+        let mascot = Mascot::new(self.theme).with_frame(self.frame);
         mascot.render(chunks[0], buf);
 
         let msg_chunks = Layout::default()

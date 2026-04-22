@@ -5,10 +5,13 @@ pub struct Theme {
     pub primary: Color,
     pub success: Color,
     pub error: Color,
+    #[allow(dead_code)]
     pub warning: Color,
+    #[allow(dead_code)]
     pub info: Color,
     pub muted: Color,
     pub text: Color,
+    #[allow(dead_code)]
     pub bg: Color,
     pub accent: Color,
 }
@@ -36,6 +39,7 @@ impl Theme {
         Style::default().fg(self.success).add_modifier(Modifier::BOLD)
     }
 
+    #[allow(dead_code)]
     pub fn style_warning(&self) -> Style {
         Style::default().fg(self.warning)
     }

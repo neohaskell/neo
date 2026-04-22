@@ -73,7 +73,7 @@ pub async fn run_watch(command_name: &str, output_mode: &mut OutputMode) -> miet
                 }
             }
             // Terminal events
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {
                 if event::poll(Duration::from_millis(0)).into_diagnostic()? {
                     let event = event::read().into_diagnostic()?;
                     match state.update(event)? {

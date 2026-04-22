@@ -7,6 +7,7 @@ use ratatui::{
 use crate::theme::Theme;
 use crate::tui::mascot::Mascot;
 
+#[allow(dead_code)]
 pub struct ErrorDisplay<'a> {
     theme: &'a Theme,
     error: &'a str,
@@ -14,10 +15,12 @@ pub struct ErrorDisplay<'a> {
 }
 
 impl<'a> ErrorDisplay<'a> {
+    #[allow(dead_code)]
     pub fn new(theme: &'a Theme, error: &'a str) -> Self {
         Self { theme, error, help: None }
     }
 
+    #[allow(dead_code)]
     pub fn with_help(mut self, help: &'a str) -> Self {
         self.help = Some(help);
         self

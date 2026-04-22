@@ -27,7 +27,7 @@ while [ $ITER -le $MAX_ITER ]; do
 
     # 2. Run the agent
     # We use tee to capture output for the "HUMAN_ASSISTANCE_REQUIRED" check
-    gemini -m gemini-3-flash -p "
+    gemini -m gemini-3-flash-preview -p "
     You are Ralph, an autonomous coding agent. 
     Follow the workflow in AGENTS.md strictly.
     

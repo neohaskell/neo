@@ -1,6 +1,7 @@
 use crate::output::OutputMode;
 use crate::errors::NeoError;
 use std::process::Stdio;
+use std::collections::VecDeque;
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::theme::Theme;
@@ -53,7 +54,7 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let t = ratatui::Terminal::with_options(
             backend,
-            ratatui::TerminalOptions { viewport: ratatui::Viewport::Inline(3) }
+            ratatui::TerminalOptions { viewport: ratatui::Viewport::Inline(5) }
         ).unwrap();
         ratatui::crossterm::terminal::disable_raw_mode().unwrap();
         Some(t)
@@ -82,7 +83,7 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
     let theme = Theme::neo();
     let mut current_step = 0;
     let mut total_steps = 0;
-    let mut last_line = String::new();
+    let mut last_lines: VecDeque<String> = VecDeque::with_capacity(3);
     let mut frame = 0;
     let mut captured_output = Vec::new();
 
@@ -98,7 +99,10 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
                             current_step = c;
                             total_steps = t;
                         }
-                        last_line = line.clone();
+                        if last_lines.len() >= 3 {
+                            last_lines.pop_front();
+                        }
+                        last_lines.push_back(line.clone());
                         captured_output.push(line.clone());
                         if is_ci {
                             println!("{}", line);
@@ -114,6 +118,10 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
             result = stderr_reader.next_line(), if !stderr_done => {
                 match result {
                     Ok(Some(line)) => {
+                        if last_lines.len() >= 3 {
+                            last_lines.pop_front();
+                        }
+                        last_lines.push_back(line.clone());
                         captured_output.push(line.clone());
                         if is_ci {
                             eprintln!("{}", line);
@@ -143,11 +151,11 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
                         .constraints([
                             Constraint::Length(1), // Spinner
                             Constraint::Length(1), // Progress bar
-                            Constraint::Min(0),    // Last line
+                            Constraint::Length(3), // Last 3 lines
                         ])
                         .split(f.area());
 
-                    let spinner = Spinner::new(&theme, frame).with_label(command_str);
+                    let spinner = Spinner::new(&theme, frame);
                     f.render_widget(spinner, chunks[0]);
 
                     if total_steps > 0 {
@@ -158,7 +166,8 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
                         f.render_widget(bar, chunks[1]);
                     }
 
-                    let output = Paragraph::new(last_line.as_str()).style(theme.style_muted());
+                    let output_text = last_lines.iter().cloned().collect::<Vec<_>>().join("\n");
+                    let output = Paragraph::new(output_text).style(theme.style_muted());
                     f.render_widget(output, chunks[2]);
                 }).ok();
             }

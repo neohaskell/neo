@@ -7,17 +7,29 @@ use crate::theme::Theme;
 
 pub struct Mascot<'a> {
     theme: &'a Theme,
+    frame: usize,
 }
 
 impl<'a> Mascot<'a> {
     pub fn new(theme: &'a Theme) -> Self {
-        Self { theme }
+        Self { theme, frame: 0 }
+    }
+
+    pub fn with_frame(mut self, frame: usize) -> Self {
+        self.frame = frame;
+        self
     }
 }
 
 impl<'a> Widget for Mascot<'a> {
     fn render(self, area: Rect, buf: &mut ratatui::buffer::Buffer) {
-        let ascii_art = include_str!("../../assets/neo_mascot.txt");
+        let mut ascii_art = include_str!("../../assets/neo_mascot.txt").to_string();
+        
+        // Blink every 20 frames (approx 1.6s if 80ms)
+        if self.frame % 20 == 0 || self.frame % 20 == 1 {
+            ascii_art = ascii_art.replace(":)", "-)");
+        }
+
         let text = Text::styled(ascii_art, self.theme.style_primary());
         Paragraph::new(text).render(area, buf);
     }

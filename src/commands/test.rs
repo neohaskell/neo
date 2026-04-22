@@ -10,6 +10,7 @@ use crate::tui::spinner::Spinner;
 use crate::tui::progress::ProgressBar;
 use crate::theme::Theme;
 use ratatui::layout::{Layout, Direction, Constraint};
+use miette::IntoDiagnostic;
 
 pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()> {
     prereqs::require_nix().await?;
@@ -135,26 +136,25 @@ pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()
                 println!("  Failed:   {}", failed);
                 println!("  Duration: {:?}", total_duration);
             } else if matches!(output_mode, OutputMode::Interactive) {
-                if terminal.is_none() {
-                    ratatui::crossterm::terminal::enable_raw_mode().unwrap();
-                    let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
-                    terminal = Some(ratatui::Terminal::with_options(
-                        backend,
-                        ratatui::TerminalOptions { viewport: ratatui::Viewport::Inline(3) }
-                    ).unwrap());
-                    ratatui::crossterm::terminal::disable_raw_mode().unwrap();
-                }
-                if let Some(t) = &mut terminal {
-                    t.draw(|f| {
+                let mut terminal = ratatui::Terminal::with_options(
+                    ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+                    ratatui::TerminalOptions { viewport: ratatui::Viewport::Inline(13) }
+                ).into_diagnostic()?;
+                
+                if failed == 0 {
+                    let msg = format!("All tests passed! ({} passed in {:?})", passed, total_duration);
+                    crate::tui::success::SuccessDisplay::show_one_shot(&theme, &msg, &mut terminal).await?;
+                } else {
+                    terminal.draw(|f| {
                         use ratatui::widgets::Paragraph;
                         let summary = format!(
-                            "Tests: {} passed, {} failed\nDuration: {:?}",
+                            "Tests FAILED: {} passed, {} failed\nDuration: {:?}",
                             passed, failed, total_duration
                         );
-                        f.render_widget(Paragraph::new(summary).style(theme.style_success()), f.area());
+                        f.render_widget(Paragraph::new(summary).style(theme.style_error()), f.area());
                     }).ok();
+                    tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(3)).await;
             }
 
             if failed > 0 {

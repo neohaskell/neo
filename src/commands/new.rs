@@ -102,7 +102,7 @@ impl State for NewProjectState {
             ])
             .split(frame.area());
 
-        let banner = Banner::new(&self.theme, "NEO", "The NeoHaskell CLI");
+        let banner = Banner::new(&self.theme, "NEO", "The NeoHaskell CLI").with_frame(self.tick_count as usize);
         frame.render_widget(banner, chunks[0]);
 
         let content_chunks = Layout::default()
@@ -321,12 +321,8 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
     std::fs::write(project_path.join(".envrc"), envrc_content).map_err(crate::errors::NeoError::IoError)?;
 
     // Add all files to git so Nix flakes can see them
-    std::process::Command::new("git")
-        .arg("add")
-        .arg(".")
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| crate::errors::NeoError::GitError(format!("Failed to execute git add: {}", e)))?;
+    crate::git::add_all(&project_path)?;
+    crate::git::commit(&project_path, "Initial commit from NeoCLI")?;
 
     Ok(())
 }
@@ -361,7 +357,7 @@ async fn scaffold_project(config: ProjectConfig, output_mode: &mut OutputMode) -
                     ])
                     .split(f.area());
 
-                let banner = Banner::new(&theme, "NEO", "Scaffolding Project...");
+                let banner = Banner::new(&theme, "NEO", "Scaffolding Project...").with_frame(frame);
                 f.render_widget(banner, chunks[0]);
 
                 let spinner = Spinner::new(&theme, frame).with_label("Downloading template and initializing project...");
@@ -372,22 +368,25 @@ async fn scaffold_project(config: ProjectConfig, output_mode: &mut OutputMode) -
                 res = rx.recv() => {
                     match res {
                         Some(Ok(_)) => {
-                            terminal.draw(|f| {
-                                let chunks = Layout::default()
-                                    .direction(Direction::Vertical)
-                                    .constraints([
-                                        Constraint::Length(12), // Banner
-                                        Constraint::Min(0),      // Content
-                                    ])
-                                    .split(f.area());
+                            // Success animation loop for 2 seconds
+                            for i in 0..25 { // 25 * 80ms = 2s
+                                terminal.draw(|f| {
+                                    let chunks = Layout::default()
+                                        .direction(Direction::Vertical)
+                                        .constraints([
+                                            Constraint::Length(12), // Banner
+                                            Constraint::Min(0),      // Content
+                                        ])
+                                        .split(f.area());
 
-                                let banner = Banner::new(&theme, "NEO", "Success!");
-                                f.render_widget(banner, chunks[0]);
+                                    let banner = Banner::new(&theme, "NEO", "Success!").with_frame(frame + i);
+                                    f.render_widget(banner, chunks[0]);
 
-                                let success = SuccessDisplay::new(&theme, "Project created successfully!");
-                                f.render_widget(success, chunks[1]);
-                            }).into_diagnostic()?;
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    let success = SuccessDisplay::new(&theme, "Project created successfully!").with_frame(frame + i);
+                                    f.render_widget(success, chunks[1]);
+                                }).into_diagnostic()?;
+                                tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                            }
                             return Ok(());
                         }
                         Some(Err(e)) => return Err(e),
