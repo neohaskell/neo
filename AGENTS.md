@@ -11,7 +11,9 @@ Follow this strict workflow for every session:
     - First, run `cargo check` to ensure your implementation compiles.
     - Second, **test the CLI manually by hand in a shell**. Run `cargo run -- <command>` with various flags and inputs to ensure it behaves correctly and looks right (TUI).
     - Third, run `cargo test` to ensure no regressions were introduced.
+    - Fourth, run the **Neo-on-Neo smoke test** (if using `ralph.sh`, this is automated, but you can run it manually by creating a new project with your build and running `build` and `test` inside it).
     - If you find bugs during manual testing, fix them immediately.
+    - **IMPORTANT**: If automated tests (cargo check/test or the smoke test) fail, you MUST document the specific errors in `NEXT_STEP.md` before attempting a fix in the next iteration.
 5. **Human Assistance**: If you encounter a bug that requires human design decisions, or if you are stuck and cannot resolve a problem after several attempts, explicitly state 'HUMAN_ASSISTANCE_REQUIRED' and stop.
 6. **Update State Log**: Once you have successfully completed the tasks in `NEXT_STEP.md` and verified them manually, append a brief log entry to the bottom of the `STATE.md` file.
 7. **Determine Next Step**: Update `NEXT_STEP.md` with the subsequent logical task from `IMPLEMENTATION_PLAN.md`.
