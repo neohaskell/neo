@@ -29,3 +29,10 @@ source-repository-package
 {% for dep in file_dependencies %}
 packages: {{ dep.path }}
 {% endfor %}
+
+-- Version upper-bounds needed for compatibility with NeoHaskell core.
+-- haskell.nix pins the Hackage snapshot, but these prevent picking API-breaking
+-- versions that post-date the NeoHaskell core code at the pinned commit.
+constraints:
+  hasql < 1.10,
+  opt-env-conf < 0.11
