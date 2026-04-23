@@ -4,10 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    neo.url = "https://github.com/NeoHaskell/neo/archive/{{ neo_sha }}.tar.gz";
+    neohaskell.url = "https://github.com/NeoHaskell/neohaskell/archive/{{ neo_sha }}.tar.gz";
   };
 
-  outputs = { self, nixpkgs, flake-utils, neo }:
+  outputs = { self, nixpkgs, flake-utils, neohaskell }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -20,7 +20,7 @@
             cabal-install
             haskell-language-server
             pkgs.hurl
-            neo.packages.${system}.default
+            neohaskell.packages.${system}.default
           ];
         };
       }

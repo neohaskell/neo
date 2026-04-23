@@ -312,6 +312,26 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
     // Fetch starter template
     crate::network::fetch_starter_template(&project_path).await?;
 
+    // Ensure launcher/Launcher.hs exists
+    let launcher_dir = project_path.join("launcher");
+    if !launcher_dir.exists() {
+        std::fs::create_dir_all(&launcher_dir).map_err(crate::errors::NeoError::IoError)?;
+    }
+    let launcher_hs = launcher_dir.join("Launcher.hs");
+    if !launcher_hs.exists() {
+        let launcher_content = format!(
+            "module Main where\n\nimport App\n\nmain :: IO ()\nmain = App.run\n"
+        );
+        std::fs::write(launcher_hs, launcher_content).map_err(crate::errors::NeoError::IoError)?;
+    }
+
+    // Ensure src/App.hs exists (since Launcher.hs imports it)
+    let src_app = project_path.join("src/App.hs");
+    if !src_app.exists() {
+        let app_content = "module App where\n\nrun :: IO ()\nrun = putStrLn \"Hello from NeoHaskell!\"\n";
+        std::fs::write(src_app, app_content).map_err(crate::errors::NeoError::IoError)?;
+    }
+
     // git init
     crate::git::init(&project_path)?;
     crate::git::install_lock_hook(&project_path)?;

@@ -14,7 +14,7 @@ The NeoCLI project has completed its initial scaffolding phase. The foundational
 - **TUI**: The mascot ASCII art and a simple `Mascot` widget are implemented in `src/tui/mascot.rs`.
 
 ## Missing / Pending Components
-- **Domain Logic**: 
+- **Domain Logic**:
   - Implementation of config parsing (`src/config.rs`).
   - Network operations for downloading templates and updates (`src/network.rs`).
   - Git integration for lockhooks and repo initialization (`src/git.rs`).
@@ -47,3 +47,5 @@ The NeoCLI project has completed its initial scaffolding phase. The foundational
 - 2026-04-22: Fixed `neo build` failure in newly created projects by adding `flake.nix` to the `neocli` repository, making it a valid Nix flake. This ensures the `neo` flake input in generated projects resolves correctly. Verified with `nix build` and pushed to the remote repository. All 93 tests pass.
 - 2026-04-22: Improved `neo build` UI to hide raw command labels and display the last 3 lines of subprocess output. Increased viewport size to 5 lines. Verified with unit tests and manual CI-mode runs.
 - 2026-04-22: Excluded 'neo' from generated '.cabal' and 'cabal.project' files. Filtered 'neo' during the resolution phase and removed the hardcoded entry from the 'cabal.project' template. This ensures 'neo' is managed solely as a platform dependency via 'flake.nix'. Verified with unit and manual tests.
+- 2026-04-22: Updated `.cabal` and `cabal.project` generation to match production standards from CIOS/datalake. Introduced `common_cfg` with production extensions/options and split the project into library/executable components. Updated `neo new` scaffolding to include `launcher/Launcher.hs`. Verified with unit and integration tests.
+- 2026-04-22: Removed 'neo' from the generated `flake.nix` file and replaced it with 'neohaskell'. Updated the repository URL in `network.rs` and the flake template to point to `NeoHaskell/neohaskell` for SHA resolution and package management. Verified all tests pass.

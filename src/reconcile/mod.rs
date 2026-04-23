@@ -75,7 +75,7 @@ mod tests {
         assert!(project_dir.join("cabal.project").exists());
 
         let cabal_content = fs::read_to_string(project_dir.join("my-project.cabal")).unwrap();
-        assert!(cabal_content.contains("name:               my-project"));
+        assert!(cabal_content.contains("name: my-project"));
         assert!(cabal_content.contains("Lib"));
         assert!(cabal_content.contains("text ^>=2.0"));
 

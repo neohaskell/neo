@@ -41,7 +41,8 @@ fn test_neo_new_ci() {
     let project_path = temp.path().join(project_name);
     assert!(project_path.exists());
     assert!(project_path.join("neo.json").exists());
-    assert!(project_path.join("src/Main.hs").exists());
+    assert!(project_path.join("src/App.hs").exists());
+    assert!(project_path.join("launcher/Launcher.hs").exists());
     assert!(project_path.join(".envrc").exists());
     assert!(project_path.join(".git").exists());
     assert!(project_path.join(".git/hooks/pre-commit").exists());

@@ -24,7 +24,7 @@ pub async fn fetch_neo_sha(version: &str) -> miette::Result<String> {
     };
 
     let output = tokio::process::Command::new("git")
-        .args(["ls-remote", "https://github.com/NeoHaskell/neo", target])
+        .args(["ls-remote", "https://github.com/NeoHaskell/neohaskell", target])
         .output()
         .await
         .map_err(|e| NeoError::GitError(format!("Failed to run git ls-remote: {}", e)))?;
@@ -119,14 +119,23 @@ pub async fn check_for_updates() -> miette::Result<Option<String>> {
 
 pub async fn fetch_starter_template(dest: &Path) -> miette::Result<()> {
     if std::env::var("NEO_SKIP_NETWORK").is_ok() {
-        // Create a dummy src/Main.hs for tests
+        // Create a dummy structure for tests
         let src_dir = dest.join("src");
         std::fs::create_dir_all(&src_dir).into_diagnostic()?;
         std::fs::write(
-            src_dir.join("Main.hs"),
-            "module Main where\n\nmain :: IO ()\nmain = putStrLn \"Hello, Neo!\"\n",
+            src_dir.join("App.hs"),
+            "module App where\n\nrun :: IO ()\nrun = putStrLn \"Hello from NeoHaskell!\"\n",
         )
         .into_diagnostic()?;
+
+        let launcher_dir = dest.join("launcher");
+        std::fs::create_dir_all(&launcher_dir).into_diagnostic()?;
+        std::fs::write(
+            launcher_dir.join("Launcher.hs"),
+            "module Main where\n\nimport App\n\nmain :: IO ()\nmain = App.run\n",
+        )
+        .into_diagnostic()?;
+
         return Ok(());
     }
 
@@ -179,6 +188,7 @@ mod tests {
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
         let dir = tempdir().unwrap();
         fetch_starter_template(dir.path()).await.unwrap();
-        assert!(dir.path().join("src/Main.hs").exists());
+        assert!(dir.path().join("src/App.hs").exists());
+        assert!(dir.path().join("launcher/Launcher.hs").exists());
     }
 }
