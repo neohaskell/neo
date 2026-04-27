@@ -332,6 +332,29 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
         std::fs::write(src_app, app_content).map_err(crate::errors::NeoError::IoError)?;
     }
 
+    // Run reconciliation to generate .cabal, flake.nix, etc.
+    // This ensures these files exist and can be tracked by Git
+    let neo_config = crate::config::NeoConfig {
+        name: config.name.clone(),
+        version: config.version.clone(),
+        neo_version: config.neo_version.clone(),
+        description: if config.description.is_empty() { None } else { Some(config.description.clone()) },
+        author: if config.author.is_empty() { None } else { Some(config.author.clone()) },
+        license: config.license.clone(),
+        dependencies: std::collections::HashMap::new(),
+    };
+    crate::reconcile::run(&project_path, &neo_config).await?;
+
+    // Safeguard .gitignore: ensure *.cabal is not ignored
+    let gitignore_path = project_path.join(".gitignore");
+    if gitignore_path.exists() {
+        let mut content = std::fs::read_to_string(&gitignore_path).map_err(crate::errors::NeoError::IoError)?;
+        if !content.contains("!*.cabal") {
+            content.push_str("\n# Ensure cabal files are tracked for Nix\n!*.cabal\n");
+            std::fs::write(&gitignore_path, content).map_err(crate::errors::NeoError::IoError)?;
+        }
+    }
+
     // git init
     crate::git::init(&project_path)?;
     crate::git::install_lock_hook(&project_path)?;

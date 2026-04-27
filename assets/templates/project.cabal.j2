@@ -8,6 +8,8 @@ author: {{ author }}
 category: Development
 build-type: Simple
 
+-- This file is managed by NeoCLI and should not be modified manually.
+
 common common_cfg
   ghc-options:
     -Wall
@@ -49,9 +51,9 @@ common common_cfg
     aeson,
     bytestring,
     text,
-    uuid,
+    uuid
 {% for dep, ver in dependencies %}
-    {{ dep }} {{ ver }},
+    , {{ dep }} {{ ver }}
 {% endfor %}
 
 library
