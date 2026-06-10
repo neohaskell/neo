@@ -60,6 +60,25 @@ Either way, do not mask or `#[ignore]` these scenarios — they are the intended
 
 If you change any subcommand surface, error message, output prefix (`[info]` / `[ok]` / `[error]` / `[fail]`), or the generated project layout, look for the affected assertions in both `tests/integration_tests.rs` and `tests/e2e.rs` and update them in the same change.
 
+## Writing implementation plans
+
+When proposing a non-trivial change in plan mode, the **Tests** and **Verification** sections are not summaries — they are specifications. Treat them as a contract with the reviewer, not a TODO list. They must enumerate:
+
+1. **Happy paths** — at least one test per user-facing surface (CLI flag, JSON field, output line, generated artifact). Name each test in `snake_case` so it can be grep'd in the suite later. Prefer a table: one row per test, with input + assertion.
+2. **Edge cases** — exhaustively, organised by the component under test. Cover at minimum:
+   - empty / missing / whitespace-only inputs
+   - case sensitivity, Unicode
+   - boundary values (0, 1, max, negative)
+   - conflicting inputs (same key two ways, ambiguous prefixes)
+   - malformed inputs (bad JSON, bad semver, bad URL)
+   - network failures and degraded modes (`NEO_SKIP_NETWORK`, 404s, timeouts)
+   - idempotence (run twice → identical output) and determinism (input reordering → identical output)
+3. **Test-layer mapping** — for each scenario, name the layer that catches it (unit / integration / e2e per the table in §"Test layers"). Each scenario lives at the lowest layer that observes the behaviour.
+4. **Verification steps** — beyond running tests, list the manual checks (artifact inspection, `nix flake check`, `cabal check`, behaviour under `--watch`).
+5. **Regression list** — explicit names of existing tests that must continue to pass, even when the change "doesn't touch them".
+
+A plan is complete only when every code change in it can be tied to at least one test in §1–3 and one verification step in §4.
+
 ## Files
 
 - `tests/e2e.rs` — scenarios (each `#[test] #[ignore]`)

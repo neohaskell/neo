@@ -44,38 +44,111 @@ mod tests {
     use tempfile::tempdir;
     use crate::reconcile::resolve::{ResolvedConfig, ResolvedDependency, DependencySource};
 
-    #[test]
-    fn test_generate_cabal_with_dependencies() {
-        let dir = tempdir().unwrap();
-
-        let mut env = Environment::new();
-        env.add_template("project.cabal", "name: {{name}}\n{% for dep, ver in dependencies %}{{dep}} {{ver}}\n{% endfor %}").unwrap();
-
-        let config = ResolvedConfig {
-            name: "test-deps".to_string(),
+    fn rc(deps: Vec<ResolvedDependency>) -> ResolvedConfig {
+        ResolvedConfig {
+            name: "p".to_string(),
             version: "0.1.0".to_string(),
             neo_version: "main".to_string(),
             neo_sha: "abc".to_string(),
             description: None,
             author: None,
             license: "MIT".to_string(),
-            dependencies: vec![
-                ResolvedDependency {
-                    name: "base".to_string(),
-                    source: DependencySource::Hackage(">= 4.14".to_string()),
-                },
-                ResolvedDependency {
-                    name: "relude".to_string(),
-                    source: DependencySource::Hackage(">= 1.0".to_string()),
-                },
-            ],
-        };
+            dependencies: deps,
+        }
+    }
 
+    fn dep_env() -> Environment<'static> {
+        let mut env = Environment::new();
+        env.add_template(
+            "project.cabal",
+            "name: {{name}}\nbuild-depends: base\n{% for dep, ver in dependencies %}    , {{dep}} {{ver}}\n{% endfor %}",
+        ).unwrap();
+        env
+    }
+
+    #[test]
+    fn cabal_emits_hackage_dep_with_constraint() {
+        let dir = tempdir().unwrap();
+        let env = dep_env();
+        let mut config = rc(vec![
+            ResolvedDependency {
+                name: "aeson".to_string(),
+                source: DependencySource::Hackage(">=2.0 && <3.0".to_string()),
+            },
+        ]);
+        config.name = "test-deps".to_string();
         generate(dir.path(), &env, &config, &[]).unwrap();
-        
         let content = fs::read_to_string(dir.path().join("test-deps.cabal")).unwrap();
-        assert!(content.contains("base >= 4.14"));
-        assert!(content.contains("relude >= 1.0"));
+        assert!(content.contains(", aeson >=2.0 && <3.0"), "got: {}", content);
+    }
+
+    #[test]
+    fn cabal_emits_hackage_dep_empty_constraint() {
+        let dir = tempdir().unwrap();
+        let env = dep_env();
+        let mut config = rc(vec![
+            ResolvedDependency {
+                name: "base".to_string(),
+                source: DependencySource::Hackage(String::new()),
+            },
+        ]);
+        config.name = "test-empty".to_string();
+        generate(dir.path(), &env, &config, &[]).unwrap();
+        let content = fs::read_to_string(dir.path().join("test-empty.cabal")).unwrap();
+        // Empty version: line ends with the name and a trailing space (no constraint).
+        assert!(content.contains(", base "), "got: {}", content);
+    }
+
+    #[test]
+    fn cabal_emits_or_range_parenthesized() {
+        let dir = tempdir().unwrap();
+        let env = dep_env();
+        let mut config = rc(vec![
+            ResolvedDependency {
+                name: "foo".to_string(),
+                source: DependencySource::Hackage("(>=1.0.0 && <2.0.0) || (>=3.0.0)".to_string()),
+            },
+        ]);
+        config.name = "test-or".to_string();
+        generate(dir.path(), &env, &config, &[]).unwrap();
+        let content = fs::read_to_string(dir.path().join("test-or.cabal")).unwrap();
+        assert!(content.contains("(>=1.0.0 && <2.0.0) || (>=3.0.0)"), "got: {}", content);
+    }
+
+    #[test]
+    fn cabal_omits_git_deps_from_build_depends_constraint() {
+        let dir = tempdir().unwrap();
+        let env = dep_env();
+        let mut config = rc(vec![
+            ResolvedDependency {
+                name: "my-git-pkg".to_string(),
+                source: DependencySource::Git {
+                    url: "https://github.com/me/g".to_string(),
+                    rev: "main".to_string(),
+                },
+            },
+            ResolvedDependency {
+                name: "my-file-pkg".to_string(),
+                source: DependencySource::File("../local".to_string()),
+            },
+        ]);
+        config.name = "test-non-hackage".to_string();
+        generate(dir.path(), &env, &config, &[]).unwrap();
+        let content = fs::read_to_string(dir.path().join("test-non-hackage.cabal")).unwrap();
+        // Both packages appear with a placeholder constraint, not as Hackage versions.
+        assert!(content.contains(", my-git-pkg >= 0"), "got: {}", content);
+        assert!(content.contains(", my-file-pkg >= 0"), "got: {}", content);
+    }
+
+    #[test]
+    fn cabal_no_dependencies() {
+        let dir = tempdir().unwrap();
+        let env = dep_env();
+        let mut config = rc(vec![]);
+        config.name = "test-empty-deps".to_string();
+        generate(dir.path(), &env, &config, &[]).unwrap();
+        let content = fs::read_to_string(dir.path().join("test-empty-deps.cabal")).unwrap();
+        assert!(content.contains("build-depends: base"));
     }
 
     #[test]

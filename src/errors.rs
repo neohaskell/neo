@@ -74,6 +74,13 @@ pub enum NeoError {
         help("Check the output above for more details.")
     )]
     SubprocessError { command: String, output: String },
+
+    #[error("Invalid dependency `{key}` = `{value}`: {reason}")]
+    #[diagnostic(
+        code(neo::invalid_dep),
+        help("Dependency values use npm-style semver (e.g. `^1.2.3`, `~2.0`, `*`). Use prefix `hackage:`, `git:`, `github:`, or `file:` for explicit sources.")
+    )]
+    InvalidDependency { key: String, value: String, reason: String },
 }
 
 #[cfg(test)]

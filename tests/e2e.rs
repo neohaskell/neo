@@ -393,6 +393,62 @@ fn build_without_nix_on_path_fails_with_nixmissing() {
 }
 
 // =====================================================
+// Group E.2: `neo.json` dependency grammar (input validation)
+// =====================================================
+
+fn write_neo_json_with_deps(sb: &Sandbox, name: &str, deps_json: &str) {
+    let neo_json = format!(
+        "{{\n  \"name\": \"{}\",\n  \"version\": \"0.1.0\",\n  \"neo-version\": \"main\",\n  \"license\": \"MIT\",\n  \"dependencies\": {}\n}}\n",
+        name, deps_json
+    );
+    std::fs::create_dir_all(sb.path("src")).unwrap();
+    std::fs::write(sb.path("src/App.hs"), "module App where\n").unwrap();
+    std::fs::create_dir_all(sb.path("launcher")).unwrap();
+    std::fs::write(
+        sb.path("launcher/Launcher.hs"),
+        "module Main where\nmain :: IO ()\nmain = pure ()\n",
+    )
+    .unwrap();
+    std::fs::write(sb.path("neo.json"), neo_json).unwrap();
+}
+
+#[test]
+#[ignore]
+fn e2e_build_invalid_semver_errors() {
+    let sb = Sandbox::new("e2e_build_invalid_semver_errors");
+    write_neo_json_with_deps(&sb, "p", r#"{"foo":"not-a-version"}"#);
+    sb.neo(".")
+        .args(["build", "--ci"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid dependency"));
+}
+
+#[test]
+#[ignore]
+fn e2e_build_unknown_protocol_errors() {
+    let sb = Sandbox::new("e2e_build_unknown_protocol_errors");
+    write_neo_json_with_deps(&sb, "p", r#"{"foo":"npm:bar"}"#);
+    sb.neo(".")
+        .args(["build", "--ci"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown protocol"));
+}
+
+#[test]
+#[ignore]
+fn e2e_build_conflicting_protocols_errors() {
+    let sb = Sandbox::new("e2e_build_conflicting_protocols_errors");
+    write_neo_json_with_deps(&sb, "p", r#"{"hackage:foo":"git:host/r.git"}"#);
+    sb.neo(".")
+        .args(["build", "--ci"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("both key and value"));
+}
+
+// =====================================================
 // Group F: `neo run`
 // =====================================================
 

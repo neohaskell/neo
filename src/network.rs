@@ -43,28 +43,26 @@ pub async fn fetch_neo_sha(version: &str) -> miette::Result<String> {
     Ok(sha.to_string())
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NeoPackages {
     pub packages: HashMap<String, NeoPackageMetadata>,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NeoPackageMetadata {
+    #[allow(dead_code)]
     pub description: String,
     pub repository: String,
     pub versions: HashMap<String, NeoPackageVersion>,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NeoPackageVersion {
     pub sha: String,
+    #[allow(dead_code)]
     pub tag: String,
 }
 
-#[allow(dead_code)]
 pub async fn fetch_package_registry() -> miette::Result<NeoPackages> {
     if std::env::var("NEO_SKIP_NETWORK").is_ok() {
         return Ok(NeoPackages {
@@ -77,9 +75,9 @@ pub async fn fetch_package_registry() -> miette::Result<NeoPackages> {
         .build()
         .map_err(NeoError::NetworkError)?;
 
-    let url = "https://raw.githubusercontent.com/NeoHaskell/packages/main/registry.json";
+    let url = "https://raw.githubusercontent.com/NeoHaskell/neopackages/main/registry.json";
     let response = client.get(url).send().await.map_err(NeoError::NetworkError)?;
-    
+
     if !response.status().is_success() {
         return Ok(NeoPackages { packages: HashMap::new() });
     }

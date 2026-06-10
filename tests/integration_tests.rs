@@ -234,6 +234,83 @@ fn test_neo_new_existing_dir() {
         .stderr(predicate::str::contains(format!("Directory `{}` already exists", project_name)));
 }
 
+// ============================================================
+// Dependency-grammar input validation
+// (fast: reconcile fails before cabal is invoked)
+// ============================================================
+
+fn write_minimal_project(dir: &std::path::Path, name: &str, deps_json: &str) {
+    let neo_json = format!(
+        "{{\n  \"name\": \"{}\",\n  \"version\": \"0.1.0\",\n  \"neo-version\": \"main\",\n  \"license\": \"MIT\",\n  \"dependencies\": {}\n}}\n",
+        name, deps_json
+    );
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/App.hs"), "module App where\n").unwrap();
+    std::fs::create_dir_all(dir.join("launcher")).unwrap();
+    std::fs::write(
+        dir.join("launcher/Launcher.hs"),
+        "module Main where\nmain :: IO ()\nmain = pure ()\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("neo.json"), neo_json).unwrap();
+}
+
+#[test]
+fn integration_build_invalid_semver_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_project(temp.path(), "p", r#"{"foo":"not-a-version"}"#);
+    neo_cmd()
+        .current_dir(temp.path())
+        .env("NEO_SKIP_NETWORK", "1")
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid dependency"));
+}
+
+#[test]
+fn integration_build_unknown_protocol_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_project(temp.path(), "p", r#"{"foo":"npm:bar"}"#);
+    neo_cmd()
+        .current_dir(temp.path())
+        .env("NEO_SKIP_NETWORK", "1")
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown protocol"));
+}
+
+#[test]
+fn integration_build_conflicting_protocols_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_project(temp.path(), "p", r#"{"hackage:foo":"git:host/r.git"}"#);
+    neo_cmd()
+        .current_dir(temp.path())
+        .env("NEO_SKIP_NETWORK", "1")
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("both key and value"));
+}
+
+#[test]
+fn integration_build_github_too_many_slashes_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    write_minimal_project(temp.path(), "p", r#"{"foo":"github:owner/repo/sub"}"#);
+    neo_cmd()
+        .current_dir(temp.path())
+        .env("NEO_SKIP_NETWORK", "1")
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("owner/repo"));
+}
+
 #[test]
 fn test_neo_build_invalid_config() {
     let temp = tempfile::tempdir().unwrap();

@@ -39,6 +39,7 @@ walkdir = "2"
 
 # Semver
 semver = "1"
+nodejs-semver = "4"
 
 # Templates
 minijinja = "2"

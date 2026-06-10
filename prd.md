@@ -284,11 +284,12 @@ All project configuration is managed via a single `neo.json` file at the root of
 - `description` (optional): One-line project description.
 - `author` (optional): Author name.
 - `license` (optional): SPDX license identifier. Defaults to `Apache-2.0`.
-- `dependencies` (optional): Map of package names to version constraints.
-  - **NeoPackages** (default): `"package-name": "^1.0.0"` — resolved from the NeoPackages registry at `github.com/NeoHaskell/neopackages`. Uses npm-style semver ranges (`^`, `~`, `>=`, `*`, etc.).
-  - **Hackage**: `"hackage:package-name": ">=2.0 && <3.0"` — prefixed with `hackage:`, pulled from Hackage.
-  - **Local**: `"name": "file:../path/to/lib"` — local filesystem dependency.
-  - **Git**: `"name": "git+https://github.com/user/repo.git#branch-or-tag"` — git remote dependency.
+- `dependencies` (optional): Map of package names to version-spec strings. All version values use npm-style semver ranges (`^`, `~`, `>=`, `<`, `*`, `latest`, hyphen ranges, x-ranges, `||`). Cabal-style operators (e.g. `^>=`) are NOT supported in `neo.json` — they are emitted by the reconciler when translating to `.cabal`.
+  - **NeoPackages** (default, no prefix): `"package-name": "^1.0.0"` — resolved from the registry at `github.com/NeoHaskell/neopackages` (always tracking `main`). Highest version satisfying the range is picked; the registry's `repository` URL and the version's commit SHA are pinned into `cabal.project`.
+  - **Hackage**: `"hackage:package-name": "^2.0.0"` — prefixed with `hackage:`. The npm range is translated to a cabal constraint (`^2.0.0` → `>=2.0.0 && <3.0.0`) and emitted to the `.cabal` build-depends. An empty string `""` means no constraint.
+  - **Git**: `"name": "git:host/owner/repo.git#<ref>"` — prefix the value with `git:`. The `#<ref>` is optional (defaults to `main`); ref can be a branch, tag, or commit SHA. URLs without a scheme are prefixed with `https://`; ssh-style URLs (`git@host:...`) are passed through unchanged.
+  - **GitHub shortcut**: `"name": "github:owner/repo[#ref]"` — expands to `git:github.com/owner/repo.git[#ref]`.
+  - **Local**: `"name": "file:../path/to/lib"` — local filesystem dependency. Path is passed verbatim to `cabal.project` as a `packages:` line.
 
 **Implicit dependencies** (always included, never declared by the user): `nhcore`, `nhintegrations`, `base`.
 
