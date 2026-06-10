@@ -2,13 +2,32 @@
 
 See `AGENTS.md` for the full Ralph-loop workflow (`STATE.md` → `NEXT_STEP.md` → `IMPLEMENTATION_PLAN.md`). This file documents harness-specific testing details.
 
+## Working environment
+
+**All toolchain commands must run inside `nix develop`.** The host system does not (and is not expected to) provide `cargo`, `rustc`, `cabal`, `ghc`, `hurl`, `iconv`, etc. — they are pinned by `flake.nix` and live in the nix store.
+
+Wrap every invocation with `nix develop --command`:
+
+```sh
+nix develop --command cargo build
+nix develop --command cargo test --test integration_tests -- --test-threads=1
+nix develop --command cabal repl
+nix develop --command hurl tests/smoke.hurl
+```
+
+Telltale sign that this rule was skipped: `ld: library not found for -liconv` from a bare `cargo build`. The fix is always "wrap in `nix develop --command`", never "install iconv".
+
+The `nix build` (release artifact) and `nix flake check` (eval) commands are themselves nix CLI — those run *outside* the dev shell. Everything else runs inside.
+
 ## Test layers
 
 | Layer | Command | Network | Speed | Notes |
 |---|---|---|---|---|
-| Unit + integration | `cargo test` | Stubbed (`NEO_SKIP_NETWORK=1` inside tests) | seconds | Default suite. `tests/integration_tests.rs` uses `assert_cmd::Command::cargo_bin("neo")` — runs a cargo-built debug binary. |
-| End-to-end (shell-level) | `cargo test --test e2e -- --ignored --test-threads=1` | Real | minutes (Haskell builds inside) | `tests/e2e.rs` shells out to the **nix-built** `result/bin/neo` against per-scenario sandbox dirs under `target/e2e-sandbox/`. |
+| Unit + integration | `cargo test` | Real | minutes (Haskell builds inside) | Default suite. `tests/integration_tests.rs` uses `assert_cmd::Command::cargo_bin("neo")` — runs the cargo-built debug binary against real `nix`, real `git`, and real GitHub. Assertions are strict: no escape hatches for missing prereqs. Prereqs (`nix`, `git`, network) are required — fix the environment, never weaken the assertion. |
+| End-to-end (shell-level) | `cargo test --test e2e -- --ignored --test-threads=1` | Real | minutes (Haskell builds inside) | `tests/e2e.rs` exercises the full user-facing flow against the **nix-built** `result/bin/neo` (the release artifact) in per-scenario sandbox dirs under `target/e2e-sandbox/`. Goal: prove the binary an end user would install behaves correctly end-to-end. |
 | Neo-on-Neo smoke | `./ralph.sh` | Real | minutes | Bash loop driven by the Ralph agent; not wired to `cargo test`. |
+
+**Integration vs e2e:** both hit real `nix` and real network. The split is the binary under test — integration runs `cargo`-built debug (the dev loop), e2e runs the `nix`-built release artifact (what an end user installs). When a behavior is worth testing, prefer adding it to e2e so it covers the shipped binary; mirror in integration only when you also want it to gate `cargo test`.
 
 ## Running the e2e suite
 
@@ -30,7 +49,7 @@ Prerequisites (all present inside `nix develop`):
 
 ### When happy-path scenarios go red
 
-The `build` / `run` / `test` happy-path scenarios in `tests/e2e.rs` (groups D, F, G) require the generated NeoHaskell project to actually compile. The two recurring sources of breakage are:
+The `build` / `run` / `test` happy-path scenarios in `tests/e2e.rs` (groups D, F, G) — and their counterparts in `tests/integration_tests.rs` — require the generated NeoHaskell project to actually compile. The two recurring sources of breakage are:
 
 1. **Starter template drift against upstream `neohaskell` API.** `neo new` tarballs `github.com/NeoHaskell/neo-starter@main` and then `neo build` updates `flake.lock` to the latest `neohaskell` `main`. When upstream renames or removes a module the starter imports (recent example: `Service.Query.Auth` → `Service.AccessControl`, `QueryAuthError` → `AccessError`), the generated project fails GHC compile. Fix in `neo-starter` and push to `main`.
 2. **A transitive Haskell dep refusing to build under plain cabal.** Historical example: `jose` needing native crypto paths that only `haskell.nix`'s `hix.project` supplies — fixed in commit `87dde77` by templating the right `flake.nix`.
@@ -45,5 +64,5 @@ If you change any subcommand surface, error message, output prefix (`[info]` / `
 
 - `tests/e2e.rs` — scenarios (each `#[test] #[ignore]`)
 - `tests/common/mod.rs` — `Sandbox`, `neo_bin()`, `cmd` wrappers, isolated `HOME` / git identity, prepended `PATH` so the installed pre-commit hook can resolve `neo`
-- `tests/integration_tests.rs` — fast, network-stubbed CLI tests via `cargo_bin`
+- `tests/integration_tests.rs` — real-network, real-nix CLI tests via `cargo_bin` (assertions are strict — no escape hatches for missing prereqs)
 - `ralph.sh` — Ralph-driven smoke loop

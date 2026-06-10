@@ -2,9 +2,7 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn neo_cmd() -> Command {
-    let mut cmd = Command::cargo_bin("neo").unwrap();
-    cmd.env("NEO_SKIP_NETWORK", "1");
-    cmd
+    Command::cargo_bin("neo").unwrap()
 }
 
 #[test]
@@ -96,24 +94,15 @@ fn test_neo_build_ci() {
         .success();
 
     let project_path = temp.path().join(project_name);
-    
+
     let mut cmd = neo_cmd();
-    let assert = cmd.current_dir(&project_path)
+    cmd.current_dir(&project_path)
         .arg("build")
         .arg("--ci")
-        .assert();
-
-    if assert.get_output().status.success() {
-        assert.stdout(predicate::str::contains("Reconciling project artifacts"));
-        assert!(project_path.join(format!("{}.cabal", project_name)).exists());
-    } else {
-        let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-        assert!(
-            stderr.contains("Nix is required but not found") || 
-            stderr.contains("Subprocess execution failed"),
-            "Expected NixNotFound or SubprocessError, but got: {}", stderr
-        );
-    }
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reconciling project artifacts"));
+    assert!(project_path.join(format!("{}.cabal", project_name)).exists());
 }
 
 #[test]
@@ -130,24 +119,15 @@ fn test_neo_run_ci() {
         .success();
 
     let project_path = temp.path().join(project_name);
-    
+
     let mut cmd = neo_cmd();
-    let assert = cmd.current_dir(&project_path)
+    cmd.current_dir(&project_path)
         .arg("run")
         .arg("--ci")
-        .assert();
-
-    if assert.get_output().status.success() {
-        assert.stdout(predicate::str::contains("Reconciling project artifacts"))
-              .stdout(predicate::str::contains("Running project"));
-    } else {
-        let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-        assert!(
-            stderr.contains("Nix is required but not found") || 
-            stderr.contains("Subprocess execution failed"),
-            "Expected NixNotFound or SubprocessError, but got: {}", stderr
-        );
-    }
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reconciling project artifacts"))
+        .stdout(predicate::str::contains("Running project"));
 }
 
 #[test]
@@ -164,24 +144,15 @@ fn test_neo_test_ci() {
         .success();
 
     let project_path = temp.path().join(project_name);
-    
+
     let mut cmd = neo_cmd();
-    let assert = cmd.current_dir(&project_path)
+    cmd.current_dir(&project_path)
         .arg("test")
         .arg("--ci")
-        .assert();
-
-    if assert.get_output().status.success() {
-        assert.stdout(predicate::str::contains("Reconciling project artifacts"))
-              .stdout(predicate::str::contains("Running unit tests"));
-    } else {
-        let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-        assert!(
-            stderr.contains("Nix is required but not found") || 
-            stderr.contains("Subprocess execution failed"),
-            "Expected NixNotFound or SubprocessError, but got: {}", stderr
-        );
-    }
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reconciling project artifacts"))
+        .stdout(predicate::str::contains("Running unit tests"));
 }
 
 #[test]
@@ -202,25 +173,14 @@ fn test_neo_test_hurl_discovery() {
     // Create a dummy hurl file
     let tests_dir = project_path.join("tests");
     std::fs::create_dir_all(&tests_dir).unwrap();
-    std::fs::write(tests_dir.join("api.hurl"), "GET http://localhost:8080").unwrap();
+    std::fs::write(tests_dir.join("api.hurl"), "GET http://localhost:8080\nHTTP *\n").unwrap();
 
     let mut cmd = neo_cmd();
-    let assert = cmd.current_dir(&project_path)
+    cmd.current_dir(&project_path)
         .arg("test")
         .arg("--ci")
-        .assert();
-
-    // It will likely fail because Nix/Cabal/Hurl are not in the test environment,
-    // but we can check if it tried to run Hurl.
-    let output = String::from_utf8_lossy(&assert.get_output().stdout);
-    let _stderr = String::from_utf8_lossy(&assert.get_output().stderr);
-    
-    if output.contains("Running 1 Hurl integration tests") {
-        assert!(output.contains("Running 1 Hurl integration tests"));
-    } else {
-        // If unit tests fail, it might not reach hurl tests.
-        // But we've verified the logic in the code.
-    }
+        .assert()
+        .stdout(predicate::str::contains("Running 1 Hurl integration tests"));
 }
 
 #[test]

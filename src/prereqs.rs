@@ -48,23 +48,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_require_nix() {
-        // We assume nix is present in the test environment
-        let result = require_nix().await;
-        // In some CI environments it might be missing, so we just check it doesn't panic
-        // and if it returns an error, it's the right one.
-        if let Err(e) = result {
-            let err_str = format!("{:?}", e);
-            assert!(err_str.contains("NixNotFound") || err_str.contains("Nix is required"));
-        }
+        require_nix().await.expect("nix must be present in the test environment");
     }
 
     #[tokio::test]
     async fn test_require_git() {
-        let result = require_git().await;
-        if let Err(e) = result {
-            let err_str = format!("{:?}", e);
-            assert!(err_str.contains("GitNotFound") || err_str.contains("Git is required"));
-        }
+        require_git().await.expect("git must be present in the test environment");
     }
 
     #[tokio::test]
