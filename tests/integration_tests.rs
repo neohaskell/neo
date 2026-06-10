@@ -95,6 +95,28 @@ fn test_neo_build_ci() {
 
     let project_path = temp.path().join(project_name);
 
+    // Without the IOHK + NeoHaskell binary caches wired into the generated flake,
+    // `neo build` would compile GHC and haskell.nix infrastructure from source —
+    // the "takes hours instead of minutes" failure mode. Verify the template
+    // configured both substituters before we attempt to build.
+    let flake = std::fs::read_to_string(project_path.join("flake.nix")).unwrap();
+    assert!(
+        flake.contains("https://cache.iog.io"),
+        "generated flake.nix is missing the `cache.iog.io` substituter — neo build would rebuild GHC from source"
+    );
+    assert!(
+        flake.contains("https://neohaskell.cachix.org"),
+        "generated flake.nix is missing the `neohaskell.cachix.org` substituter — neo build would rebuild project deps from source"
+    );
+    assert!(
+        flake.contains("hydra.iohk.io:f/Ea+s+dFdN+3Y/G+FDgSq+a5NEWhJGzdjvKNGv0/EQ="),
+        "generated flake.nix is missing the IOHK trusted-public-key — substituter URL alone won't trust the cache"
+    );
+    assert!(
+        flake.contains("neohaskell.cachix.org-1:mo2cLaGbwqbrxs9xhqKK8jeNsn3osi7t6XoAmxSZssc="),
+        "generated flake.nix is missing the NeoHaskell trusted-public-key"
+    );
+
     let mut cmd = neo_cmd();
     cmd.current_dir(&project_path)
         .arg("build")
