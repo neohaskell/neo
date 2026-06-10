@@ -19,15 +19,34 @@ pub async fn run(output_mode: &mut OutputMode) -> miette::Result<()> {
 }
 
 pub async fn spawn_app() -> miette::Result<tokio::process::Child> {
-    Command::new("nix")
-        .args(["develop", "--command", "bash", "-c", "cabal run all"])
+    let mut cmd = Command::new("nix");
+    cmd.args(["develop", "--command", "bash", "-c", "cabal run all"])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| NeoError::SubprocessError { 
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    cmd.spawn()
+        .map_err(|e| NeoError::SubprocessError {
             command: "nix develop --command bash -c cabal run all".to_string(),
             output: format!("Failed to spawn app: {}", e)
         }.into())
+}
+
+pub async fn kill_app(mut child: tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let group = format!("-{pid}");
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &group])
+            .status();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &group])
+            .status();
+    }
+    let _ = child.wait().await;
 }
 
 pub async fn test(output_mode: &mut OutputMode) -> miette::Result<()> {

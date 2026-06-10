@@ -52,7 +52,7 @@ pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()
             }
 
             // Start the app in the background
-            let mut app_child = nix::spawn_app().await?;
+            let app_child = nix::spawn_app().await?;
             
             // Wait for app to start (heuristic: 2 seconds)
             sleep(Duration::from_secs(2)).await;
@@ -125,8 +125,8 @@ pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()
                 }
             }
 
-            // Kill the app
-            let _ = app_child.kill().await;
+            // Tear down the app and every descendant nix develop / bash / cabal / app spawned.
+            nix::kill_app(app_child).await;
 
             let total_duration = start_time.elapsed();
 

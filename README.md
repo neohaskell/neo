@@ -62,6 +62,18 @@ For headless environments, use the `--ci` flag to disable interactive prompts an
 neo build --ci
 ```
 
+## Testing
+
+Fast unit + integration suite:
+```bash
+cargo test
+```
+
+Full end-to-end suite against the nix-built binary (requires `nix build` first and real network access):
+```bash
+cargo test --test e2e -- --ignored --test-threads=1
+```
+
 ## License
 
 MIT
