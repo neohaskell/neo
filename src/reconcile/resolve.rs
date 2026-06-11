@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::NeoConfig;
 use crate::errors::NeoError;
-use crate::network::{NeoPackageMetadata, NeoPackages};
+use crate::network::{NeoPackages, PackageTag};
 use crate::reconcile::dep_spec::{self, DependencyDecl, NpmRange};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,9 +55,25 @@ pub async fn resolve(config: &NeoConfig) -> miette::Result<ResolvedConfig> {
         None
     };
 
+    // Versions in NeoPackages live in upstream git tags, not in the registry
+    // JSON. For every bare dep that the registry knows, fetch the tag list now
+    // so the synchronous resolve pass has it on hand.
+    let mut tags_by_name: HashMap<String, Vec<PackageTag>> = HashMap::new();
+    if let Some(reg) = registry.as_ref() {
+        for (name, decl) in &parsed {
+            if !matches!(decl, DependencyDecl::Bare { .. }) {
+                continue;
+            }
+            if let Some(meta) = reg.packages.get(name) {
+                let tags = crate::network::fetch_package_tags(&meta.repository).await?;
+                tags_by_name.insert(name.clone(), tags);
+            }
+        }
+    }
+
     let mut deps = Vec::with_capacity(parsed.len());
     for (name, decl) in parsed {
-        let source = resolve_decl(&name, &decl, registry.as_ref(), Some(config))?;
+        let source = resolve_decl(&name, &decl, registry.as_ref(), &tags_by_name, Some(config))?;
         deps.push(ResolvedDependency { name, source });
     }
     // Sort for deterministic generated artifacts.
@@ -84,6 +102,7 @@ pub(crate) fn resolve_decl(
     name: &str,
     decl: &DependencyDecl,
     registry: Option<&NeoPackages>,
+    tags_by_name: &HashMap<String, Vec<PackageTag>>,
     config: Option<&NeoConfig>,
 ) -> miette::Result<DependencySource> {
     match decl {
@@ -99,7 +118,7 @@ pub(crate) fn resolve_decl(
             rev: git_ref.clone().unwrap_or_else(|| "main".to_string()),
         }),
         DependencyDecl::File { path } => Ok(DependencySource::File(path.clone())),
-        DependencyDecl::Bare { req } => resolve_bare(name, req, registry, config),
+        DependencyDecl::Bare { req } => resolve_bare(name, req, registry, tags_by_name, config),
     }
 }
 
@@ -123,6 +142,7 @@ fn resolve_bare(
     name: &str,
     req: &NpmRange,
     registry: Option<&NeoPackages>,
+    tags_by_name: &HashMap<String, Vec<PackageTag>>,
     config: Option<&NeoConfig>,
 ) -> miette::Result<DependencySource> {
     let registry = match registry {
@@ -144,22 +164,20 @@ fn resolve_bare(
         unknown_package(name, &registry.packages.keys().cloned().collect::<Vec<_>>(), config)
     })?;
 
-    let picked = pick_best_version(name, req, meta, config)?;
-    let rev = meta
-        .versions
-        .get(&picked)
-        .map(|v| v.sha.clone())
-        .unwrap_or(picked);
+    let empty: Vec<PackageTag> = Vec::new();
+    let tags = tags_by_name.get(name).unwrap_or(&empty);
+    let picked = pick_best_version(name, req, &meta.repository, tags, config)?;
 
-    Ok(DependencySource::Git { url: meta.repository.clone(), rev })
+    Ok(DependencySource::Git { url: meta.repository.clone(), rev: picked.sha })
 }
 
 fn pick_best_version(
     name: &str,
     req: &NpmRange,
-    meta: &NeoPackageMetadata,
+    repository: &str,
+    tags: &[PackageTag],
     config: Option<&NeoConfig>,
-) -> miette::Result<String> {
+) -> miette::Result<PackageTag> {
     use nodejs_semver::{Range, Version};
 
     let range_str = npm_range_string(req);
@@ -174,29 +192,45 @@ fn pick_best_version(
         }
     })?;
 
-    let mut versions: Vec<(String, Version)> = meta
-        .versions
-        .keys()
-        .filter_map(|k| k.parse::<Version>().ok().map(|v| (k.clone(), v)))
+    // Each tag is parsed as semver after stripping an optional leading `v` (the
+    // most common upstream convention). Tags that aren't semver are skipped —
+    // they cannot satisfy a semver constraint.
+    let mut versions: Vec<(PackageTag, Version)> = tags
+        .iter()
+        .filter_map(|t| {
+            let stripped = t.tag.strip_prefix('v').unwrap_or(&t.tag);
+            stripped.parse::<Version>().ok().map(|v| (t.clone(), v))
+        })
         .collect();
     versions.sort_by(|a, b| b.1.cmp(&a.1));
 
-    for (key, v) in &versions {
+    for (tag, v) in &versions {
         if v.satisfies(&range) {
-            return Ok(key.clone());
+            return Ok(tag.clone());
         }
     }
 
-    let available: Vec<String> = versions.into_iter().map(|(k, _)| k).collect();
+    let available: Vec<String> = versions.into_iter().map(|(t, _)| t.tag).collect();
     let (src, span) = dep_source(config, name);
+    let reason = if available.is_empty() {
+        format!(
+            "no semver tags found at `{}` (ran `git ls-remote --tags`). NeoPackages discovers versions from upstream git tags — push a tag like `0.1.0` (or `v0.1.0`) to that repo, or replace this `neo.json` entry with `\"git:{}#<ref>\"` to pin a branch/SHA directly",
+            repository, repository,
+        )
+    } else {
+        format!(
+            "no upstream git tag of `{}` satisfies the constraint. Available tags at `{}`: [{}]. Either widen the constraint in `neo.json` (e.g. `\"^{}\"`), or pin a specific tag with `\"git:{}#<tag>\"`",
+            name,
+            repository,
+            available.join(", "),
+            available[0],
+            repository,
+        )
+    };
     Err(NeoError::InvalidDependency {
         key: name.to_string(),
         value: range_str,
-        reason: format!(
-            "no version of `{}` in the NeoPackages registry satisfies the constraint. Available: [{}]",
-            name,
-            available.join(", "),
-        ),
+        reason,
         src,
         span,
     }
@@ -272,43 +306,47 @@ fn ensure_scheme(url: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use crate::network::{NeoPackageMetadata, NeoPackageVersion, NeoPackages};
+    use crate::network::{NeoPackageMetadata, NeoPackages, PackageTag};
 
-    fn make_meta(repo: &str, versions: &[(&str, &str, &str)]) -> NeoPackageMetadata {
-        let mut vs = HashMap::new();
-        for (ver, sha, tag) in versions {
-            vs.insert(ver.to_string(), NeoPackageVersion {
-                sha: sha.to_string(),
-                tag: tag.to_string(),
-            });
-        }
-        NeoPackageMetadata {
+    /// Build a (registry-entry, tag-list) fixture. Each tuple is `(tag, sha)`.
+    fn make_pkg(repo: &str, tags: &[(&str, &str)]) -> (NeoPackageMetadata, Vec<PackageTag>) {
+        let meta = NeoPackageMetadata {
             description: "test".to_string(),
             repository: repo.to_string(),
-            versions: vs,
-        }
+        };
+        let tag_vec = tags
+            .iter()
+            .map(|(t, s)| PackageTag { tag: t.to_string(), sha: s.to_string() })
+            .collect();
+        (meta, tag_vec)
     }
 
-    fn registry_with(packages: Vec<(&str, NeoPackageMetadata)>) -> NeoPackages {
+    fn registry_with(packages: Vec<(&str, (NeoPackageMetadata, Vec<PackageTag>))>) -> (NeoPackages, HashMap<String, Vec<PackageTag>>) {
         let mut m = HashMap::new();
-        for (k, v) in packages { m.insert(k.to_string(), v); }
-        NeoPackages { packages: m }
+        let mut tags = HashMap::new();
+        for (k, (meta, tag_vec)) in packages {
+            m.insert(k.to_string(), meta);
+            tags.insert(k.to_string(), tag_vec);
+        }
+        (NeoPackages { packages: m }, tags)
     }
 
-    fn resolve_one(name: &str, value: &str, registry: Option<&NeoPackages>) -> miette::Result<DependencySource> {
+    fn resolve_one(name: &str, value: &str, registry: Option<&NeoPackages>, tags: &HashMap<String, Vec<PackageTag>>) -> miette::Result<DependencySource> {
         let (n, decl) = dep_spec::parse(name, value)?;
-        resolve_decl(&n, &decl, registry, None)
+        resolve_decl(&n, &decl, registry, tags, None)
     }
+
+    fn no_tags() -> HashMap<String, Vec<PackageTag>> { HashMap::new() }
 
     // ===== happy paths =====
 
     #[test]
     fn resolve_bare_picks_highest_match() {
-        let reg = registry_with(vec![("foo", make_meta(
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
             "https://github.com/x/foo.git",
-            &[("1.0.0", "sha1", "v1.0.0"), ("1.5.0", "sha15", "v1.5.0"), ("2.0.0", "sha20", "v2.0.0")],
+            &[("1.0.0", "sha1"), ("1.5.0", "sha15"), ("2.0.0", "sha20")],
         ))]);
-        let src = resolve_one("foo", "^1.0.0", Some(&reg)).unwrap();
+        let src = resolve_one("foo", "^1.0.0", Some(&reg), &tags).unwrap();
         match src {
             DependencySource::Git { url, rev } => {
                 assert_eq!(url, "https://github.com/x/foo.git");
@@ -319,11 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_bare_exact_version() {
-        let reg = registry_with(vec![("foo", make_meta(
-            "u", &[("1.5.0", "sha15", "v1.5.0")],
+    fn resolve_bare_accepts_v_prefixed_tags() {
+        // Most upstream projects publish `v1.2.3`-style tags. The leading `v`
+        // is stripped before semver parsing; the original tag is preserved on
+        // the returned `PackageTag` (which feeds the cabal rev).
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
+            "u", &[("v1.0.0", "sha1"), ("v1.5.0", "sha15"), ("v2.0.0", "sha20")],
         ))]);
-        let src = resolve_one("foo", "1.5.0", Some(&reg)).unwrap();
+        let src = resolve_one("foo", "^1.0.0", Some(&reg), &tags).unwrap();
+        match src {
+            DependencySource::Git { rev, .. } => assert_eq!(rev, "sha15"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn resolve_bare_exact_version() {
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
+            "u", &[("1.5.0", "sha15")],
+        ))]);
+        let src = resolve_one("foo", "1.5.0", Some(&reg), &tags).unwrap();
         match src {
             DependencySource::Git { rev, .. } => assert_eq!(rev, "sha15"),
             _ => panic!(),
@@ -332,10 +385,10 @@ mod tests {
 
     #[test]
     fn resolve_bare_latest() {
-        let reg = registry_with(vec![("foo", make_meta(
-            "u", &[("1.0.0", "s1", "v1"), ("2.0.0", "s2", "v2")],
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
+            "u", &[("1.0.0", "s1"), ("2.0.0", "s2")],
         ))]);
-        let src = resolve_one("foo", "latest", Some(&reg)).unwrap();
+        let src = resolve_one("foo", "latest", Some(&reg), &tags).unwrap();
         match src {
             DependencySource::Git { rev, .. } => assert_eq!(rev, "s2"),
             _ => panic!(),
@@ -344,7 +397,7 @@ mod tests {
 
     #[test]
     fn resolve_hackage_translates_caret() {
-        let src = resolve_one("hackage:relude", "^1.0.0", None).unwrap();
+        let src = resolve_one("hackage:relude", "^1.0.0", None, &no_tags()).unwrap();
         match src {
             DependencySource::Hackage(s) => assert_eq!(s, ">=1.0.0 && <2.0.0"),
             _ => panic!(),
@@ -353,7 +406,7 @@ mod tests {
 
     #[test]
     fn resolve_hackage_empty_constraint() {
-        let src = resolve_one("hackage:base", "", None).unwrap();
+        let src = resolve_one("hackage:base", "", None, &no_tags()).unwrap();
         match src {
             DependencySource::Hackage(s) => assert_eq!(s, ""),
             _ => panic!(),
@@ -362,7 +415,7 @@ mod tests {
 
     #[test]
     fn resolve_git_default_main() {
-        let src = resolve_one("lib", "git:host/r.git", None).unwrap();
+        let src = resolve_one("lib", "git:host/r.git", None, &no_tags()).unwrap();
         match src {
             DependencySource::Git { url, rev } => {
                 assert_eq!(url, "https://host/r.git");
@@ -374,7 +427,7 @@ mod tests {
 
     #[test]
     fn resolve_git_with_ref() {
-        let src = resolve_one("lib", "git:host/r.git#v1", None).unwrap();
+        let src = resolve_one("lib", "git:host/r.git#v1", None, &no_tags()).unwrap();
         match src {
             DependencySource::Git { rev, .. } => assert_eq!(rev, "v1"),
             _ => panic!(),
@@ -383,7 +436,7 @@ mod tests {
 
     #[test]
     fn resolve_git_preserves_scheme() {
-        let src = resolve_one("lib", "git:https://example.com/r.git", None).unwrap();
+        let src = resolve_one("lib", "git:https://example.com/r.git", None, &no_tags()).unwrap();
         match src {
             DependencySource::Git { url, .. } => assert_eq!(url, "https://example.com/r.git"),
             _ => panic!(),
@@ -392,7 +445,7 @@ mod tests {
 
     #[test]
     fn resolve_git_preserves_ssh_url() {
-        let src = resolve_one("lib", "git:git@github.com:o/r.git", None).unwrap();
+        let src = resolve_one("lib", "git:git@github.com:o/r.git", None, &no_tags()).unwrap();
         match src {
             DependencySource::Git { url, .. } => assert_eq!(url, "git@github.com:o/r.git"),
             _ => panic!(),
@@ -401,7 +454,7 @@ mod tests {
 
     #[test]
     fn resolve_github_shorthand() {
-        let src = resolve_one("lib", "github:o/r#main", None).unwrap();
+        let src = resolve_one("lib", "github:o/r#main", None, &no_tags()).unwrap();
         match src {
             DependencySource::Git { url, rev } => {
                 assert_eq!(url, "https://github.com/o/r.git");
@@ -413,7 +466,7 @@ mod tests {
 
     #[test]
     fn resolve_file_passthrough() {
-        let src = resolve_one("lib", "file:../l", None).unwrap();
+        let src = resolve_one("lib", "file:../l", None, &no_tags()).unwrap();
         match src {
             DependencySource::File(p) => assert_eq!(p, "../l"),
             _ => panic!(),
@@ -446,19 +499,33 @@ mod tests {
 
     #[test]
     fn resolve_bare_no_registry_match() {
-        let reg = registry_with(vec![("foo", make_meta(
-            "u", &[("2.0.0", "s2", "v2")],
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
+            "u", &[("2.0.0", "s2")],
         ))]);
-        let err = resolve_one("foo", "^1.0.0", Some(&reg)).unwrap_err();
+        let err = resolve_one("foo", "^1.0.0", Some(&reg), &tags).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("no version"), "got: {}", msg);
+        assert!(msg.contains("no upstream git tag"), "got: {}", msg);
         assert!(msg.contains("2.0.0"), "got: {}", msg);
     }
 
     #[test]
+    fn resolve_bare_no_semver_tags_at_all() {
+        // Package is in the registry but its repo has no semver tags. The error
+        // should tell the user exactly how to fix it: push a tag, or pin via git:.
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
+            "https://github.com/x/foo.git", &[("not-a-version", "sx"), ("nightly", "sn")],
+        ))]);
+        let err = resolve_one("foo", "*", Some(&reg), &tags).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no semver tags"), "got: {}", msg);
+        assert!(msg.contains("git ls-remote --tags"), "got: {}", msg);
+        assert!(msg.contains("https://github.com/x/foo.git"), "got: {}", msg);
+    }
+
+    #[test]
     fn resolve_bare_package_missing_from_registry() {
-        let reg = registry_with(vec![("bar", make_meta("u", &[("1.0.0", "s", "t")]))]);
-        let err = resolve_one("foo", "^1.0.0", Some(&reg)).unwrap_err();
+        let (reg, tags) = registry_with(vec![("bar", make_pkg("u", &[("1.0.0", "s")]))]);
+        let err = resolve_one("foo", "^1.0.0", Some(&reg), &tags).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not found"), "got: {}", msg);
         assert!(msg.contains("hackage:") || msg.contains("git:"), "got: {}", msg);
@@ -466,9 +533,9 @@ mod tests {
 
     #[test]
     fn resolve_bare_empty_registry_under_skip_network() {
-        let reg = registry_with(vec![]);
+        let (reg, tags) = registry_with(vec![]);
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
-        let src = resolve_one("foo", "^1.0.0", Some(&reg)).unwrap();
+        let src = resolve_one("foo", "^1.0.0", Some(&reg), &tags).unwrap();
         match src {
             DependencySource::Git { rev, .. } => assert_eq!(rev, "stub"),
             _ => panic!("expected stub git source"),
@@ -477,11 +544,11 @@ mod tests {
 
     #[test]
     fn resolve_bare_registry_version_not_semver() {
-        let reg = registry_with(vec![("foo", make_meta(
+        let (reg, tags) = registry_with(vec![("foo", make_pkg(
             "u",
-            &[("weird", "sx", "weird"), ("1.0.0", "s1", "v1")],
+            &[("weird", "sx"), ("1.0.0", "s1")],
         ))]);
-        let src = resolve_one("foo", "*", Some(&reg)).unwrap();
+        let src = resolve_one("foo", "*", Some(&reg), &tags).unwrap();
         match src {
             DependencySource::Git { rev, .. } => assert_eq!(rev, "s1"),
             _ => panic!(),
@@ -490,13 +557,13 @@ mod tests {
 
     #[test]
     fn resolve_invalid_semver_input() {
-        let err = resolve_one("foo", "not-a-version", None).unwrap_err();
+        let err = resolve_one("foo", "not-a-version", None, &no_tags()).unwrap_err();
         assert!(err.to_string().contains("Invalid dependency"));
     }
 
     #[test]
     fn resolve_unknown_protocol() {
-        let err = resolve_one("foo", "svn:abc", None).unwrap_err();
+        let err = resolve_one("foo", "svn:abc", None, &no_tags()).unwrap_err();
         assert!(err.to_string().contains("unknown protocol"));
     }
 

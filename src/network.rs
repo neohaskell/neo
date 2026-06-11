@@ -74,14 +74,15 @@ pub struct NeoPackageMetadata {
     #[allow(dead_code)]
     pub description: String,
     pub repository: String,
-    pub versions: HashMap<String, NeoPackageVersion>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct NeoPackageVersion {
-    pub sha: String,
-    #[allow(dead_code)]
+/// A git tag discovered on a NeoPackages-listed repository, together with the
+/// commit SHA it resolves to. Versions in NeoPackages come from upstream git
+/// tags (enumerated via `git ls-remote --tags`), not from the registry JSON.
+#[derive(Debug, Clone)]
+pub struct PackageTag {
     pub tag: String,
+    pub sha: String,
 }
 
 pub async fn fetch_package_registry() -> miette::Result<NeoPackages> {
@@ -109,13 +110,78 @@ pub async fn fetch_package_registry() -> miette::Result<NeoPackages> {
         .into_diagnostic()
         .wrap_err_with(|| format!(
             "parsing the NeoPackages registry JSON downloaded from `{}`. \
-             Expected: an object `{{ \"packages\": {{ \"<name>\": {{ \"description\": \"...\", \"repository\": \"...\", \"versions\": {{ ... }} }}, ... }} }}`. \
+             Expected: an object `{{ \"packages\": {{ \"<name>\": {{ \"description\": \"...\", \"repository\": \"https://...\" }}, ... }} }}` — versions come from the upstream git tags, not the registry. \
              Fix: if you are pointing at a non-default registry URL, verify it serves valid JSON in this shape. \
-             If you maintain the registry, validate it with `jq < registry.json`. \
+             If you maintain the registry, validate it with `check-jsonschema --schemafile registry.schema.json registry.json`. \
              Otherwise re-run with `NEO_SKIP_NETWORK=1` to skip registry resolution.",
             url
         ))?;
     Ok(registry)
+}
+
+/// Run `git ls-remote --tags <repo_url>` and return one `PackageTag` per
+/// upstream tag. Annotated tags (with a `^{}` peeled line) resolve to the
+/// peeled commit SHA, never the tag-object SHA.
+pub async fn fetch_package_tags(repo_url: &str) -> miette::Result<Vec<PackageTag>> {
+    if std::env::var("NEO_SKIP_NETWORK").is_ok() {
+        return Ok(Vec::new());
+    }
+
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", "--tags", repo_url])
+        .output()
+        .await
+        .map_err(|e| NeoError::SubprocessFailed {
+            operation: format!("spawning `git ls-remote --tags {}` to enumerate versions", repo_url),
+            cause: format!("could not run git: {}", e),
+            fix: "Ensure `git` is installed and on PATH (`which git`). If installed, open a new shell.".to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if let Some(i) = interpret::interpret_git(&stderr) {
+            return Err(NeoError::SubprocessFailed {
+                operation: format!("`git ls-remote --tags {}`", repo_url),
+                cause: i.cause,
+                fix: i.fix,
+            }.into());
+        }
+        return Err(NeoError::SubprocessFailed {
+            operation: format!("`git ls-remote --tags {}`", repo_url),
+            cause: format!("git exited non-zero: {}", stderr.trim()),
+            fix: format!("Check that `{}` is reachable and is a valid git repository (try `git ls-remote --tags {}` yourself). If the registry points at the wrong repo, fix it in `registry.json` (https://github.com/NeoHaskell/neopackages).", repo_url, repo_url),
+        }.into());
+    }
+
+    Ok(parse_ls_remote_tags(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_ls_remote_tags(stdout: &str) -> Vec<PackageTag> {
+    // `git ls-remote --tags` lines look like:
+    //   <sha>\trefs/tags/<tag>
+    //   <sha>\trefs/tags/<tag>^{}     (peeled: annotated-tag → commit)
+    // For an annotated tag the un-peeled line is the tag object's SHA and the
+    // peeled line is the commit's SHA. We always want the commit, so the peeled
+    // value wins when both are present.
+    let mut by_tag: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        let Some((sha, refname)) = line.split_once('\t') else { continue };
+        let Some(rest) = refname.strip_prefix("refs/tags/") else { continue };
+        let (tag, peeled) = match rest.strip_suffix("^{}") {
+            Some(t) => (t, true),
+            None => (rest, false),
+        };
+        if tag.is_empty() {
+            continue;
+        }
+        if peeled || !by_tag.contains_key(tag) {
+            by_tag.insert(tag.to_string(), sha.to_string());
+        }
+    }
+    by_tag
+        .into_iter()
+        .map(|(tag, sha)| PackageTag { tag, sha })
+        .collect()
 }
 
 pub async fn check_for_updates() -> miette::Result<Option<String>> {
@@ -246,5 +312,43 @@ mod tests {
         fetch_starter_template(dir.path()).await.unwrap();
         assert!(dir.path().join("src/App.hs").exists());
         assert!(dir.path().join("launcher/Launcher.hs").exists());
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_lightweight() {
+        let stdout = "abc1234567890abc1234567890abc1234567890a\trefs/tags/0.1.0\n\
+                      def1234567890def1234567890def1234567890d\trefs/tags/v1.2.3\n";
+        let tags = parse_ls_remote_tags(stdout);
+        assert_eq!(tags.len(), 2);
+        let by: std::collections::HashMap<_, _> =
+            tags.iter().map(|t| (t.tag.clone(), t.sha.clone())).collect();
+        assert_eq!(by.get("0.1.0").unwrap(), "abc1234567890abc1234567890abc1234567890a");
+        assert_eq!(by.get("v1.2.3").unwrap(), "def1234567890def1234567890def1234567890d");
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_annotated_prefers_peeled() {
+        // Annotated tag: first line is tag-object SHA, second line is the peeled commit SHA.
+        let stdout = "tagobjsha000000000000000000000000000000000\trefs/tags/v2.0.0\n\
+                      commitsha00000000000000000000000000000000\trefs/tags/v2.0.0^{}\n";
+        let tags = parse_ls_remote_tags(stdout);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].tag, "v2.0.0");
+        assert_eq!(tags[0].sha, "commitsha00000000000000000000000000000000");
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_ignores_unrelated_refs() {
+        let stdout = "abc1234567890abc1234567890abc1234567890a\trefs/heads/main\n\
+                      def1234567890def1234567890def1234567890d\trefs/tags/0.1.0\n\
+                      garbage-without-tab\n";
+        let tags = parse_ls_remote_tags(stdout);
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].tag, "0.1.0");
+    }
+
+    #[test]
+    fn parse_ls_remote_tags_empty() {
+        assert!(parse_ls_remote_tags("").is_empty());
     }
 }

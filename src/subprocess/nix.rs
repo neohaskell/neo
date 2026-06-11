@@ -69,6 +69,14 @@ fn parse_cabal_progress(line: &str) -> Option<(usize, usize)> {
     None
 }
 
+fn full_output_or_placeholder(captured: &[String]) -> String {
+    if captured.is_empty() {
+        "(no output)".to_string()
+    } else {
+        captured.join("\n")
+    }
+}
+
 fn last_meaningful_lines(lines: &[String], n: usize) -> String {
     let _ = n;
     // Prefer the single most-likely-actionable line: an `error: …` / `Error: …` /
@@ -228,8 +236,7 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
         })?;
 
     if !status.success() {
-        let joined = captured_output.join("\n");
-        if let Some(i) = interpret::interpret_any(&joined) {
+        if let Some(i) = interpret::interpret_any(&captured_output.join("\n")) {
             return Err(NeoError::SubprocessFailed {
                 operation: format!("`{}`", command_str),
                 cause: i.cause,
@@ -239,6 +246,7 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
         return Err(NeoError::SubprocessRaw {
             operation: format!("`{}`", command_str),
             tail: last_meaningful_lines(&captured_output, 5),
+            full_output: full_output_or_placeholder(&captured_output),
         }.into());
     }
 
@@ -311,9 +319,19 @@ mod tests {
         let err = result.unwrap_err();
         if let Some(neo_err) = err.downcast_ref::<NeoError>() {
             match neo_err {
-                NeoError::SubprocessRaw { operation, tail } => {
+                NeoError::SubprocessRaw { operation, tail, full_output } => {
                     assert!(operation.contains("ls /non-existent-directory-neo"));
                     assert!(!tail.is_empty(), "Captured tail should not be empty");
+                    // The failure may come from `nix develop` itself (no flake.nix in the
+                    // test cwd) or from `ls` (when a flake IS present). Either way, the
+                    // invariant under test is that full_output is threaded through —
+                    // not which subsystem produced the failing line.
+                    assert!(!full_output.is_empty(), "full_output should not be empty");
+                    assert_ne!(
+                        full_output, "(no output)",
+                        "full_output should contain the real child output, not the placeholder: {}",
+                        full_output
+                    );
                 }
                 NeoError::SubprocessFailed { operation, .. } => {
                     // also acceptable if `ls` stderr happens to match an interpreter pattern
@@ -324,6 +342,31 @@ mod tests {
         } else {
             panic!("Expected NeoError, got {:?}", err);
         }
+    }
+
+    #[test]
+    fn full_output_or_placeholder_empty_yields_placeholder() {
+        assert_eq!(full_output_or_placeholder(&[]), "(no output)");
+    }
+
+    #[test]
+    fn full_output_or_placeholder_joins_lines_with_newline() {
+        let v = vec![
+            "stdout: starting".to_string(),
+            "stderr: kaboom".to_string(),
+        ];
+        assert_eq!(
+            full_output_or_placeholder(&v),
+            "stdout: starting\nstderr: kaboom"
+        );
+    }
+
+    #[test]
+    fn full_output_or_placeholder_preserves_single_blank_line() {
+        // A child that prints a single empty line is NOT the empty case — we still
+        // want to surface that something happened, not collapse it to "(no output)".
+        let v = vec!["".to_string()];
+        assert_eq!(full_output_or_placeholder(&v), "");
     }
 
     #[tokio::test]

@@ -107,15 +107,16 @@ pub enum NeoError {
         fix: String,
     },
 
-    #[error("{operation} failed — `neo` could not extract an actionable cause from the child output.\n\nLast meaningful line from the child:\n  {tail}")]
+    #[error("{operation} failed — `neo` could not extract an actionable cause from the child output.\n\nLast meaningful line from the child:\n  {tail}\n\n--- full child output (stdout + stderr, in capture order) ---\n{full_output}\n--- end of child output ---")]
     #[diagnostic(
         code(neo::subprocess_raw),
         url(docsrs),
-        help("Scroll up to read the full child output, or re-run with `--verbose`. If you can identify the real failure line in there, add a match for it in `src/subprocess/interpret.rs` (`interpret_cabal` / `interpret_nix` / `interpret_git`) so future runs surface a concrete fix recipe instead of raw output.")
+        help("We didn't recognise this failure mode. Please open an issue so we can add a fix recipe:\n  https://github.com/neohaskell/neo/issues/new?template=uninterpreted-subprocess-error.md\nPaste the `--- full child output ---` block above into the issue. The template walks you through the rest.")
     )]
     SubprocessRaw {
         operation: String,
         tail: String,
+        full_output: String,
     },
 
     #[error("Invalid dependency `{key}` = `{value}`: {reason}")]
@@ -231,6 +232,7 @@ mod tests {
         let err = NeoError::SubprocessRaw {
             operation: "nix develop".to_string(),
             tail: "(no output)".to_string(),
+            full_output: "(no output)".to_string(),
         };
         let rendered = err.to_string();
         assert!(rendered.contains("nix develop failed"), "rendered: {}", rendered);
@@ -297,6 +299,93 @@ mod tests {
         assert_eq!(help, "Y", "bad help: {}", help);
     }
 
+    // ---------------- SubprocessRaw: full output + GH issue link ----------------
+
+    fn stub_subprocess_raw() -> NeoError {
+        NeoError::SubprocessRaw {
+            operation: "`cabal build all`".to_string(),
+            tail: "Error: [Cabal-7125]".to_string(),
+            full_output: "alpha\nbravo\ncharlie αβγ".to_string(),
+        }
+    }
+
+    #[test]
+    fn subprocess_raw_renders_full_output_inline() {
+        let err = stub_subprocess_raw();
+        let rendered = err.to_string();
+        assert!(rendered.contains("alpha"), "missing alpha: {}", rendered);
+        assert!(rendered.contains("bravo"), "missing bravo: {}", rendered);
+        assert!(rendered.contains("charlie αβγ"), "missing unicode line: {}", rendered);
+        assert!(rendered.contains("--- full child output"), "missing opening fence: {}", rendered);
+        assert!(rendered.contains("--- end of child output ---"), "missing closing fence: {}", rendered);
+    }
+
+    #[test]
+    fn subprocess_raw_renders_no_output_placeholder() {
+        let err = NeoError::SubprocessRaw {
+            operation: "`cabal build all`".to_string(),
+            tail: "(no output)".to_string(),
+            full_output: "(no output)".to_string(),
+        };
+        let rendered = err.to_string();
+        // Placeholder appears between the fences, not just in the tail.
+        let opening = rendered.find("--- full child output").expect("opening fence");
+        let closing = rendered.find("--- end of child output ---").expect("closing fence");
+        let between = &rendered[opening..closing];
+        assert!(between.contains("(no output)"), "placeholder not between fences: {}", between);
+    }
+
+    #[test]
+    fn subprocess_raw_help_points_at_gh_template() {
+        let err = stub_subprocess_raw();
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("github.com/neohaskell/neo/issues/new"),
+            "help missing GH issue URL: {}",
+            help
+        );
+        assert!(
+            help.contains("template=uninterpreted-subprocess-error.md"),
+            "help missing template query param: {}",
+            help
+        );
+    }
+
+    #[test]
+    fn subprocess_raw_help_does_not_mention_interpret_rs() {
+        // Regression: the old help told end users to edit `src/subprocess/interpret.rs`.
+        // That guidance belongs in the GH issue template (for contributors), not in
+        // the error a user installing the released binary sees.
+        let err = stub_subprocess_raw();
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(!help.contains("interpret.rs"), "help still mentions interpret.rs: {}", help);
+        assert!(!help.contains("interpret_cabal"), "help still mentions interpret_cabal: {}", help);
+    }
+
+    #[test]
+    fn subprocess_raw_help_does_not_say_scroll_up() {
+        // Regression: full output is now inline, so "scroll up" is misleading.
+        let err = stub_subprocess_raw();
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            !help.to_lowercase().contains("scroll up"),
+            "help still says 'scroll up': {}",
+            help
+        );
+    }
+
+    #[test]
+    fn subprocess_raw_tail_still_renders() {
+        let err = stub_subprocess_raw();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("Last meaningful line from the child:"),
+            "missing tail headline: {}",
+            rendered
+        );
+        assert!(rendered.contains("Error: [Cabal-7125]"), "missing tail content: {}", rendered);
+    }
+
     // ---------------- Tier 2a: url() on every variant ----------------
 
     fn all_variants() -> Vec<NeoError> {
@@ -322,7 +411,7 @@ mod tests {
             },
             NeoError::TemplateError { template: "t".to_string(), reason: "r".to_string() },
             NeoError::SubprocessFailed { operation: "o".to_string(), cause: "c".to_string(), fix: "f".to_string() },
-            NeoError::SubprocessRaw { operation: "o".to_string(), tail: "t".to_string() },
+            NeoError::SubprocessRaw { operation: "o".to_string(), tail: "t".to_string(), full_output: "stdout line\nstderr line".to_string() },
             stub_invalid_dep(),
         ]
     }
