@@ -18,10 +18,35 @@ use clap::Parser;
 use cli::Cli;
 use output::OutputMode;
 
+fn detect_terminal_width() -> usize {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        ratatui::crossterm::terminal::size()
+            .map(|(cols, _)| (cols as usize).max(80))
+            .unwrap_or(120)
+    } else {
+        // Piped / non-TTY (CI logs, test runners, `2>&1 | …`): use a wide
+        // width so consumers can do their own wrapping and substring matchers
+        // are not derailed by mid-phrase line breaks.
+        200
+    }
+}
+
 #[tokio::main]
 async fn main() -> miette::Result<()> {
-    miette::set_hook(Box::new(|_| {
-        Box::new(miette::NarratableReportHandler::new())
+    let stderr_is_tty = {
+        use std::io::IsTerminal;
+        std::io::stderr().is_terminal()
+    };
+    miette::set_hook(Box::new(move |_| {
+        Box::new(
+            miette::GraphicalReportHandler::new()
+                // OSC-8 hyperlinks only when stderr is a real terminal — piped
+                // output should not contain raw `\x1b]8;…` escape sentinels.
+                .with_links(stderr_is_tty)
+                .with_context_lines(2)
+                .with_width(detect_terminal_width()),
+        )
     }))?;
 
     let cli = Cli::parse();
@@ -80,4 +105,74 @@ async fn main() -> miette::Result<()> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use miette::{GraphicalReportHandler, GraphicalTheme};
+
+    fn render(diag: &dyn miette::Diagnostic, handler: GraphicalReportHandler) -> String {
+        let mut buf = String::new();
+        handler.render_report(&mut buf, diag).unwrap();
+        buf
+    }
+
+    #[test]
+    fn graphical_handler_emits_unicode_and_color() {
+        let diag = crate::errors::NeoError::NoWorkspace;
+        let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode())
+            .with_links(true)
+            .with_width(120);
+        let rendered = render(&diag, handler);
+        assert!(rendered.contains("×"), "missing unicode error glyph: {}", rendered);
+        assert!(rendered.contains("help:"), "missing help block: {}", rendered);
+        assert!(rendered.contains("\x1b["), "missing ANSI color codes: {:?}", rendered);
+    }
+
+    #[test]
+    fn no_color_theme_strips_ansi_keeps_unicode() {
+        let diag = crate::errors::NeoError::NoWorkspace;
+        let handler = GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor())
+            .with_links(false)
+            .with_urls(false)
+            .with_width(120);
+        let rendered = render(&diag, handler);
+        assert!(!rendered.contains("\x1b["), "unexpected ANSI in nocolor theme: {:?}", rendered);
+        assert!(rendered.contains("×"), "unicode glyph missing in nocolor: {}", rendered);
+    }
+
+    #[test]
+    fn none_theme_strips_ansi_and_unicode() {
+        let diag = crate::errors::NeoError::NoWorkspace;
+        let handler = GraphicalReportHandler::new_themed(GraphicalTheme::none())
+            .with_links(false)
+            .with_urls(false)
+            .with_width(120);
+        let rendered = render(&diag, handler);
+        assert!(!rendered.contains("\x1b["), "unexpected ANSI in none theme: {:?}", rendered);
+    }
+
+    #[test]
+    fn narratable_handler_not_installed() {
+        // Grep guard against regressing to the plain-text screen-reader handler.
+        // We assemble the forbidden substring at runtime so this very assertion
+        // does not falsely trip itself.
+        let src = include_str!("main.rs");
+        let forbidden = format!("Box::new({}::{}HandlerNew", "miette", "Narratable")
+            .replace("HandlerNew", "Handler::new()");
+        assert!(
+            !src.contains(&forbidden),
+            "the plain-text screen-reader handler is being installed by the miette hook — \
+             this regresses the rendering. Use GraphicalReportHandler instead."
+        );
+    }
+
+    #[test]
+    fn graphical_handler_is_installed() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("GraphicalReportHandler::new()"),
+            "GraphicalReportHandler::new() is not installed in the miette hook"
+        );
+    }
 }

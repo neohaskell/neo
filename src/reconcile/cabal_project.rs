@@ -11,7 +11,7 @@ pub fn generate<P: AsRef<Path>>(
     config: &ResolvedConfig,
 ) -> miette::Result<()> {
     let template = env.get_template("cabal.project")
-        .map_err(|e| NeoError::TemplateError(e.to_string()))?;
+        .map_err(|e| NeoError::TemplateError { template: "cabal.project".to_string(), reason: e.to_string() })?;
 
     let mut git_dependencies = Vec::new();
     let mut file_dependencies = Vec::new();
@@ -32,9 +32,10 @@ pub fn generate<P: AsRef<Path>>(
         git_dependencies => git_dependencies,
         file_dependencies => file_dependencies,
         neo_sha => config.neo_sha,
-    }).map_err(|e| NeoError::TemplateError(e.to_string()))?;
+    }).map_err(|e| NeoError::TemplateError { template: "cabal.project".to_string(), reason: e.to_string() })?;
 
-    fs::write(project_dir.as_ref().join("cabal.project"), rendered).map_err(NeoError::IoError)?;
+    let out_path = project_dir.as_ref().join("cabal.project");
+    fs::write(&out_path, rendered).map_err(|e| NeoError::io_at("writing generated `cabal.project` at", &out_path, e))?;
 
     Ok(())
 }

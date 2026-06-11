@@ -48,15 +48,17 @@ pub async fn run_test(path: &PathBuf, output_mode: &mut OutputMode) -> miette::R
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| NeoError::SubprocessError { 
-            command: format!("hurl --test {:?}", path),
-            output: format!("Failed to spawn hurl: {}", e)
+        .map_err(|e| NeoError::SubprocessFailed {
+            operation: format!("spawning `nix develop --command hurl --test {}`", path.display()),
+            cause: format!("could not spawn child process: {}", e),
+            fix: "Ensure `nix` is installed and `hurl` is available inside `nix develop` (it is in this repo's flake). Re-run from the project root.".to_string(),
         })?;
 
     let status = child.wait().await
-        .map_err(|e| NeoError::SubprocessError { 
-            command: format!("hurl --test {:?}", path),
-            output: format!("Failed to wait for hurl: {}", e)
+        .map_err(|e| NeoError::SubprocessFailed {
+            operation: format!("waiting on `hurl --test {}`", path.display()),
+            cause: format!("could not reap child process: {}", e),
+            fix: "Re-run. If reproducible, your shell may be out of file descriptors (`ulimit -n`).".to_string(),
         })?;
 
     let duration = start.elapsed();

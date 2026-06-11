@@ -5,7 +5,6 @@ use ratatui::{
     buffer::Buffer,
 };
 use crate::theme::Theme;
-use crate::tui::mascot::Mascot;
 
 pub struct Banner<'a> {
     pub theme: &'a Theme,
@@ -27,34 +26,23 @@ impl<'a> Banner<'a> {
 
 impl<'a> Widget for Banner<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let _ = self.frame;
         let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(40), // Mascot area
-                Constraint::Min(0),      // Title area
-            ])
-            .split(area);
-
-        // Render Mascot
-        let mascot = Mascot::new(self.theme).with_frame(self.frame);
-        mascot.render(chunks[0], buf);
-
-        // Render Title
-        let title_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // Title
                 Constraint::Length(1), // Subtitle
+                Constraint::Min(0),
             ])
-            .split(chunks[1]);
+            .split(area);
 
         let title = Paragraph::new(Line::from(self.title))
             .style(self.theme.style_primary().add_modifier(ratatui::style::Modifier::BOLD));
-        title.render(title_chunks[0], buf);
-        
+        title.render(chunks[0], buf);
+
         let subtitle = Paragraph::new(Line::from(self.subtitle))
             .style(self.theme.style_muted());
-        subtitle.render(title_chunks[1], buf);
+        subtitle.render(chunks[1], buf);
     }
 }
 
@@ -70,9 +58,11 @@ mod tests {
         let area = Rect::new(0, 0, 80, 10);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
-        
+
         let content = buf.content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("NEO"));
         assert!(content.contains("Subtitle"));
+        assert!(!content.contains("║ :)║"));
+        assert!(!content.contains("╔═══╗"));
     }
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::errors::NeoError;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct NeoConfig {
     pub name: String,
@@ -16,6 +16,15 @@ pub struct NeoConfig {
     pub license: String,
     #[serde(default)]
     pub dependencies: HashMap<String, String>,
+
+    /// Path the config was loaded from, for diagnostic source spans.
+    /// `None` when the config was constructed programmatically (tests, defaults).
+    #[serde(skip)]
+    pub source_path: Option<String>,
+    /// Raw file content the config was parsed from. Used by dependency-error
+    /// diagnostics to underline the offending entry in the source.
+    #[serde(skip)]
+    pub source_content: Option<String>,
 }
 
 fn default_license() -> String {
@@ -29,15 +38,29 @@ impl NeoConfig {
             return Err(NeoError::NoWorkspace.into());
         }
 
-        let content = std::fs::read_to_string(path).map_err(NeoError::IoError)?;
-        
-        serde_json::from_str(&content).map_err(|e| {
-            NeoError::InvalidConfig {
-                line: e.line(),
-                col: e.column(),
-                reason: e.to_string(),
-            }.into()
-        })
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| NeoError::io_at("reading `neo.json`", path, e))?;
+
+        let path_str = path.display().to_string();
+        let parsed: Result<NeoConfig, _> = serde_json::from_str(&content);
+        match parsed {
+            Ok(mut config) => {
+                config.source_path = Some(path_str);
+                config.source_content = Some(content);
+                Ok(config)
+            }
+            Err(e) => {
+                let line = e.line();
+                let col = e.column();
+                let offset = miette::SourceOffset::from_location(&content, line, col);
+                Err(NeoError::InvalidConfig {
+                    reason: e.to_string(),
+                    src: miette::NamedSource::new(path_str, content),
+                    bad_bit: miette::SourceSpan::new(offset, 1usize),
+                }
+                .into())
+            }
+        }
     }
 }
 

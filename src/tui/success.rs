@@ -5,7 +5,6 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 use crate::theme::Theme;
-use crate::tui::mascot::Mascot;
 
 pub struct SuccessDisplay<'a> {
     theme: &'a Theme,
@@ -35,8 +34,8 @@ impl<'a> SuccessDisplay<'a> {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(12), // Banner
-                        Constraint::Min(0),      // Content
+                        Constraint::Length(5), // Banner
+                        Constraint::Min(0),     // Content
                     ])
                     .split(f.area());
 
@@ -54,33 +53,22 @@ impl<'a> SuccessDisplay<'a> {
 
 impl<'a> Widget for SuccessDisplay<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let _ = self.frame;
         let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Length(40), // Mascot area
-                Constraint::Min(0),      // Message area
-            ])
-            .split(area);
-
-        // Render Mascot
-        let mascot = Mascot::new(self.theme).with_frame(self.frame);
-        mascot.render(chunks[0], buf);
-
-        let msg_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(2), // Padding
+                Constraint::Length(1), // Padding
                 Constraint::Length(1), // Message
                 Constraint::Min(0),
             ])
-            .split(chunks[1]);
+            .split(area);
 
         let success_line = Line::from(vec![
             Span::styled("✓ ", self.theme.style_success()),
             Span::styled(self.message, self.theme.style_success()),
         ]);
-        
-        Paragraph::new(success_line).render(msg_chunks[1], buf);
+
+        Paragraph::new(success_line).render(chunks[1], buf);
     }
 }
 
@@ -96,9 +84,10 @@ mod tests {
         let area = Rect::new(0, 0, 80, 10);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
-        
+
         let content = buf.content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("✓"));
         assert!(content.contains("Build succeeded!"));
+        assert!(!content.contains("║ :)║"));
     }
 }

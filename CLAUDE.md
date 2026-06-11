@@ -60,6 +60,21 @@ Either way, do not mask or `#[ignore]` these scenarios — they are the intended
 
 If you change any subcommand surface, error message, output prefix (`[info]` / `[ok]` / `[error]` / `[fail]`), or the generated project layout, look for the affected assertions in both `tests/integration_tests.rs` and `tests/e2e.rs` and update them in the same change.
 
+## Errors as repair instructions (HARD invariant)
+
+Every user-facing error in this repo — `NeoError` variants, miette diagnostics, subprocess wraps, panics reachable from user input — must be readable and **actionable by the smallest dumb LLM** (gemini-flash-2.5, haiku, gpt-3.5-nano level). Opaque errors are bugs of equal severity to wrong results.
+
+Every error message must include, in this order:
+
+1. **What operation failed** — verb + noun ("parsing `neo.json` dependency value", not "Subprocess error").
+2. **The bad input quoted** — file path + line, the exact string, the env var name. Empty values appear as `""`, never blank.
+3. **The expected shape** — grammar, schema, one valid example.
+4. **A concrete fix recipe** — copy-pasteable edit or command. Not "check the docs". Not "verify your config".
+
+Subprocess wraps must interpret known stderr patterns (cabal `unknown package: X` → "add `X` to neo.json as `hackage:X` or `git:...`", nix `attribute missing` → regenerate, git `couldn't find ref` → fix the `#ref`). Do not dump raw child stderr without interpretation.
+
+The full contract, examples, and bad→good rewrites live in `.claude/skills/error-messages-instruct-llms/SKILL.md`. Read it before writing or modifying any error-producing code.
+
 ## Writing implementation plans
 
 When proposing a non-trivial change in plan mode, the **Tests** and **Verification** sections are not summaries — they are specifications. Treat them as a contract with the reviewer, not a TODO list. They must enumerate:

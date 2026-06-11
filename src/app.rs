@@ -71,13 +71,8 @@ pub async fn dispatch(
             commands::lock::run(args, output_mode).await?;
         }
         None => {
-            if matches!(output_mode, OutputMode::Interactive) {
-                let mascot = include_str!("../assets/neo_mascot.txt");
-                println!("{}", mascot);
-                println!("The NeoHaskell CLI. Run `neo --help` for commands.");
-            } else {
-                println!("The NeoHaskell CLI. Run `neo --help` for commands.");
-            }
+            let _ = output_mode;
+            println!("The NeoHaskell CLI. Run `neo --help` for commands.");
         }
     }
     

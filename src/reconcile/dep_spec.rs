@@ -131,10 +131,14 @@ pub fn parse(name_key: &str, value: &str) -> miette::Result<(String, DependencyD
 }
 
 fn invalid(key: &str, value: &str, reason: &str) -> miette::Report {
+    // The pure parser has no NeoConfig in scope — spans are attached at the
+    // caller (`resolve::resolve_decl`) where the file content is available.
     NeoError::InvalidDependency {
         key: key.to_string(),
         value: value.to_string(),
         reason: reason.to_string(),
+        src: None,
+        span: None,
     }
     .into()
 }

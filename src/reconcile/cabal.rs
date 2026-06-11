@@ -12,7 +12,7 @@ pub fn generate<P: AsRef<Path>>(
     modules: &[String],
 ) -> miette::Result<()> {
     let template = env.get_template("project.cabal")
-        .map_err(|e| NeoError::TemplateError(e.to_string()))?;
+        .map_err(|e| NeoError::TemplateError { template: "project.cabal".to_string(), reason: e.to_string() })?;
     
     let dependencies: Vec<(String, String)> = config.dependencies.iter().map(|dep| {
         let version = match &dep.source {
@@ -30,10 +30,11 @@ pub fn generate<P: AsRef<Path>>(
         author => config.author,
         modules => modules,
         dependencies => dependencies,
-    }).map_err(|e| NeoError::TemplateError(e.to_string()))?;
+    }).map_err(|e| NeoError::TemplateError { template: "project.cabal".to_string(), reason: e.to_string() })?;
 
     let filename = format!("{}.cabal", config.name);
-    fs::write(project_dir.as_ref().join(filename), rendered).map_err(NeoError::IoError)?;
+    let out_path = project_dir.as_ref().join(filename);
+    fs::write(&out_path, rendered).map_err(|e| NeoError::io_at("writing generated cabal file at", &out_path, e))?;
 
     Ok(())
 }

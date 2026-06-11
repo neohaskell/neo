@@ -341,7 +341,13 @@ fn build_invalid_neo_json_fails_with_parseerror() {
         .args(["build", "--ci"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Failed to parse `neo.json`"));
+        .stderr(predicate::str::contains("Failed to parse `neo.json`"))
+        // GraphicalReportHandler renders a source-pointer block with the
+        // filename + caret + label. assert_cmd captures stderr (non-TTY) so
+        // we get the ASCII fallback `,-[neo.json:line:col]`.
+        .stderr(predicate::str::contains("neo.json:").and(
+            predicate::str::contains("syntax error here")
+        ));
 }
 
 #[test]

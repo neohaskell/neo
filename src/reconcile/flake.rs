@@ -11,15 +11,16 @@ pub fn generate<P: AsRef<Path>>(
     config: &ResolvedConfig,
 ) -> miette::Result<()> {
     let template = env.get_template("flake.nix")
-        .map_err(|e| NeoError::TemplateError(e.to_string()))?;
+        .map_err(|e| NeoError::TemplateError { template: "flake.nix".to_string(), reason: e.to_string() })?;
 
     let rendered = template.render(context! {
         name => config.name,
         description => config.description,
         neo_sha => config.neo_sha,
-    }).map_err(|e| NeoError::TemplateError(e.to_string()))?;
+    }).map_err(|e| NeoError::TemplateError { template: "flake.nix".to_string(), reason: e.to_string() })?;
 
-    fs::write(project_dir.as_ref().join("flake.nix"), rendered).map_err(NeoError::IoError)?;
+    let out_path = project_dir.as_ref().join("flake.nix");
+    fs::write(&out_path, rendered).map_err(|e| NeoError::io_at("writing generated `flake.nix` at", &out_path, e))?;
 
     Ok(())
 }

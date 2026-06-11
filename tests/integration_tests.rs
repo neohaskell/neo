@@ -15,6 +15,20 @@ fn test_version() {
 }
 
 #[test]
+fn bare_neo_prints_single_line_hint_no_mascot() {
+    let mut cmd = neo_cmd();
+    cmd.arg("--ci")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("The NeoHaskell CLI"))
+        .stdout(predicate::str::contains("neo --help"))
+        // Mascot art must not appear anywhere.
+        .stdout(predicate::str::contains("╔═══╗").not())
+        .stdout(predicate::str::contains("║ :)║").not())
+        .stdout(predicate::str::contains("╚═══╝").not());
+}
+
+#[test]
 fn test_help() {
     let mut cmd = neo_cmd();
     cmd.arg("--help")
@@ -335,7 +349,13 @@ fn test_neo_build_invalid_config() {
         .arg("--ci")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Failed to parse `neo.json`"));
+        .stderr(predicate::str::contains("Failed to parse `neo.json`"))
+        // The new GraphicalReportHandler renders a source-pointer block:
+        // either with unicode `╭─[neo.json:` (TTY) or ASCII `,-[neo.json:` (pipe).
+        // assert_cmd pipes stderr, so we get the ASCII fallback.
+        .stderr(predicate::str::contains("neo.json:").and(
+            predicate::str::contains("syntax error here")
+        ));
 }
 
 #[test]
@@ -488,7 +508,8 @@ fn test_neo_lock_check_violation() {
         .arg("--ci")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("locked and cannot be committed"));
+        .stderr(predicate::str::contains("locked and cannot be committed"))
+        .stderr(predicate::str::contains("neo lock --remove"));
 }
 
 #[test]

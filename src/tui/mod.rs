@@ -1,4 +1,3 @@
-pub mod mascot;
 pub mod banner;
 pub mod prompt;
 pub mod selection;

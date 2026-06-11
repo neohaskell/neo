@@ -76,22 +76,20 @@ async fn check_locked_files(output_mode: &OutputMode) -> Result<()> {
     }
 
     if !locked_staged.is_empty() {
-        match output_mode {
-            OutputMode::Ci => {
-                eprintln!("Error: The following files are locked and cannot be committed:");
-                for file in locked_staged {
-                    eprintln!("  - {}", file);
-                }
-                std::process::exit(1);
-            }
-            OutputMode::Interactive => {
-                eprintln!("Error: The following files are locked and cannot be committed:");
-                for file in locked_staged {
-                    eprintln!("  - {}", file);
-                }
-                std::process::exit(1);
-            }
+        let _ = output_mode;
+        eprintln!("Error: The following files are locked and cannot be committed:");
+        for file in &locked_staged {
+            eprintln!("  - {}", file);
         }
+        eprintln!();
+        eprintln!("These files were locked by `neo lock` to freeze the event-sourced domain — committing them would silently break event replay.");
+        eprintln!();
+        eprintln!("Fix: unlock each file before committing, then re-stage and commit. For example:");
+        for file in &locked_staged {
+            eprintln!("  neo lock --remove {}", file);
+        }
+        eprintln!("(Or unlock everything at once with `neo lock --remove --all`.)");
+        std::process::exit(1);
     }
 
     Ok(())

@@ -55,7 +55,7 @@ pub async fn resolve(config: &NeoConfig) -> miette::Result<ResolvedConfig> {
 
     let mut deps = Vec::with_capacity(parsed.len());
     for (name, decl) in parsed {
-        let source = resolve_decl(&name, &decl, registry.as_ref())?;
+        let source = resolve_decl(&name, &decl, registry.as_ref(), Some(config))?;
         deps.push(ResolvedDependency { name, source });
     }
     // Sort for deterministic generated artifacts.
@@ -84,6 +84,7 @@ pub(crate) fn resolve_decl(
     name: &str,
     decl: &DependencyDecl,
     registry: Option<&NeoPackages>,
+    config: Option<&NeoConfig>,
 ) -> miette::Result<DependencySource> {
     match decl {
         DependencyDecl::Hackage { req } => {
@@ -98,18 +99,35 @@ pub(crate) fn resolve_decl(
             rev: git_ref.clone().unwrap_or_else(|| "main".to_string()),
         }),
         DependencyDecl::File { path } => Ok(DependencySource::File(path.clone())),
-        DependencyDecl::Bare { req } => resolve_bare(name, req, registry),
+        DependencyDecl::Bare { req } => resolve_bare(name, req, registry, config),
     }
+}
+
+/// Build the (src, span) pair to attach to an `InvalidDependency` error, if the
+/// caller has a loaded `NeoConfig` with source info. Returns `(None, None)` for
+/// programmatic / test fixtures with no source.
+fn dep_source(
+    config: Option<&NeoConfig>,
+    name: &str,
+) -> (Option<miette::NamedSource<String>>, Option<miette::SourceSpan>) {
+    let Some(config) = config else { return (None, None) };
+    let Some(content) = config.source_content.as_ref() else { return (None, None) };
+    let path = config.source_path.as_deref().unwrap_or("neo.json");
+    (
+        Some(miette::NamedSource::new(path, content.clone())),
+        crate::errors::key_span(content, name),
+    )
 }
 
 fn resolve_bare(
     name: &str,
     req: &NpmRange,
     registry: Option<&NeoPackages>,
+    config: Option<&NeoConfig>,
 ) -> miette::Result<DependencySource> {
     let registry = match registry {
         Some(r) => r,
-        None => return Err(unknown_package(name, &[])),
+        None => return Err(unknown_package(name, &[], config)),
     };
 
     // NEO_SKIP_NETWORK returns an empty registry; emit a stub so existing offline
@@ -123,10 +141,10 @@ fn resolve_bare(
     }
 
     let meta = registry.packages.get(name).ok_or_else(|| {
-        unknown_package(name, &registry.packages.keys().cloned().collect::<Vec<_>>())
+        unknown_package(name, &registry.packages.keys().cloned().collect::<Vec<_>>(), config)
     })?;
 
-    let picked = pick_best_version(name, req, meta)?;
+    let picked = pick_best_version(name, req, meta, config)?;
     let rev = meta
         .versions
         .get(&picked)
@@ -140,15 +158,19 @@ fn pick_best_version(
     name: &str,
     req: &NpmRange,
     meta: &NeoPackageMetadata,
+    config: Option<&NeoConfig>,
 ) -> miette::Result<String> {
     use nodejs_semver::{Range, Version};
 
     let range_str = npm_range_string(req);
     let range: Range = range_str.parse().map_err(|e: nodejs_semver::SemverError| {
+        let (src, span) = dep_source(config, name);
         NeoError::InvalidDependency {
             key: name.to_string(),
             value: range_str.clone(),
             reason: format!("internal: re-parsing npm range failed: {}", e),
+            src,
+            span,
         }
     })?;
 
@@ -166,6 +188,7 @@ fn pick_best_version(
     }
 
     let available: Vec<String> = versions.into_iter().map(|(k, _)| k).collect();
+    let (src, span) = dep_source(config, name);
     Err(NeoError::InvalidDependency {
         key: name.to_string(),
         value: range_str,
@@ -174,6 +197,8 @@ fn pick_best_version(
             name,
             available.join(", "),
         ),
+        src,
+        span,
     }
     .into())
 }
@@ -211,7 +236,7 @@ fn npm_range_string(req: &NpmRange) -> String {
     }
 }
 
-fn unknown_package(name: &str, available: &[String]) -> miette::Report {
+fn unknown_package(name: &str, available: &[String], config: Option<&NeoConfig>) -> miette::Report {
     let hint = if available.is_empty() {
         "use `hackage:<name>` for a Hackage package, or `git:<url>` for a git source".to_string()
     } else {
@@ -220,6 +245,7 @@ fn unknown_package(name: &str, available: &[String]) -> miette::Report {
             available.join(", "),
         )
     };
+    let (src, span) = dep_source(config, name);
     NeoError::InvalidDependency {
         key: name.to_string(),
         value: String::new(),
@@ -227,6 +253,8 @@ fn unknown_package(name: &str, available: &[String]) -> miette::Report {
             "package `{}` not found in the NeoPackages registry. Hint: {}",
             name, hint
         ),
+        src,
+        span,
     }
     .into()
 }
@@ -269,7 +297,7 @@ mod tests {
 
     fn resolve_one(name: &str, value: &str, registry: Option<&NeoPackages>) -> miette::Result<DependencySource> {
         let (n, decl) = dep_spec::parse(name, value)?;
-        resolve_decl(&n, &decl, registry)
+        resolve_decl(&n, &decl, registry, None)
     }
 
     // ===== happy paths =====
@@ -405,6 +433,8 @@ mod tests {
             author: None,
             license: "MIT".to_string(),
             dependencies: deps,
+            source_path: None,
+            source_content: None,
         };
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
         let resolved = resolve(&config).await.unwrap();
@@ -481,6 +511,8 @@ mod tests {
             description: None, author: None,
             license: "MIT".to_string(),
             dependencies: deps,
+            source_path: None,
+            source_content: None,
         };
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
         let resolved = resolve(&config).await.unwrap();
@@ -501,6 +533,8 @@ mod tests {
             description: None, author: None,
             license: "MIT".to_string(),
             dependencies: deps,
+            source_path: None,
+            source_content: None,
         };
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
         let r1 = resolve(&config).await.unwrap();
@@ -523,6 +557,8 @@ mod tests {
             description: None, author: None,
             license: "MIT".to_string(),
             dependencies: deps,
+            source_path: None,
+            source_content: None,
         };
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
         let resolved = resolve(&config).await.unwrap();

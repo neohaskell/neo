@@ -11,7 +11,6 @@ use ratatui::{
     Frame,
 };
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,14 +299,19 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
         return Err(crate::errors::NeoError::DirectoryExists { name: config.name }.into());
     }
 
-    std::fs::create_dir_all(&project_path).map_err(|e| {
-        miette::miette!("Failed to create directory: {}", e)
-    })?;
+    std::fs::create_dir_all(&project_path)
+        .map_err(|e| crate::errors::NeoError::io_at("creating the new project directory at", &project_path, e))?;
 
     // Write neo.json
-    let config_json = serde_json::to_string_pretty(&config).unwrap();
-    let mut config_file = std::fs::File::create(project_path.join("neo.json")).unwrap();
-    config_file.write_all(config_json.as_bytes()).unwrap();
+    let neo_json_path = project_path.join("neo.json");
+    let config_json = serde_json::to_string_pretty(&config)
+        .map_err(|e| crate::errors::NeoError::io_at(
+            "serializing default `neo.json` for",
+            &neo_json_path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        ))?;
+    std::fs::write(&neo_json_path, config_json.as_bytes())
+        .map_err(|e| crate::errors::NeoError::io_at("writing initial `neo.json` to", &neo_json_path, e))?;
 
     // Fetch starter template
     crate::network::fetch_starter_template(&project_path).await?;
@@ -315,21 +319,24 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
     // Ensure launcher/Launcher.hs exists
     let launcher_dir = project_path.join("launcher");
     if !launcher_dir.exists() {
-        std::fs::create_dir_all(&launcher_dir).map_err(crate::errors::NeoError::IoError)?;
+        std::fs::create_dir_all(&launcher_dir)
+            .map_err(|e| crate::errors::NeoError::io_at("creating the launcher directory at", &launcher_dir, e))?;
     }
     let launcher_hs = launcher_dir.join("Launcher.hs");
     if !launcher_hs.exists() {
         let launcher_content = format!(
             "module Main where\n\nimport App\n\nmain :: IO ()\nmain = App.run\n"
         );
-        std::fs::write(launcher_hs, launcher_content).map_err(crate::errors::NeoError::IoError)?;
+        std::fs::write(&launcher_hs, launcher_content)
+            .map_err(|e| crate::errors::NeoError::io_at("writing `launcher/Launcher.hs` to", &launcher_hs, e))?;
     }
 
     // Ensure src/App.hs exists (since Launcher.hs imports it)
     let src_app = project_path.join("src/App.hs");
     if !src_app.exists() {
         let app_content = "module App where\n\nrun :: IO ()\nrun = putStrLn \"Hello from NeoHaskell!\"\n";
-        std::fs::write(src_app, app_content).map_err(crate::errors::NeoError::IoError)?;
+        std::fs::write(&src_app, app_content)
+            .map_err(|e| crate::errors::NeoError::io_at("writing `src/App.hs` to", &src_app, e))?;
     }
 
     // Run reconciliation to generate .cabal, flake.nix, etc.
@@ -342,16 +349,20 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
         author: if config.author.is_empty() { None } else { Some(config.author.clone()) },
         license: config.license.clone(),
         dependencies: std::collections::HashMap::new(),
+        source_path: None,
+        source_content: None,
     };
     crate::reconcile::run(&project_path, &neo_config).await?;
 
     // Safeguard .gitignore: ensure *.cabal is not ignored
     let gitignore_path = project_path.join(".gitignore");
     if gitignore_path.exists() {
-        let mut content = std::fs::read_to_string(&gitignore_path).map_err(crate::errors::NeoError::IoError)?;
+        let mut content = std::fs::read_to_string(&gitignore_path)
+            .map_err(|e| crate::errors::NeoError::io_at("reading `.gitignore` at", &gitignore_path, e))?;
         if !content.contains("!*.cabal") {
             content.push_str("\n# Ensure cabal files are tracked for Nix\n!*.cabal\n");
-            std::fs::write(&gitignore_path, content).map_err(crate::errors::NeoError::IoError)?;
+            std::fs::write(&gitignore_path, content)
+                .map_err(|e| crate::errors::NeoError::io_at("appending to `.gitignore` at", &gitignore_path, e))?;
         }
     }
 
@@ -361,7 +372,9 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
 
     // Write .envrc for direnv/HLS integration
     let envrc_content = "use flake\n";
-    std::fs::write(project_path.join(".envrc"), envrc_content).map_err(crate::errors::NeoError::IoError)?;
+    let envrc_path = project_path.join(".envrc");
+    std::fs::write(&envrc_path, envrc_content)
+        .map_err(|e| crate::errors::NeoError::io_at("writing `.envrc` to", &envrc_path, e))?;
 
     // Add all files to git so Nix flakes can see them
     crate::git::add_all(&project_path)?;

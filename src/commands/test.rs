@@ -31,14 +31,7 @@ pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()
             println!("[info] Running unit tests...");
         }
         
-        let unit_test_result = nix::test(output_mode).await;
-        
-        if let Err(e) = unit_test_result {
-            if output_mode.is_ci() {
-                eprintln!("[error] Unit tests failed: {}", e);
-            }
-            return Err(e);
-        }
+        nix::test(output_mode).await?;
 
         if output_mode.is_ci() {
             println!("[ok] Unit tests passed");
@@ -119,7 +112,9 @@ pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()
                     Err(e) => {
                         failed += 1;
                         if output_mode.is_ci() {
-                            eprintln!("[error] Failed to run test {}: {}", test_path.display(), e);
+                            // Print the diagnostic compactly; don't double up — the caller will
+                            // also see the final `cabal test all failed: …` aggregate below.
+                            eprintln!("[fail] {}: {}", test_path.display(), e);
                         }
                     }
                 }
@@ -158,9 +153,10 @@ pub async fn run(watch: bool, output_mode: &mut OutputMode) -> miette::Result<()
             }
 
             if failed > 0 {
-                return Err(crate::errors::NeoError::SubprocessError { 
-                    command: "hurl tests".to_string(), 
-                    output: format!("{} integration tests failed", failed) 
+                return Err(crate::errors::NeoError::SubprocessFailed {
+                    operation: "running Hurl integration tests".to_string(),
+                    cause: format!("{} of {} tests failed", failed, passed + failed),
+                    fix: "Inspect the failing test output above to identify which assertions failed. Common causes: (a) the server under test is not running — start it with `neo run` in another terminal, (b) request fixtures are stale — update the `.hurl` files in `tests/` to match the current API, (c) the response shape changed — update the assertions.".to_string(),
                 }.into());
             }
         } else {

@@ -19,17 +19,17 @@ pub async fn run<P: AsRef<Path>>(project_dir: P, config: &NeoConfig) -> miette::
         "project.cabal",
         include_str!("../../assets/templates/project.cabal.j2"),
     )
-    .map_err(|e| NeoError::TemplateError(e.to_string()))?;
+    .map_err(|e| NeoError::TemplateError { template: "project.cabal".to_string(), reason: e.to_string() })?;
     env.add_template(
         "flake.nix",
         include_str!("../../assets/templates/flake.nix.j2"),
     )
-    .map_err(|e| NeoError::TemplateError(e.to_string()))?;
+    .map_err(|e| NeoError::TemplateError { template: "flake.nix".to_string(), reason: e.to_string() })?;
     env.add_template(
         "cabal.project",
         include_str!("../../assets/templates/cabal.project.j2"),
     )
-    .map_err(|e| NeoError::TemplateError(e.to_string()))?;
+    .map_err(|e| NeoError::TemplateError { template: "cabal.project".to_string(), reason: e.to_string() })?;
 
     let resolved = resolve::resolve(config).await?;
     let modules = modules::discover(project_dir.join("src"));
@@ -63,6 +63,8 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            source_path: None,
+            source_content: None,
         }
     }
 

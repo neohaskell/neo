@@ -35,7 +35,6 @@ Build NeoCLI, the NeoHaskell CLI tool, in Rust. It must deliver a polished, bran
 neocli/
 ├── [x] Cargo.toml
 ├── assets/
-│   ├── [x] neo_mascot.txt          # ASCII art for the Neo CRT mascot
 │   └── templates/                  # .cabal, flake.nix, cabal.project templates
 │       ├── [ ] project.cabal.j2
 │       ├── [ ] flake.nix.j2
@@ -68,13 +67,12 @@ neocli/
 │   │
 │   ├── tui/                        # All terminal UI components
 │   │   ├── [x] mod.rs
-│   │   ├── [x] mascot.rs           # Neo mascot ASCII art widget
-│   │   ├── [ ] banner.rs           # Top banner with big text + mascot
+│   │   ├── [ ] banner.rs           # Top banner with big text
 │   │   ├── [ ] spinner.rs          # Animated spinner widget
 │   │   ├── [ ] progress.rs         # Progress bar widget
 │   │   ├── [ ] prompt.rs           # Interactive input prompt widget
 │   │   ├── [ ] confirm.rs          # Y/n confirmation widget
-│   │   ├── [ ] success.rs          # Green success message with mascot
+│   │   ├── [ ] success.rs          # Green success message
 │   │   ├── [ ] error_display.rs    # Red error display with hints
 │   │   └── [ ] watch.rs            # Watch-mode full-screen layout
 │   │
@@ -319,17 +317,7 @@ impl Theme {
 
 These guidelines ensure NeoCLI delivers a **fantastic, polished** terminal experience.
 
-### 7.1 Mascot Rendering
-
-The Neo CRT mascot is stored as ASCII art in `assets/neo_mascot.txt` and embedded via `include_str!`. It is rendered as a `Paragraph` widget with the brand `primary` color.
-
-**Rules:**
-- Show mascot on: bare `neo` invocation, `neo new` interview banner, success messages
-- Never show mascot in `--ci` mode
-- Mascot is rendered in a fixed-width `Rect` — measure the art and constrain layout accordingly
-- Use `tui-big-text` for the "NEO" title text beside the mascot
-
-### 7.2 Layout Principles
+### 7.1 Layout Principles
 
 ```
 ┌─────────────────────────────────────────┐
