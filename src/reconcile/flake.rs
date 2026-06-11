@@ -45,6 +45,7 @@ mod tests {
             description: Some("A test description".to_string()),
             author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: vec![],
         };
 

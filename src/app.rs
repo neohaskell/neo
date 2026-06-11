@@ -55,8 +55,8 @@ pub async fn dispatch(
     update_status: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 ) -> miette::Result<()> {
     match command {
-        Some(Commands::New { project_name }) => {
-            commands::new::run(project_name, output_mode, update_status).await?;
+        Some(Commands::New { project_name, library }) => {
+            commands::new::run(project_name, library, output_mode, update_status).await?;
         }
         Some(Commands::Build { watch }) => {
             commands::build::run(watch, output_mode).await?;
@@ -144,7 +144,7 @@ mod tests {
         
         unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
         
-        let command = Some(Commands::New { project_name: Some("dispatch-project".to_string()) });
+        let command = Some(Commands::New { project_name: Some("dispatch-project".to_string()), library: false });
         let mut output_mode = OutputMode::Ci;
         let update_status = std::sync::Arc::new(std::sync::Mutex::new(None));
         

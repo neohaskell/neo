@@ -55,6 +55,7 @@ mod tests {
             description: None,
             author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: deps,
         }
     }

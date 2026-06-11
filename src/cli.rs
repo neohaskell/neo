@@ -25,6 +25,9 @@ pub enum Commands {
     New {
         /// Project name (required in --ci mode)
         project_name: Option<String>,
+        /// Scaffold a library project (no launcher folder, no executable cabal stanza)
+        #[arg(long)]
+        library: bool,
     },
     /// Reconcile config and build the project
     #[command(long_about = "Automatically generate Nix and Cabal files from neo.json and build the project. \
@@ -86,7 +89,22 @@ mod tests {
     fn test_parse_new() {
         let cli = Cli::try_parse_from(["neo", "new", "my-project"]).unwrap();
         match cli.command {
-            Some(Commands::New { project_name }) => assert_eq!(project_name, Some("my-project".into())),
+            Some(Commands::New { project_name, library }) => {
+                assert_eq!(project_name, Some("my-project".into()));
+                assert!(!library);
+            }
+            _ => panic!("Expected New command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_new_library() {
+        let cli = Cli::try_parse_from(["neo", "new", "my-lib", "--library"]).unwrap();
+        match cli.command {
+            Some(Commands::New { project_name, library }) => {
+                assert_eq!(project_name, Some("my-lib".into()));
+                assert!(library);
+            }
             _ => panic!("Expected New command"),
         }
     }

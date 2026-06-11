@@ -1,4 +1,5 @@
 use crate::app::{Action, State};
+use crate::config::ProjectKind;
 use crate::output::OutputMode;
 use crate::theme::Theme;
 use crate::tui::banner::Banner;
@@ -22,6 +23,12 @@ pub struct ProjectConfig {
     pub description: String,
     pub author: String,
     pub license: String,
+    #[serde(rename = "type", default, skip_serializing_if = "is_executable")]
+    pub kind: ProjectKind,
+}
+
+fn is_executable(k: &ProjectKind) -> bool {
+    matches!(k, ProjectKind::Executable)
 }
 
 impl Default for ProjectConfig {
@@ -33,6 +40,7 @@ impl Default for ProjectConfig {
             description: "A new NeoHaskell project".to_string(),
             author: "Anonymous".to_string(),
             license: "MIT".to_string(),
+            kind: ProjectKind::Executable,
         }
     }
 }
@@ -257,12 +265,15 @@ use crate::tui::success::SuccessDisplay;
 
 pub async fn run(
     project_name: Option<String>,
+    library: bool,
     output_mode: &mut OutputMode,
     update_status: Arc<Mutex<Option<String>>>,
 ) -> miette::Result<()> {
     let theme = Theme::neo();
 
-    let config = if matches!(output_mode, OutputMode::Interactive) {
+    let kind = if library { ProjectKind::Library } else { ProjectKind::Executable };
+
+    let mut config = if matches!(output_mode, OutputMode::Interactive) {
         // Enter alternate screen for the interview
         crossterm::terminal::enable_raw_mode().into_diagnostic()?;
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
@@ -287,6 +298,8 @@ pub async fn run(
             ..ProjectConfig::default()
         }
     };
+
+    config.kind = kind;
 
     scaffold_project(config, output_mode).await?;
 
@@ -316,22 +329,35 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
     // Fetch starter template
     crate::network::fetch_starter_template(&project_path).await?;
 
-    // Ensure launcher/Launcher.hs exists
-    let launcher_dir = project_path.join("launcher");
-    if !launcher_dir.exists() {
-        std::fs::create_dir_all(&launcher_dir)
-            .map_err(|e| crate::errors::NeoError::io_at("creating the launcher directory at", &launcher_dir, e))?;
-    }
-    let launcher_hs = launcher_dir.join("Launcher.hs");
-    if !launcher_hs.exists() {
-        let launcher_content = format!(
-            "module Main where\n\nimport App\n\nmain :: IO ()\nmain = App.run\n"
-        );
-        std::fs::write(&launcher_hs, launcher_content)
-            .map_err(|e| crate::errors::NeoError::io_at("writing `launcher/Launcher.hs` to", &launcher_hs, e))?;
+    // The starter template ships a `launcher/` directory. Library projects don't
+    // need it — remove it after extract so the project tree matches `type: library`.
+    if config.kind.is_library() {
+        let launcher_dir = project_path.join("launcher");
+        if launcher_dir.exists() {
+            std::fs::remove_dir_all(&launcher_dir)
+                .map_err(|e| crate::errors::NeoError::io_at("removing the starter `launcher/` directory at (library project does not need it)", &launcher_dir, e))?;
+        }
     }
 
-    // Ensure src/App.hs exists (since Launcher.hs imports it)
+    // Ensure launcher/Launcher.hs exists (executable projects only)
+    if !config.kind.is_library() {
+        let launcher_dir = project_path.join("launcher");
+        if !launcher_dir.exists() {
+            std::fs::create_dir_all(&launcher_dir)
+                .map_err(|e| crate::errors::NeoError::io_at("creating the launcher directory at", &launcher_dir, e))?;
+        }
+        let launcher_hs = launcher_dir.join("Launcher.hs");
+        if !launcher_hs.exists() {
+            let launcher_content = format!(
+                "module Main where\n\nimport App\n\nmain :: IO ()\nmain = App.run\n"
+            );
+            std::fs::write(&launcher_hs, launcher_content)
+                .map_err(|e| crate::errors::NeoError::io_at("writing `launcher/Launcher.hs` to", &launcher_hs, e))?;
+        }
+    }
+
+    // Ensure src/App.hs exists (since Launcher.hs imports it for executable projects).
+    // Libraries get the same stub so the starter compiles with an `exposed-modules: App` entry.
     let src_app = project_path.join("src/App.hs");
     if !src_app.exists() {
         let app_content = "module App where\n\nrun :: IO ()\nrun = putStrLn \"Hello from NeoHaskell!\"\n";
@@ -348,6 +374,7 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
         description: if config.description.is_empty() { None } else { Some(config.description.clone()) },
         author: if config.author.is_empty() { None } else { Some(config.author.clone()) },
         license: config.license.clone(),
+        kind: config.kind,
         dependencies: std::collections::HashMap::new(),
         source_path: None,
         source_content: None,

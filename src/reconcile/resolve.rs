@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::NeoConfig;
+use crate::config::{NeoConfig, ProjectKind};
 use crate::errors::NeoError;
 use crate::network::{NeoPackages, PackageTag};
 use crate::reconcile::dep_spec::{self, DependencyDecl, NpmRange};
@@ -29,6 +29,7 @@ pub struct ResolvedConfig {
     pub description: Option<String>,
     pub author: Option<String>,
     pub license: String,
+    pub kind: ProjectKind,
     pub dependencies: Vec<ResolvedDependency>,
 }
 
@@ -87,6 +88,7 @@ pub async fn resolve(config: &NeoConfig) -> miette::Result<ResolvedConfig> {
         description: config.description.clone(),
         author: config.author.clone(),
         license: config.license.clone(),
+        kind: config.kind,
         dependencies: deps,
     })
 }
@@ -485,6 +487,7 @@ mod tests {
             description: None,
             author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: deps,
             source_path: None,
             source_content: None,
@@ -577,6 +580,7 @@ mod tests {
             neo_version: "main".to_string(),
             description: None, author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: deps,
             source_path: None,
             source_content: None,
@@ -599,6 +603,7 @@ mod tests {
             neo_version: "main".to_string(),
             description: None, author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: deps,
             source_path: None,
             source_content: None,
@@ -623,6 +628,7 @@ mod tests {
             neo_version: "main".to_string(),
             description: None, author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: deps,
             source_path: None,
             source_content: None,

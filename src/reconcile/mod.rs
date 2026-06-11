@@ -56,6 +56,7 @@ mod tests {
             description: Some("A test project".to_string()),
             author: Some("Neo".to_string()),
             license: "Apache-2.0".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: [
                 ("hackage:text".to_string(), "^2.0.0".to_string()),
                 ("my-git-lib".to_string(), "git:host/g.git#main".to_string()),

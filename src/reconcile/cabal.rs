@@ -30,6 +30,7 @@ pub fn generate<P: AsRef<Path>>(
         author => config.author,
         modules => modules,
         dependencies => dependencies,
+        is_library => config.kind.is_library(),
     }).map_err(|e| NeoError::TemplateError { template: "project.cabal".to_string(), reason: e.to_string() })?;
 
     let filename = format!("{}.cabal", config.name);
@@ -54,6 +55,7 @@ mod tests {
             description: None,
             author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: deps,
         }
     }
@@ -153,6 +155,54 @@ mod tests {
     }
 
     #[test]
+    fn cabal_executable_stanza_by_default() {
+        // Default (Executable) projects keep the `executable <name>` stanza so
+        // `cabal build` can produce the launcher binary.
+        let dir = tempdir().unwrap();
+        let mut env = Environment::new();
+        env.add_template(
+            "project.cabal",
+            include_str!("../../assets/templates/project.cabal.j2"),
+        ).unwrap();
+
+        let mut config = rc(vec![]);
+        config.name = "test-exec".to_string();
+        // kind defaults to Executable in rc()
+
+        generate(dir.path(), &env, &config, &["App".to_string()]).unwrap();
+        let content = fs::read_to_string(dir.path().join("test-exec.cabal")).unwrap();
+        assert!(content.contains("executable test-exec"), "missing executable stanza:\n{}", content);
+        assert!(content.contains("main-is: Launcher.hs"), "missing main-is:\n{}", content);
+        assert!(content.contains("hs-source-dirs: launcher"), "missing launcher source dir:\n{}", content);
+    }
+
+    #[test]
+    fn cabal_omits_executable_stanza_for_library() {
+        // `type: library` projects have no launcher → the generated cabal file
+        // must NOT contain the `executable <name>` stanza, `main-is: Launcher.hs`,
+        // or the `hs-source-dirs: launcher` line. The library stanza stays.
+        let dir = tempdir().unwrap();
+        let mut env = Environment::new();
+        env.add_template(
+            "project.cabal",
+            include_str!("../../assets/templates/project.cabal.j2"),
+        ).unwrap();
+
+        let mut config = rc(vec![]);
+        config.name = "my-lib".to_string();
+        config.kind = crate::config::ProjectKind::Library;
+
+        generate(dir.path(), &env, &config, &["MyLib".to_string()]).unwrap();
+        let content = fs::read_to_string(dir.path().join("my-lib.cabal")).unwrap();
+        assert!(!content.contains("executable my-lib"), "library project should not declare an executable:\n{}", content);
+        assert!(!content.contains("main-is: Launcher.hs"), "library project should not reference Launcher.hs:\n{}", content);
+        assert!(!content.contains("hs-source-dirs: launcher"), "library project should not reference launcher dir:\n{}", content);
+        // Library stanza is still present
+        assert!(content.contains("library"), "library project must keep the library stanza:\n{}", content);
+        assert!(content.contains("hs-source-dirs: src"), "library project should still expose src/:\n{}", content);
+    }
+
+    #[test]
     fn test_generate_cabal_with_modules() {
         let dir = tempdir().unwrap();
 
@@ -167,6 +217,7 @@ mod tests {
             description: None,
             author: None,
             license: "MIT".to_string(),
+            kind: crate::config::ProjectKind::Executable,
             dependencies: vec![],
         };
 

@@ -75,6 +75,64 @@ fn test_neo_new_ci() {
 }
 
 #[test]
+fn test_neo_new_library_ci() {
+    // `--library` should produce a project with no launcher/Launcher.hs file
+    // and a generated .cabal without the `executable <name>` stanza.
+    // The neo.json file should record `"type": "library"`.
+    let temp = tempfile::tempdir().unwrap();
+    let project_name = "test-lib";
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(temp.path())
+        .arg("new")
+        .arg(project_name)
+        .arg("--library")
+        .arg("--ci")
+        .assert()
+        .success();
+
+    let project_path = temp.path().join(project_name);
+    assert!(project_path.exists());
+    assert!(project_path.join("neo.json").exists());
+    assert!(project_path.join("src/App.hs").exists());
+
+    // No launcher folder
+    assert!(
+        !project_path.join("launcher").exists(),
+        "library project must not have a launcher/ directory"
+    );
+    assert!(
+        !project_path.join("launcher/Launcher.hs").exists(),
+        "library project must not have launcher/Launcher.hs"
+    );
+
+    // neo.json records type: library
+    let config_content = std::fs::read_to_string(project_path.join("neo.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&config_content).unwrap();
+    assert_eq!(config["type"], "library", "neo.json should record type=library, got: {}", config_content);
+
+    // Generated .cabal has no executable stanza
+    let cabal_path = project_path.join(format!("{}.cabal", project_name));
+    assert!(cabal_path.exists(), "{}.cabal should be generated", project_name);
+    let cabal = std::fs::read_to_string(&cabal_path).unwrap();
+    assert!(
+        !cabal.contains(&format!("executable {}", project_name)),
+        "library .cabal must not declare an executable stanza:\n{}",
+        cabal
+    );
+    assert!(
+        !cabal.contains("main-is: Launcher.hs"),
+        "library .cabal must not reference Launcher.hs:\n{}",
+        cabal
+    );
+    assert!(
+        cabal.contains("library"),
+        "library .cabal must keep the library stanza:\n{}",
+        cabal
+    );
+}
+
+#[test]
 fn test_neo_new_with_custom_name() {
     let temp = tempfile::tempdir().unwrap();
     let project_name = "custom-project";

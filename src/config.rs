@@ -4,6 +4,20 @@ use std::path::Path;
 
 use crate::errors::NeoError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectKind {
+    #[default]
+    Executable,
+    Library,
+}
+
+impl ProjectKind {
+    pub fn is_library(self) -> bool {
+        matches!(self, ProjectKind::Library)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct NeoConfig {
@@ -14,6 +28,8 @@ pub struct NeoConfig {
     pub author: Option<String>,
     #[serde(default = "default_license")]
     pub license: String,
+    #[serde(rename = "type", default)]
+    pub kind: ProjectKind,
     #[serde(default)]
     pub dependencies: HashMap<String, String>,
 
@@ -143,6 +159,64 @@ mod tests {
 
         let result = NeoConfig::load(file.path());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_kind_defaults_to_executable() {
+        let mut file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "name": "p",
+            "version": "0.1.0",
+            "neo-version": "main"
+        }"#;
+        file.write_all(json.as_bytes()).unwrap();
+        let config = NeoConfig::load(file.path()).unwrap();
+        assert_eq!(config.kind, ProjectKind::Executable);
+        assert!(!config.kind.is_library());
+    }
+
+    #[test]
+    fn test_load_kind_library() {
+        let mut file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "name": "p",
+            "version": "0.1.0",
+            "neo-version": "main",
+            "type": "library"
+        }"#;
+        file.write_all(json.as_bytes()).unwrap();
+        let config = NeoConfig::load(file.path()).unwrap();
+        assert_eq!(config.kind, ProjectKind::Library);
+        assert!(config.kind.is_library());
+    }
+
+    #[test]
+    fn test_load_kind_executable_explicit() {
+        let mut file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "name": "p",
+            "version": "0.1.0",
+            "neo-version": "main",
+            "type": "executable"
+        }"#;
+        file.write_all(json.as_bytes()).unwrap();
+        let config = NeoConfig::load(file.path()).unwrap();
+        assert_eq!(config.kind, ProjectKind::Executable);
+    }
+
+    #[test]
+    fn test_load_kind_invalid_value() {
+        let mut file = NamedTempFile::new().unwrap();
+        let json = r#"{
+            "name": "p",
+            "version": "0.1.0",
+            "neo-version": "main",
+            "type": "not-a-kind"
+        }"#;
+        file.write_all(json.as_bytes()).unwrap();
+        let err = NeoConfig::load(file.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid") || msg.contains("unknown variant"), "got: {}", msg);
     }
 
     #[test]
