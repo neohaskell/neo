@@ -203,7 +203,7 @@ fn test_neo_build_ci() {
 fn test_neo_run_ci() {
     let temp = tempfile::tempdir().unwrap();
     let project_name = "run-project";
-    
+
     let mut cmd = neo_cmd();
     cmd.current_dir(temp.path())
         .arg("new")
@@ -214,14 +214,41 @@ fn test_neo_run_ci() {
 
     let project_path = temp.path().join(project_name);
 
-    let mut cmd = neo_cmd();
-    cmd.current_dir(&project_path)
-        .arg("run")
-        .arg("--ci")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Reconciling project artifacts"))
-        .stdout(predicate::str::contains("Running project"));
+    // `neo run --ci` launches the starter executable; the default starter is
+    // server-style and runs forever, so a bare `assert_cmd`-style invocation
+    // would hang the whole `cargo test` session. Wrap with coreutils
+    // `timeout` (mirrors `run_ci_completes_or_runs_for_fresh_starter` in
+    // tests/e2e.rs): accept exit 0 (finite program) OR 124 (SIGTERM by
+    // timeout), and require both reconcile + run markers in stdout as
+    // evidence we got past every interesting stage.
+    let neo = assert_cmd::cargo::cargo_bin("neo");
+    let out = std::process::Command::new("timeout")
+        .args(["--signal=TERM", "180"])
+        .arg(&neo)
+        .args(["run", "--ci"])
+        .current_dir(&project_path)
+        .output()
+        .expect("spawn `timeout` + neo failed (is coreutils `timeout` on PATH?)");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code().unwrap_or(-1);
+
+    assert!(
+        stdout.contains("Reconciling project artifacts"),
+        "missing reconcile marker; stdout=`{}` stderr=`{}` code={}",
+        stdout, stderr, code
+    );
+    assert!(
+        stdout.contains("Running project"),
+        "missing run marker; stdout=`{}` stderr=`{}` code={}",
+        stdout, stderr, code
+    );
+    assert!(
+        out.status.success() || code == 124,
+        "unexpected exit code {} (stderr: {})",
+        code, stderr
+    );
 }
 
 #[test]
@@ -558,8 +585,10 @@ fn test_neo_lock_check_violation() {
     std::fs::write(&file_path, "modified content").unwrap();
     std::process::Command::new("git").args(["add", "src/Domain/Commands/CreateUser.hs"]).current_dir(project_path).output().unwrap();
 
-    // 5. Check violation — new wording mirrors the pre-build error, with the
-    //    three fix recipes (revert / unlock / --skip-lock-check) inline.
+    // 5. Check violation — railguard wording: explainer + V-bump recipe +
+    //    worked example. The escape hatches (`neo lock --remove`,
+    //    `--skip-lock-check`) must NOT appear; they live in `--help` for
+    //    humans who already understand the model.
     let mut cmd = neo_cmd();
     cmd.current_dir(project_path)
         .arg("lock")
@@ -569,8 +598,10 @@ fn test_neo_lock_check_violation() {
         .failure()
         .stderr(predicate::str::contains("Build refused"))
         .stderr(predicate::str::contains("src/Domain/Commands/CreateUser.hs"))
-        .stderr(predicate::str::contains("neo lock --remove"))
-        .stderr(predicate::str::contains("--skip-lock-check"));
+        .stderr(predicate::str::contains("event-sourced"))
+        .stderr(predicate::str::contains("CreateUserV2.hs"))
+        .stderr(predicate::str::contains("neo lock --remove").not())
+        .stderr(predicate::str::contains("--skip-lock-check").not());
 }
 
 #[test]
@@ -749,7 +780,12 @@ fn test_neo_build_refuses_modified_locked() {
         .failure()
         .stderr(predicate::str::contains("Build refused"))
         .stderr(predicate::str::contains("src/Domain/Commands/CreateUser.hs"))
-        .stderr(predicate::str::contains("--skip-lock-check"));
+        .stderr(predicate::str::contains("event-sourced"))
+        .stderr(predicate::str::contains("CreateUserV2.hs"))
+        .stderr(predicate::str::contains("byte-identical"))
+        .stderr(predicate::str::contains("--skip-lock-check").not())
+        .stderr(predicate::str::contains("neo lock --remove").not())
+        .stderr(predicate::str::contains("git checkout --").not());
 }
 
 #[test]

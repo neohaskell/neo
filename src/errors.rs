@@ -136,7 +136,7 @@ pub enum NeoError {
         span: Option<SourceSpan>,
     },
 
-    #[error("Build refused: {count} locked file(s) have been modified")]
+    #[error("Build refused: {count} locked file(s) violate the lock")]
     #[diagnostic(
         code(neo::lock_violation),
         url(docsrs),
@@ -163,10 +163,17 @@ impl NeoError {
     /// path so the help text can point the user at it. If logging fails (no
     /// HOME, disk full, perms), the field reads as a fallback hint rather
     /// than a real path — the error itself is still surfaced normally.
-    /// Build a `LockViolation` from the list of locked-and-modified paths.
-    /// Pre-formats the help text so the diagnostic carries the full bad-input
-    /// listing + three fix recipes (revert, unlock, skip-flag) in a shape a
-    /// small LLM can act on without consulting any documentation.
+    /// Build a `LockViolation` from the list of locked-and-touched paths
+    /// (modify, rename, or delete — all surface here via `parse_porcelain`).
+    ///
+    /// The help text is a railguard for coding-agent LLMs: it teaches the
+    /// event-sourcing immutability rule and the only correct fix (write a
+    /// new sibling file with a `V`-bumped suffix and leave the locked file
+    /// byte-identical). It deliberately does NOT mention
+    /// `neo lock --remove` or `neo build --skip-lock-check` — those exist
+    /// for humans who already understand the model and find them in
+    /// `--help`; advertising them in the railguard would defeat its
+    /// purpose.
     pub fn lock_violation(paths: Vec<String>) -> Self {
         let count = paths.len();
         let paths_block = paths
@@ -175,16 +182,39 @@ impl NeoError {
             .collect::<Vec<_>>()
             .join("\n");
         let first = paths.first().map(String::as_str).unwrap_or("<path>");
+        let (first_next_path, first_type, first_next_type) = derive_next_version(first);
+        let restore_args = paths
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let intentional = if count == 1 {
+            format!(
+                "  2. If you do need new behavior: do NOT modify, rename, or delete the locked file. Create a new sibling file with a `V`-bumped suffix and write the new behavior from scratch there:\n       \
+                 - Create `{first_next_path}`\n       \
+                 - Define type `{first_next_type}` inside it with the new shape\n       \
+                 - Leave `{first}` byte-identical to the locked version\n     \
+                 Naming is exact: PascalCase type, matching filename, suffix is `V` immediately followed by an integer (no `_v2`, no `.V2`, no `Version2`). If the next number is taken (e.g. `V2` already exists), bump again to `V3`, `V4`, etc."
+            )
+        } else {
+            format!(
+                "  2. If you do need new behavior: do NOT modify, rename, or delete any of the locked files above. For each path, create a new sibling file with a `V`-bumped suffix and write the new behavior from scratch there. Naming is exact: PascalCase type, matching filename, suffix is `V` immediately followed by an integer (no `_v2`, no `.V2`, no `Version2`). If the next number is taken (e.g. `V2` already exists), bump again to `V3`, `V4`, etc.\n\n     \
+                 Worked example for `{first}` (type `{first_type}`):\n       \
+                 - Create `{first_next_path}`\n       \
+                 - Define type `{first_next_type}` inside it with the new shape\n       \
+                 - Leave `{first}` byte-identical to the locked version"
+            )
+        };
+
         let help_text = format!(
-            "Pre-build lock check on `.locked-files` aborted because these locked files have been modified (staged, unstaged, or untracked):\n\
+            "Pre-build lock check on `.locked-files` aborted. Locked files have been modified, renamed, or deleted (staged, unstaged, or untracked):\n\
              {paths_block}\n\n\
-             Locked files must remain unchanged — they were locked with `neo lock` to freeze the event-sourced domain, and any modification would silently break event replay.\n\n\
-             Fix one of:\n  \
-             1. Revert the change(s): `git checkout -- {first}`\n  \
-             2. Unlock the file(s): `neo lock --remove {first}` (or `neo lock --remove --all` to clear the whole manifest)\n  \
-             3. Bypass this check (NOT recommended — this is what the lock exists to prevent): `neo build --skip-lock-check`",
-            paths_block = paths_block,
-            first = first,
+             Why this matters:\n  \
+             NeoHaskell projects are event-sourced. Commands, events, projections, and deciders define the wire shapes that persisted event logs decode against. Every deployed instance replays its log on start. Editing, renaming, or deleting a locked file silently breaks replay on every deployed node — a class of bug that is invisible in tests and catastrophic in production. The lock exists to prevent that.\n\n\
+             Do exactly one of these:\n\n  \
+             1. If the edit was unintentional: discard with `git restore -- {restore_args}` so the path(s) are byte-identical to the locked version.\n\n\
+             {intentional}"
         );
         NeoError::LockViolation { count, help_text }
     }
@@ -203,6 +233,48 @@ impl NeoError {
         };
         NeoError::SubprocessRaw { operation, tail, full_output, log_path }
     }
+}
+
+/// Derive `(next-version path, original type, next-version type)` from a
+/// locked Haskell file path. Used to render a concrete worked example in
+/// `LockViolation` help.
+///
+/// Examples:
+///
+///   src/Foo/Bar.hs     -> (src/Foo/BarV2.hs,  Bar,    BarV2)
+///   src/Foo/BarV2.hs   -> (src/Foo/BarV3.hs,  BarV2,  BarV3)
+///   src/Foo/BarV99.hs  -> (src/Foo/BarV100.hs, BarV99, BarV100)
+///   Bar                -> (BarV2, Bar, BarV2)
+///
+/// Detects an existing `V<digits>` tail so the example never suggests
+/// `BarV2V2` for an already-versioned locked file.
+fn derive_next_version(path: &str) -> (String, String, String) {
+    let (dir, file_name) = match path.rfind('/') {
+        Some(i) => (&path[..=i], &path[i + 1..]),
+        None => ("", path),
+    };
+    let (stem, ext) = match file_name.rfind('.') {
+        Some(i) => (&file_name[..i], &file_name[i..]),
+        None => (file_name, ""),
+    };
+
+    let bytes = stem.as_bytes();
+    let mut digit_start = bytes.len();
+    while digit_start > 0 && bytes[digit_start - 1].is_ascii_digit() {
+        digit_start -= 1;
+    }
+    let next_stem = if digit_start < bytes.len()
+        && digit_start > 0
+        && bytes[digit_start - 1] == b'V'
+    {
+        let n: u64 = stem[digit_start..].parse().unwrap_or(1);
+        format!("{}{}", &stem[..digit_start], n + 1)
+    } else {
+        format!("{stem}V2")
+    };
+
+    let next_path = format!("{dir}{next_stem}{ext}");
+    (next_path, stem.to_string(), next_stem)
 }
 
 /// Find the byte-offset span of `"<key>"` inside a JSON-like source.
@@ -533,16 +605,74 @@ mod tests {
         ]
     }
 
-    // ---------------- LockViolation: help acts as repair instructions ----------------
+    // ---------------- LockViolation: help acts as an LLM railguard ----------------
+    //
+    // The help text must (a) teach the event-sourcing immutability rule,
+    // (b) point at the V-bump recipe with a worked example, and (c) refuse
+    // to advertise the escape hatches (`neo lock --remove`, `--skip-lock-check`).
+    // A coding-agent LLM reading the error must conclude "create a new
+    // sibling file with a V-bumped suffix", not "unlock and edit".
 
     #[test]
-    fn lock_violation_help_contains_all_three_fix_recipes() {
+    fn lock_violation_help_explains_event_sourcing_immutability() {
         let err = NeoError::lock_violation(vec!["src/Commands/User.hs".to_string()]);
         let help = err.help().map(|h| h.to_string()).unwrap_or_default();
-        assert!(help.contains("git checkout -- src/Commands/User.hs"), "missing revert recipe: {}", help);
-        assert!(help.contains("neo lock --remove src/Commands/User.hs"), "missing unlock recipe: {}", help);
-        assert!(help.contains("neo lock --remove --all"), "missing unlock-all recipe: {}", help);
-        assert!(help.contains("neo build --skip-lock-check"), "missing skip-flag recipe: {}", help);
+        assert!(help.contains("event-sourced"), "missing event-sourcing explainer: {}", help);
+        assert!(help.contains("replay"), "missing replay rationale: {}", help);
+    }
+
+    #[test]
+    fn lock_violation_help_includes_versioned_worked_example() {
+        let err = NeoError::lock_violation(vec![
+            "src/Starter/Counter/Commands/IncrementCounter.hs".to_string(),
+        ]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        // Path bumped to V2 in the same directory.
+        assert!(
+            help.contains("src/Starter/Counter/Commands/IncrementCounterV2.hs"),
+            "missing V2 path in worked example: {}",
+            help,
+        );
+        // Type name bumped to V2.
+        assert!(help.contains("IncrementCounterV2"), "missing V2 type: {}", help);
+        // Original file must be called out as untouched.
+        assert!(
+            help.contains("byte-identical"),
+            "missing 'byte-identical' instruction: {}",
+            help,
+        );
+        // Naming-convention guardrail (anti-hallucination on suffix shape).
+        assert!(help.contains("`_v2`"), "missing forbidden-naming list: {}", help);
+    }
+
+    #[test]
+    fn lock_violation_help_drops_unlock_and_skip_flag() {
+        // The forbidden phrases — these are the railguard's reason to exist.
+        let err = NeoError::lock_violation(vec![
+            "src/Commands/A.hs".to_string(),
+            "src/Events/B.hs".to_string(),
+        ]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(!help.contains("neo lock --remove"), "unlock recipe leaked: {}", help);
+        assert!(!help.contains("--skip-lock-check"), "skip flag leaked: {}", help);
+        assert!(!help.contains("git checkout --"), "old revert recipe leaked: {}", help);
+        // And no soft signals to look for the escape hatches.
+        assert!(
+            !help.to_lowercase().contains("not recommended"),
+            "should not editorialize about an escape hatch we don't mention: {}",
+            help,
+        );
+    }
+
+    #[test]
+    fn lock_violation_help_uses_git_restore_for_unintentional_branch() {
+        let err = NeoError::lock_violation(vec!["src/Commands/A.hs".to_string()]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("git restore -- src/Commands/A.hs"),
+            "missing concrete git restore recipe: {}",
+            help,
+        );
     }
 
     #[test]
@@ -578,11 +708,53 @@ mod tests {
     }
 
     #[test]
-    fn lock_violation_help_warns_about_skip_flag() {
-        let err = NeoError::lock_violation(vec!["x.hs".to_string()]);
+    fn lock_violation_help_single_file_has_no_for_each_abstraction() {
+        // N=1: the worked example IS the recipe — no "for each path" wrapper.
+        let err = NeoError::lock_violation(vec!["src/Commands/A.hs".to_string()]);
         let help = err.help().map(|h| h.to_string()).unwrap_or_default();
-        // The skip flag must be presented as a last resort, not the default fix.
-        assert!(help.to_lowercase().contains("not recommended"), "skip flag should be discouraged: {}", help);
+        assert!(
+            !help.to_lowercase().contains("for each path"),
+            "single-file help should not abstract over a list: {}",
+            help,
+        );
+    }
+
+    #[test]
+    fn lock_violation_help_multi_file_shares_explainer_and_one_example() {
+        // N>1: shared "for each path" recipe, ONE worked example anchored to
+        // the first path (not repeated per file — token economy +
+        // hallucination reduction).
+        let err = NeoError::lock_violation(vec![
+            "src/Commands/Alpha.hs".to_string(),
+            "src/Events/Beta.hs".to_string(),
+            "src/Queries/Gamma.hs".to_string(),
+        ]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("For each path"), "missing shared recipe phrase: {}", help);
+        // Worked example must use the first path (Alpha), not Beta or Gamma.
+        assert!(
+            help.contains("Worked example for `src/Commands/Alpha.hs`"),
+            "worked example missing or not on first path: {}",
+            help,
+        );
+        assert!(help.contains("src/Commands/AlphaV2.hs"), "missing AlphaV2 path: {}", help);
+        // Beta and Gamma must NOT have their own worked-example blocks.
+        assert!(
+            !help.contains("Worked example for `src/Events/Beta.hs`"),
+            "per-file example leaked for Beta: {}",
+            help,
+        );
+        assert!(
+            !help.contains("Worked example for `src/Queries/Gamma.hs`"),
+            "per-file example leaked for Gamma: {}",
+            help,
+        );
+        // git restore line lists ALL paths inline so the LLM can copy-paste.
+        assert!(
+            help.contains("git restore -- src/Commands/Alpha.hs src/Events/Beta.hs src/Queries/Gamma.hs"),
+            "git restore should enumerate all paths: {}",
+            help,
+        );
     }
 
     #[test]
@@ -590,6 +762,59 @@ mod tests {
         let err = NeoError::lock_violation(vec![]);
         let _ = err.to_string();
         let _ = err.help().map(|h| h.to_string());
+    }
+
+    // ---------------- derive_next_version helper ----------------
+
+    #[test]
+    fn derive_next_version_appends_v2_to_plain_haskell_file() {
+        let (next_path, ty, next_ty) = derive_next_version("src/Foo/Bar.hs");
+        assert_eq!(next_path, "src/Foo/BarV2.hs");
+        assert_eq!(ty, "Bar");
+        assert_eq!(next_ty, "BarV2");
+    }
+
+    #[test]
+    fn derive_next_version_bumps_existing_v_suffix() {
+        // Already-versioned locked file (the project evolved through V2):
+        // the example must point at V3, not BarV2V2.
+        let (next_path, ty, next_ty) = derive_next_version("src/Foo/BarV2.hs");
+        assert_eq!(next_path, "src/Foo/BarV3.hs");
+        assert_eq!(ty, "BarV2");
+        assert_eq!(next_ty, "BarV3");
+    }
+
+    #[test]
+    fn derive_next_version_bumps_large_v_suffix() {
+        let (next_path, _, next_ty) = derive_next_version("src/Foo/BarV99.hs");
+        assert_eq!(next_path, "src/Foo/BarV100.hs");
+        assert_eq!(next_ty, "BarV100");
+    }
+
+    #[test]
+    fn derive_next_version_treats_lowercase_v_as_no_version_suffix() {
+        // `v2` is NOT the project convention — treat as plain stem and
+        // append V2, yielding `Barv2V2`. This is correct: the user/LLM
+        // should adopt the canonical PascalCase `V` form.
+        let (next_path, _, next_ty) = derive_next_version("src/Foo/Barv2.hs");
+        assert_eq!(next_path, "src/Foo/Barv2V2.hs");
+        assert_eq!(next_ty, "Barv2V2");
+    }
+
+    #[test]
+    fn derive_next_version_handles_file_with_no_directory() {
+        let (next_path, ty, next_ty) = derive_next_version("Bar.hs");
+        assert_eq!(next_path, "BarV2.hs");
+        assert_eq!(ty, "Bar");
+        assert_eq!(next_ty, "BarV2");
+    }
+
+    #[test]
+    fn derive_next_version_handles_file_with_no_extension() {
+        let (next_path, ty, next_ty) = derive_next_version("Bar");
+        assert_eq!(next_path, "BarV2");
+        assert_eq!(ty, "Bar");
+        assert_eq!(next_ty, "BarV2");
     }
 
     #[test]
