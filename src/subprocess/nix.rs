@@ -1,6 +1,6 @@
 use crate::output::OutputMode;
 use crate::errors::NeoError;
-use crate::subprocess::interpret;
+use crate::interpret;
 use std::process::Stdio;
 use std::collections::VecDeque;
 use tokio::process::Command;
@@ -236,18 +236,18 @@ async fn execute(command_str: &str, output_mode: &mut OutputMode) -> miette::Res
         })?;
 
     if !status.success() {
-        if let Some(i) = interpret::interpret_any(&captured_output.join("\n")) {
+        if let Some(i) = interpret::match_any(&captured_output.join("\n")) {
             return Err(NeoError::SubprocessFailed {
                 operation: format!("`{}`", command_str),
                 cause: i.cause,
                 fix: i.fix,
             }.into());
         }
-        return Err(NeoError::SubprocessRaw {
-            operation: format!("`{}`", command_str),
-            tail: last_meaningful_lines(&captured_output, 5),
-            full_output: full_output_or_placeholder(&captured_output),
-        }.into());
+        return Err(NeoError::subprocess_raw(
+            format!("`{}`", command_str),
+            last_meaningful_lines(&captured_output, 5),
+            full_output_or_placeholder(&captured_output),
+        ).into());
     }
 
     Ok(())
@@ -319,7 +319,7 @@ mod tests {
         let err = result.unwrap_err();
         if let Some(neo_err) = err.downcast_ref::<NeoError>() {
             match neo_err {
-                NeoError::SubprocessRaw { operation, tail, full_output } => {
+                NeoError::SubprocessRaw { operation, tail, full_output, log_path: _ } => {
                     assert!(operation.contains("ls /non-existent-directory-neo"));
                     assert!(!tail.is_empty(), "Captured tail should not be empty");
                     // The failure may come from `nix develop` itself (no flake.nix in the

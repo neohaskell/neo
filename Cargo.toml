@@ -41,6 +41,9 @@ walkdir = "2"
 semver = "1"
 nodejs-semver = "4"
 
+# Regex (used by `src/interpret/` to match interpreter patterns against subprocess output)
+regex = "1"
+
 # Templates
 minijinja = "2"
 

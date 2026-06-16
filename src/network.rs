@@ -5,7 +5,7 @@ use miette::WrapErr;
 use serde::Deserialize;
 use semver::Version;
 use crate::errors::NeoError;
-use crate::subprocess::interpret;
+use crate::interpret::{self, Kind};
 
 #[derive(Debug, Deserialize)]
 struct GitHubRelease {
@@ -37,7 +37,7 @@ pub async fn fetch_neo_sha(version: &str) -> miette::Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if let Some(i) = interpret::interpret_git(&stderr) {
+        if let Some(i) = interpret::match_kind(Kind::Git, &stderr) {
             return Err(NeoError::SubprocessFailed {
                 operation: format!("`git ls-remote https://github.com/NeoHaskell/neohaskell {}`", target),
                 cause: i.cause,
@@ -139,7 +139,7 @@ pub async fn fetch_package_tags(repo_url: &str) -> miette::Result<Vec<PackageTag
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if let Some(i) = interpret::interpret_git(&stderr) {
+        if let Some(i) = interpret::match_kind(Kind::Git, &stderr) {
             return Err(NeoError::SubprocessFailed {
                 operation: format!("`git ls-remote --tags {}`", repo_url),
                 cause: i.cause,

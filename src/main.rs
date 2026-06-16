@@ -1,7 +1,9 @@
 mod app;
 mod cli;
 mod commands;
+mod errlog;
 mod errors;
+mod interpret;
 mod output;
 mod config;
 mod prereqs;

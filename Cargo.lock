@@ -2404,6 +2404,7 @@ dependencies = [
  "nucleo",
  "predicates",
  "ratatui 0.30.0",
+ "regex",
  "reqwest",
  "semver",
  "serde",

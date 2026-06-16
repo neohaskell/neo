@@ -111,12 +111,13 @@ pub enum NeoError {
     #[diagnostic(
         code(neo::subprocess_raw),
         url(docsrs),
-        help("We didn't recognise this failure mode. Please open an issue so we can add a fix recipe:\n  https://github.com/neohaskell/neo/issues/new?template=uninterpreted-subprocess-error.md\nPaste the `--- full child output ---` block above into the issue. The template walks you through the rest.")
+        help("We didn't recognise this failure mode.\n\nThe full failure has been appended to your local log:\n  {log_path}\n\nThis file is the central backlog of every unrecognized error `neo` has hit on this machine — each line is one JSON record (operation, tail, full output, timestamp, cwd). When you have a moment, open an issue so we can add a fix recipe:\n  https://github.com/neohaskell/neo/issues/new?template=uninterpreted-subprocess-error.md\nYou can paste one record per issue, or attach the file and let us batch them.")
     )]
     SubprocessRaw {
         operation: String,
         tail: String,
         full_output: String,
+        log_path: String,
     },
 
     #[error("Invalid dependency `{key}` = `{value}`: {reason}")]
@@ -143,6 +144,27 @@ impl NeoError {
             path: path.into().display().to_string(),
             source,
         }
+    }
+
+    /// Build a `SubprocessRaw` and, as a side-effect, append the failure to
+    /// the centralized `unrecognized-errors.jsonl` log under `$NEO_HOME` (or
+    /// `$HOME/.neo` if unset). The returned variant carries the resolved log
+    /// path so the help text can point the user at it. If logging fails (no
+    /// HOME, disk full, perms), the field reads as a fallback hint rather
+    /// than a real path — the error itself is still surfaced normally.
+    pub fn subprocess_raw(
+        operation: impl Into<String>,
+        tail: impl Into<String>,
+        full_output: impl Into<String>,
+    ) -> Self {
+        let operation = operation.into();
+        let tail = tail.into();
+        let full_output = full_output.into();
+        let log_path = match crate::errlog::log_unrecognized(&operation, &tail, &full_output) {
+            Some(p) => p.display().to_string(),
+            None => "(could not write to `~/.neo/unrecognized-errors.jsonl` — set `NEO_HOME` to a writable directory if you want this persisted)".to_string(),
+        };
+        NeoError::SubprocessRaw { operation, tail, full_output, log_path }
     }
 }
 
@@ -233,6 +255,7 @@ mod tests {
             operation: "nix develop".to_string(),
             tail: "(no output)".to_string(),
             full_output: "(no output)".to_string(),
+            log_path: "/tmp/test/unrecognized-errors.jsonl".to_string(),
         };
         let rendered = err.to_string();
         assert!(rendered.contains("nix develop failed"), "rendered: {}", rendered);
@@ -306,6 +329,7 @@ mod tests {
             operation: "`cabal build all`".to_string(),
             tail: "Error: [Cabal-7125]".to_string(),
             full_output: "alpha\nbravo\ncharlie αβγ".to_string(),
+            log_path: "/tmp/test-home/.neo/unrecognized-errors.jsonl".to_string(),
         }
     }
 
@@ -326,6 +350,7 @@ mod tests {
             operation: "`cabal build all`".to_string(),
             tail: "(no output)".to_string(),
             full_output: "(no output)".to_string(),
+            log_path: "/tmp/log.jsonl".to_string(),
         };
         let rendered = err.to_string();
         // Placeholder appears between the fences, not just in the tail.
@@ -333,6 +358,60 @@ mod tests {
         let closing = rendered.find("--- end of child output ---").expect("closing fence");
         let between = &rendered[opening..closing];
         assert!(between.contains("(no output)"), "placeholder not between fences: {}", between);
+    }
+
+    #[test]
+    fn subprocess_raw_help_mentions_log_path_field() {
+        // Help text must surface the JSONL log path the constructor writes to,
+        // so the user knows where to find the persisted record for filing an issue.
+        let err = NeoError::SubprocessRaw {
+            operation: "op".to_string(),
+            tail: "t".to_string(),
+            full_output: "f".to_string(),
+            log_path: "/home/u/.neo/unrecognized-errors.jsonl".to_string(),
+        };
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(
+            help.contains("/home/u/.neo/unrecognized-errors.jsonl"),
+            "help missing log path: {}",
+            help
+        );
+        assert!(help.contains("appended"), "help should say the failure was appended: {}", help);
+    }
+
+    #[test]
+    fn subprocess_raw_constructor_writes_jsonl_under_neo_home() {
+        // Integration between `NeoError::subprocess_raw` and `errlog`: the
+        // constructor must call into the logger so every call site gets
+        // persistence for free.
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::var("NEO_HOME").ok();
+        // SAFETY: cargo test runs this in the same process; the cost is that
+        // parallel tests touching NEO_HOME may race. We accept that — the
+        // intent is to prove the constructor invokes the logger.
+        unsafe { std::env::set_var("NEO_HOME", dir.path()); }
+
+        let err = NeoError::subprocess_raw("op-x", "tail-x", "full-x\nmulti-line");
+        let log_file = dir.path().join("unrecognized-errors.jsonl");
+        assert!(log_file.exists(), "constructor should have written the log file");
+
+        let content = std::fs::read_to_string(&log_file).unwrap();
+        assert!(content.contains("op-x"), "log missing operation: {}", content);
+        assert!(content.contains("tail-x"), "log missing tail: {}", content);
+        // Verify the variant carries the resolved path (not the fallback message)
+        match &err {
+            NeoError::SubprocessRaw { log_path, .. } => {
+                assert_eq!(log_path, &log_file.display().to_string());
+            }
+            _ => panic!("expected SubprocessRaw"),
+        }
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("NEO_HOME", v),
+                None => std::env::remove_var("NEO_HOME"),
+            }
+        }
     }
 
     #[test]
@@ -411,7 +490,7 @@ mod tests {
             },
             NeoError::TemplateError { template: "t".to_string(), reason: "r".to_string() },
             NeoError::SubprocessFailed { operation: "o".to_string(), cause: "c".to_string(), fix: "f".to_string() },
-            NeoError::SubprocessRaw { operation: "o".to_string(), tail: "t".to_string(), full_output: "stdout line\nstderr line".to_string() },
+            NeoError::SubprocessRaw { operation: "o".to_string(), tail: "t".to_string(), full_output: "stdout line\nstderr line".to_string(), log_path: "/tmp/log.jsonl".to_string() },
             stub_invalid_dep(),
         ]
     }
