@@ -1,1 +1,15 @@
-node_modules/
+# Frontend tooling — node_modules and logs are noise.
+node_modules
+*.log
+npm-debug.log*
+*.local
+
+# IMPORTANT: dist/ is NOT ignored here.
+#
+# The Rust binary embeds `assets/ide/dist/` at compile time via rust-embed.
+# `cargo build` and `nix build` consume whatever is in `dist/` at that
+# moment — so the built frontend tree must be committed to git, otherwise
+# the released `neo` binary serves nothing.
+#
+# Workflow: `pnpm build` (or `npm run build`) inside this dir before
+# committing — the diff in `dist/` is part of the PR.

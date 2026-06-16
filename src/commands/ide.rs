@@ -1,13 +1,20 @@
 use crate::errors::NeoError;
+use crate::ide::methods::register_all;
+use crate::ide::registry::MethodRegistry;
+use crate::ide::transport::LocalTransport;
+use crate::ide::workspace::Workspace;
+use crate::ide::AppState;
 use crate::output::OutputMode;
 use axum::{
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
+    routing::get,
     Router,
 };
 use crossterm::style::Stylize;
 use rust_embed::RustEmbed;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 /// All files under `assets/ide/dist/` are embedded into the binary at
 /// compile time in release builds. In debug builds `rust-embed` reads from
@@ -34,7 +41,20 @@ pub async fn run(host: IpAddr, port: u16, output_mode: &mut OutputMode) -> miett
 
     print_startup(output_mode, &browseable, &bound.to_string(), bind_hint);
 
-    let app = Router::new().fallback(serve_asset);
+    // Mint the workspace from the cwd once at server boot — every WS
+    // connection inherits the same `Arc<Workspace>` via the `LocalTransport`.
+    // Per the design-panel "Replit mistake" rule: workspace state is
+    // explicit, not implicit-in-cwd-at-handler-call-time.
+    let cwd = std::env::current_dir().map_err(|e| NeoError::IdeServe { source: e })?;
+    let workspace = Workspace::from_root(&cwd)?;
+    let transport = Arc::new(LocalTransport::new(workspace));
+    let registry = register_all(MethodRegistry::new());
+    let state = AppState { registry, transport };
+
+    let app = Router::new()
+        .route("/ws", get(crate::ide::server::ws_upgrade))
+        .with_state(state)
+        .fallback(serve_asset);
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
@@ -151,7 +171,7 @@ mod tests {
         let (status, content_type, body) = body_string(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/html"), "bad MIME: {content_type}");
-        assert!(body.contains("Neo IDE"), "body missing identifier: {body}");
+        assert!(body.contains("id=\"root\""), "body missing React mount point: {body}");
     }
 
     #[tokio::test]
@@ -162,7 +182,10 @@ mod tests {
         let (status, content_type, body) = body_string(resp).await;
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/html"), "bad MIME: {content_type}");
-        assert!(body.contains("Neo IDE"), "fallback should serve index.html: {body}");
+        assert!(
+            body.contains("id=\"root\""),
+            "SPA fallback should serve index.html with React mount point: {body}"
+        );
     }
 
     #[tokio::test]
@@ -171,7 +194,7 @@ mod tests {
         let resp = serve_path("/index.html");
         let (status, _, body) = body_string(resp).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("Neo IDE"));
+        assert!(body.contains("id=\"root\""));
     }
 
     #[test]

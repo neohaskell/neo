@@ -1,29 +1,73 @@
-# Neo IDE — bundled frontend
+# React + TypeScript + Vite
 
-This directory holds the Vite project for the in-browser IDE that `neo ide`
-serves. The Rust binary embeds `dist/` at compile time via
-[`rust-embed`](https://docs.rs/rust-embed) (see `src/commands/ide.rs`).
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-## Layout
+Currently, two official plugins are available:
 
-- `dist/` — the Vite build output. **Tracked in git**: the Rust binary
-  expects this directory to exist at `cargo build` time, and the release
-  `nix build` consumes it as-is (the release derivation does not run Vite).
-- `dist/index.html` — currently a placeholder. Replace by dropping in a real
-  Vite project and running `npm run build` (or `pnpm build`).
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-## Workflow once the real Vite project is in place
+## React Compiler
 
-```sh
-nix develop              # gives you node + pnpm
-cd assets/ide
-pnpm install
-pnpm build               # populates assets/ide/dist/
-cd ../..
-nix develop --command cargo build
-target/debug/neo ide     # serves the freshly built dist/
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+
+```js
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+
+      // Remove tseslint.configs.recommended and replace with this
+      tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      tseslint.configs.stylisticTypeChecked,
+
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
 ```
 
-In debug builds `rust-embed` reads `dist/` from disk on every request, so
-you don't need to rebuild the Rust binary while iterating on the frontend —
-just `pnpm build` and refresh the browser.
+You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+
+```js
+// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
+
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```

@@ -995,6 +995,80 @@ fn error_invalid_config_mentions_neo_json() {
 }
 
 // =====================================================
+// Group ? — neo ide JSON-RPC against the release artifact
+// =====================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn ide_initialize_against_release_binary() {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::process::Stdio;
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let sb = Sandbox::new("ide_initialize_against_release_binary");
+    std::fs::write(
+        sb.path("neo.json"),
+        r#"{"name":"e2e-ide","version":"0.0.1","neo-version":"0.1.0"}"#,
+    )
+    .unwrap();
+
+    // Reserve a port (drop-before-spawn, tiny race window).
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let bin = neo_bin();
+    let mut child = std::process::Command::new(&bin)
+        .current_dir(&sb.root)
+        .env("HOME", &sb.home)
+        .arg("--ci")
+        .arg("ide")
+        .arg("--port")
+        .arg(port.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn nix-built neo ide");
+
+    // Poll until the server is listening, then connect and `initialize`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let url = format!("ws://127.0.0.1:{port}/ws");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("connect");
+    ws.send(Message::Text(
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+               "params":{"clientInfo":{"name":"e2e","version":"0"}}})
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let resp: serde_json::Value = match msg {
+        Message::Text(t) => serde_json::from_str(&t).unwrap(),
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    assert_eq!(resp["result"]["serverInfo"]["name"], "neo");
+    assert_eq!(resp["result"]["workspace"]["project"]["name"], "e2e-ide");
+    assert_eq!(resp["result"]["workspace"]["project"]["neoVersion"], "0.1.0");
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// =====================================================
 // Local helpers
 // =====================================================
 

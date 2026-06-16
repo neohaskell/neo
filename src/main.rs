@@ -3,6 +3,7 @@ mod cli;
 mod commands;
 mod errlog;
 mod errors;
+mod ide;
 mod interpret;
 mod output;
 mod config;

@@ -879,3 +879,307 @@ fn test_neo_build_skip_lock_check_bypasses_check() {
         .stderr(predicate::str::contains("Build refused").not())
         .stderr(predicate::str::contains("neo::lock_violation").not());
 }
+
+// =====================================================================
+// `neo ide` — JSON-RPC over WebSocket
+//
+// Each test:
+//   1. Bind a probe TCP socket to grab a free port, drop it.
+//   2. Spawn `neo --ci ide --port <p>` from a tempdir (so each test has its
+//      own "workspace").
+//   3. Connect a tokio-tungstenite WS client to `ws://127.0.0.1:<p>/ws`.
+//   4. Exchange frames, assert, kill the child.
+// =====================================================================
+
+mod ide_ws {
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::json;
+    use std::process::{Child, Stdio};
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// Reserve a port by binding-then-dropping. Tiny race window; rare in
+    /// practice on a developer machine + CI.
+    fn reserve_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    /// Spawn `neo --ci ide --port <port>` in `cwd` and wait until it is
+    /// accepting connections (or panic on timeout).
+    fn spawn_ide(cwd: &std::path::Path, port: u16) -> Child {
+        let neo = assert_cmd::cargo::cargo_bin("neo");
+        let child = std::process::Command::new(&neo)
+            .current_dir(cwd)
+            .arg("--ci")
+            .arg("ide")
+            .arg("--port")
+            .arg(port.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn neo ide");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return child;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("neo ide did not start listening on port {port} within 10s");
+    }
+
+    fn kill(mut child: Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    async fn ws_connect(
+        port: u16,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let url = format!("ws://127.0.0.1:{port}/ws");
+        let (ws, _resp) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
+        ws
+    }
+
+    async fn send_recv(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        ws.send(Message::Text(payload.to_string()))
+            .await
+            .expect("send");
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("recv timeout")
+            .expect("stream closed")
+            .expect("recv error");
+        match msg {
+            Message::Text(t) => serde_json::from_str(&t).expect("response is JSON"),
+            other => panic!("unexpected ws message: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_initialize_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "clientInfo": { "name": "it-test", "version": "0" } }
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["id"], 1);
+        assert!(resp["error"].is_null(), "no error expected: {resp}");
+        let result = &resp["result"];
+        assert_eq!(result["serverInfo"]["name"], "neo");
+        assert_eq!(
+            result["serverInfo"]["version"].as_str().unwrap(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(result["workspace"]["root"].is_string(), "workspace.root present");
+        assert!(result["workspace"]["project"].is_null(), "no neo.json in tempdir");
+        assert!(
+            result["sessionId"].as_str().unwrap().starts_with("session_"),
+            "session_id present: {result}",
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_unknown_method_returns_method_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":7,"method":"does/not/exist"}),
+        )
+        .await;
+        assert_eq!(resp["id"], 7);
+        assert_eq!(resp["error"]["code"], -32601);
+        assert!(
+            resp["error"]["message"].as_str().unwrap().contains("does/not/exist"),
+            "method named in error: {resp}",
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_invalid_json_returns_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        ws.send(Message::Text("{garbage".to_string()))
+            .await
+            .unwrap();
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let resp: serde_json::Value = match msg {
+            Message::Text(t) => serde_json::from_str(&t).unwrap(),
+            other => panic!("unexpected: {other:?}"),
+        };
+        // Parse error → id null per spec.
+        assert!(resp["id"].is_null(), "parse error id must be null: {resp}");
+        assert_eq!(resp["error"]["code"], -32700);
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_multiple_concurrent_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut a = ws_connect(port).await;
+        let mut b = ws_connect(port).await;
+        let resp_a = send_recv(
+            &mut a,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                   "params":{"clientInfo":{"name":"a","version":"0"}}}),
+        )
+        .await;
+        let resp_b = send_recv(
+            &mut b,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                   "params":{"clientInfo":{"name":"b","version":"0"}}}),
+        )
+        .await;
+        let sid_a = resp_a["result"]["sessionId"].as_str().unwrap().to_string();
+        let sid_b = resp_b["result"]["sessionId"].as_str().unwrap().to_string();
+        assert_ne!(sid_a, sid_b, "two connections must have distinct session ids");
+        // Both see the same workspace.
+        assert_eq!(resp_a["result"]["workspace"]["id"], resp_b["result"]["workspace"]["id"]);
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_static_assets_still_served_after_ws_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let body = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("id=\"root\""),
+            "static index.html still served (looking for React mount point): {body}",
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_event_model_write_then_read_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let payload = r#"{"name":"e2e","slices":[]}"#.to_string();
+
+        // Write
+        let resp_write = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/writeEventModel",
+                   "params":{"content": payload}}),
+        )
+        .await;
+        assert!(resp_write["error"].is_null(), "write failed: {resp_write}");
+        assert!(
+            resp_write["result"]["path"].as_str().unwrap().ends_with("event-model.json"),
+            "result echoes the path: {resp_write}",
+        );
+
+        // File landed in the workspace cwd.
+        let on_disk = std::fs::read_to_string(dir.path().join("event-model.json")).unwrap();
+        assert_eq!(on_disk, payload, "file content matches write payload");
+
+        // Read it back
+        let resp_read = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":2,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+        assert!(resp_read["error"].is_null(), "read failed: {resp_read}");
+        assert_eq!(resp_read["result"]["content"].as_str().unwrap(), payload);
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_event_model_read_returns_null_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+        assert!(resp["error"].is_null(), "read should succeed even when file missing: {resp}");
+        assert!(resp["result"]["content"].is_null(), "content must be null: {resp}");
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_initialize_reports_project_when_neo_json_present() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("neo.json"),
+            r#"{"name":"wsproj","version":"0.9.0","neo-version":"0.1.0"}"#,
+        )
+        .unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                   "params":{"clientInfo":{"name":"t","version":"0"}}}),
+        )
+        .await;
+        let project = &resp["result"]["workspace"]["project"];
+        assert_eq!(project["name"], "wsproj");
+        assert_eq!(project["version"], "0.9.0");
+        assert_eq!(project["neoVersion"], "0.1.0");
+
+        kill(child);
+    }
+}

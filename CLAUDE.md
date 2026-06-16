@@ -4,7 +4,20 @@ See `AGENTS.md` for the full Ralph-loop workflow (`STATE.md` → `NEXT_STEP.md` 
 
 ## Working environment
 
-**All toolchain commands must run inside `nix develop`.** The host system does not (and is not expected to) provide `cargo`, `rustc`, `cabal`, `ghc`, `hurl`, `iconv`, etc. — they are pinned by `flake.nix` and live in the nix store.
+**All toolchain commands must run inside `nix develop`.** The host system does not (and is not expected to) provide `cargo`, `rustc`, `cabal`, `ghc`, `hurl`, `iconv`, `node`, `npm`, etc. — they are pinned by `flake.nix` and live in the nix store.
+
+## Building the full stack
+
+The bundled IDE has two halves: the Vite/React frontend at `assets/ide/` (built into `assets/ide/dist/`) and the Rust binary that embeds `dist/` via `rust-embed`. Both halves are built in one command:
+
+```sh
+nix develop --command ./scripts/build.sh                  # debug
+nix develop --command ./scripts/build.sh --release        # release
+```
+
+The script runs `npm install` only on first use (when `assets/ide/node_modules/` is absent), then `npm run build` (`tsc -b && vite build`), then `cargo build` (forwarding any flags you pass). Resulting binary is `target/{debug,release}/neo`.
+
+For Rust-only iterations: `cargo build` reads the already-built `assets/ide/dist/`. For frontend-only iterations: `cd assets/ide && npm run build` (the debug binary's `rust-embed` reads `dist/` from disk on each request, so a Rust rebuild is not needed). The script is the catch-all when you don't want to think about which half changed.
 
 Wrap every invocation with `nix develop --command`:
 
@@ -93,6 +106,25 @@ When proposing a non-trivial change in plan mode, the **Tests** and **Verificati
 5. **Regression list** — explicit names of existing tests that must continue to pass, even when the change "doesn't touch them".
 
 A plan is complete only when every code change in it can be tied to at least one test in §1–3 and one verification step in §4.
+
+## Capturing durable rules (MUST → auto-memory)
+
+Whenever you encounter or write a statement of the form *"in the future this MUST do XXX"*, *"never YYY"*, *"every ZZZ must WWW"* — anywhere: code comment, miette `help()` block, design doc, plan file, chat — lift it to auto-memory at `/Users/nick/.claude/projects/-Users-nick-repos-neo/memory/` immediately. Don't leave it as a code comment.
+
+Code comments and `TODO` markers do not survive refactors. Auto-memory does. A "MUST" claim is by definition a durable invariant; its only safe home is the memory system. Pick the type that fits (`project` for "the codebase works this way", `feedback` for "the user wants me to work this way", `reference` for external systems) and link it from `MEMORY.md`.
+
+Examples worth lifting from this repo's history:
+- "Adding a new IDE method should be a one-file change; if you touch `src/ide/rpc.rs` or `src/ide/registry.rs`, the foundation is wrong" → `project_ide_jsonrpc_architecture.md`.
+- "Future process / command methods MUST take a closed enum, never a free string" → same.
+- "Plans must spec Tests + Verification exhaustively" → already a feedback memory.
+
+## End-of-session location map
+
+At the end of any session that adds or restructures modules (new top-level dir under `src/`, new test layer, new asset directory, new schema), save a memory recording where the new things live: top-level dir, entry points, test fixtures, wiring points.
+
+The standard auto-memory default ("don't save derivable file paths") is **explicitly overridden** in this repo. Each session pays for itself by leaving the next session a map. Otherwise every cold-start session repeats the exploration the prior session already did.
+
+Skip the location map for trivial single-file edits. Save it for additions/restructurings that future-you would benefit from a map of.
 
 ## Files
 
