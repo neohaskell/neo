@@ -18,6 +18,13 @@ tokio = { version = "1", features = ["full"] }
 # HTTP
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
+# HTTP server (for `neo ide`)
+axum = { version = "0.7", default-features = false, features = ["http1", "tokio"] }
+
+# Static asset embedding (for `neo ide`)
+rust-embed = { version = "8", features = ["mime-guess"] }
+mime_guess = "2"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

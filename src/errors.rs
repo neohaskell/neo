@@ -146,6 +146,37 @@ pub enum NeoError {
         count: usize,
         help_text: String,
     },
+
+    #[error("Binding `neo ide` HTTP server to {host}:{port} failed: {source}")]
+    #[diagnostic(
+        code(neo::ide::bind),
+        url(docsrs),
+        help("Address {host}:{port} is unavailable. Common causes and concrete fixes:\n  \
+              1. Port {port} is already in use. Find the PID and stop it:\n     \
+                 - macOS: `lsof -iTCP:{port} -sTCP:LISTEN`\n     \
+                 - Linux: `ss -ltnp 'sport = :{port}'`\n  \
+              2. Pick a different free port. Re-run with `neo ide --port <FREE_PORT>` (any integer in 1024..=65535 that nothing else is listening on — e.g. `neo ide --port 2324`). Ports below 1024 require root; do not use them.\n  \
+              3. The host {host} is not assigned to any interface on this machine. To bind every interface, re-run with `neo ide --host 0.0.0.0`. To bind loopback only, re-run with `neo ide --host 127.0.0.1`. Pass a literal IP, not a hostname.")
+    )]
+    IdeBind {
+        host: std::net::IpAddr,
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("`neo ide` HTTP server crashed: {source}")]
+    #[diagnostic(
+        code(neo::ide::serve),
+        url(docsrs),
+        help("The embedded axum server returned an unexpected I/O error mid-flight. This is a bug in `neo`. \
+              Re-run with `--verbose` to capture details, then file an issue at \
+              https://github.com/NeoHaskell/neo/issues with the full output.")
+    )]
+    IdeServe {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 impl NeoError {
@@ -602,6 +633,14 @@ mod tests {
             NeoError::SubprocessRaw { operation: "o".to_string(), tail: "t".to_string(), full_output: "stdout line\nstderr line".to_string(), log_path: "/tmp/log.jsonl".to_string() },
             stub_invalid_dep(),
             NeoError::lock_violation(vec!["src/Commands/Foo.hs".to_string()]),
+            NeoError::IdeBind {
+                host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port: 2323,
+                source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+            },
+            NeoError::IdeServe {
+                source: std::io::Error::other("server crashed"),
+            },
         ]
     }
 
@@ -943,6 +982,60 @@ mod tests {
         assert!(rendered.contains("Invalid dependency `foo`"), "headline: {}", rendered);
         assert!(rendered.contains("from this entry"), "label: {}", rendered);
         assert!(rendered.contains("neo.json"), "filename: {}", rendered);
+    }
+
+    // ---------------- IdeBind / IdeServe: actionable help ----------------
+
+    #[test]
+    fn ide_bind_help_names_addr_and_concrete_fix() {
+        let err = NeoError::IdeBind {
+            host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 2323,
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+        };
+        let display = err.to_string();
+        // Headline must name the exact host:port the user asked for, not a hardcoded one.
+        assert!(display.contains("127.0.0.1:2323"), "missing op + addr: {}", display);
+        assert!(display.contains("address in use"), "missing source cause: {}", display);
+
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        // Must mention both the host and port the user actually passed.
+        assert!(help.contains("2323"), "help missing port: {}", help);
+        assert!(help.contains("127.0.0.1"), "help missing host: {}", help);
+        // Must give a concrete fix recipe — the `--port` flag form.
+        assert!(help.contains("neo ide --port"), "help missing --port recipe: {}", help);
+        // Must mention `--host` so users who hit an unassigned-interface error see the fix.
+        assert!(help.contains("--host"), "help missing --host recipe: {}", help);
+        // Must give a probe command for finding what's bound.
+        assert!(help.contains("lsof"), "help missing lsof probe: {}", help);
+    }
+
+    #[test]
+    fn ide_bind_help_reflects_user_supplied_host() {
+        // When the user passes `--host 0.0.0.0` and bind fails, the headline + help
+        // must echo `0.0.0.0`, not silently report `127.0.0.1`.
+        let err = NeoError::IdeBind {
+            host: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port: 9000,
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+        };
+        let display = err.to_string();
+        assert!(display.contains("0.0.0.0:9000"), "headline must echo host:port: {}", display);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("0.0.0.0"), "help must echo user-supplied host: {}", help);
+    }
+
+    #[test]
+    fn ide_serve_help_points_at_bug_tracker() {
+        let err = NeoError::IdeServe {
+            source: std::io::Error::other("unexpected EOF"),
+        };
+        let display = err.to_string();
+        assert!(display.contains("HTTP server crashed"), "missing op label: {}", display);
+        assert!(display.contains("unexpected EOF"), "missing source cause: {}", display);
+
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("github.com/NeoHaskell/neo/issues"), "help missing issue link: {}", help);
     }
 
     #[test]

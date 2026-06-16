@@ -1,4 +1,5 @@
 pub mod build;
+pub mod ide;
 pub mod lock;
 pub mod new;
 pub mod run;

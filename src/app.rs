@@ -70,6 +70,9 @@ pub async fn dispatch(
         Some(Commands::Lock(args)) => {
             commands::lock::run(args, output_mode).await?;
         }
+        Some(Commands::Ide { host, port }) => {
+            commands::ide::run(host, port, output_mode).await?;
+        }
         None => {
             let _ = output_mode;
             println!("The NeoHaskell CLI. Run `neo --help` for commands.");
@@ -204,6 +207,35 @@ mod tests {
         assert!(result.is_err());
         
         std::env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_ide_port_in_use_errors_actionably() {
+        // Occupy a port, then ask `neo ide` to bind to the same address.
+        // dispatch must return Err with an IdeBind diagnostic — and the
+        // error's display + help must name the address and a `--port` fix.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        // Keep `probe` alive across the dispatch call so the port stays bound.
+
+        let host = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let command = Some(Commands::Ide { host, port });
+        let mut output_mode = OutputMode::Ci;
+        let update_status = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = dispatch(command, &mut output_mode, update_status).await;
+
+        let err = result.expect_err("dispatch must fail when the port is occupied");
+        let rendered = format!("{err:?}");
+        assert!(
+            rendered.contains(&port.to_string()),
+            "rendered error should mention the port: {rendered}"
+        );
+        assert!(
+            rendered.contains("--port"),
+            "rendered error should suggest --port: {rendered}"
+        );
+
+        drop(probe);
     }
 
     #[tokio::test]
