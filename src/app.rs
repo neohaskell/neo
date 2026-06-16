@@ -58,8 +58,8 @@ pub async fn dispatch(
         Some(Commands::New { project_name, library }) => {
             commands::new::run(project_name, library, output_mode, update_status).await?;
         }
-        Some(Commands::Build { watch }) => {
-            commands::build::run(watch, output_mode).await?;
+        Some(Commands::Build { watch, skip_lock_check }) => {
+            commands::build::run(watch, skip_lock_check, output_mode).await?;
         }
         Some(Commands::Run { watch }) => {
             commands::run::run(watch, output_mode).await?;
@@ -165,7 +165,7 @@ mod tests {
         std::env::set_current_dir(temp.path()).unwrap();
         
         // Should fail without neo.json
-        let command = Some(Commands::Build { watch: false });
+        let command = Some(Commands::Build { watch: false, skip_lock_check: false });
         let mut output_mode = OutputMode::Ci;
         let update_status = std::sync::Arc::new(std::sync::Mutex::new(None));
         let result = dispatch(command, &mut output_mode, update_status).await;

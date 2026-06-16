@@ -104,14 +104,69 @@ pub fn fuzzy_match(query: &str, candidates: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-pub fn get_staged_files() -> Result<Vec<String>> {
+/// Parse `git status --porcelain` v1 output into a list of file paths.
+///
+/// Returns every path mentioned regardless of status code: staged, unstaged,
+/// untracked, deleted, renamed, etc. For renames/copies (`R`/`C`), both the
+/// old and new paths are included — a rename of a locked file is still a
+/// modification of the locked path. Lines too short to carry a path are
+/// skipped. Quoted paths (git's C-style quoting for special chars) are passed
+/// through verbatim; locked files live under `src/` with ASCII names in
+/// practice, so this is acceptable.
+pub fn parse_porcelain(output: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in output.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let status = &line[..2];
+        let rest = &line[3..];
+
+        if status.starts_with('R') || status.starts_with('C') {
+            if let Some(arrow_pos) = rest.find(" -> ") {
+                files.push(rest[..arrow_pos].to_string());
+                files.push(rest[arrow_pos + 4..].to_string());
+                continue;
+            }
+        }
+
+        files.push(rest.to_string());
+    }
+    files
+}
+
+/// Run `git status --porcelain` in the current directory and parse the result.
+///
+/// Passes `--untracked-files=all` so an untracked file is reported by its
+/// own path rather than rolled up under its parent directory. Without this,
+/// a brand-new locked file in a fresh subdirectory would show up only as the
+/// directory `??` and miss the manifest comparison.
+pub fn get_modified_files() -> Result<Vec<String>> {
     let output = std::process::Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output()
         .into_diagnostic()?;
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout.lines().map(|l| l.to_string()).collect())
+    Ok(parse_porcelain(&stdout))
+}
+
+/// Return the sorted intersection of the `.locked-files` manifest and the
+/// currently-modified files (staged, unstaged, or untracked). Returns
+/// `Ok(vec![])` when no manifest exists or it is empty.
+pub fn find_locked_violations() -> Result<Vec<String>> {
+    let manifest = LockManifest::load()?;
+    if manifest.locked_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let modified = get_modified_files()?;
+    let mut violations: Vec<String> = modified
+        .into_iter()
+        .filter(|p| manifest.is_locked(p))
+        .collect();
+    violations.sort();
+    violations.dedup();
+    Ok(violations)
 }
 
 #[cfg(test)]
@@ -186,6 +241,103 @@ mod tests {
         std::env::set_current_dir(original_dir).unwrap();
         
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_porcelain_staged() {
+        let out = "M  src/Commands/User.hs\n";
+        assert_eq!(parse_porcelain(out), vec!["src/Commands/User.hs"]);
+    }
+
+    #[test]
+    fn test_parse_porcelain_unstaged() {
+        let out = " M src/Events/Created.hs\n";
+        assert_eq!(parse_porcelain(out), vec!["src/Events/Created.hs"]);
+    }
+
+    #[test]
+    fn test_parse_porcelain_untracked() {
+        let out = "?? src/Queries/Get.hs\n";
+        assert_eq!(parse_porcelain(out), vec!["src/Queries/Get.hs"]);
+    }
+
+    #[test]
+    fn test_parse_porcelain_renamed_includes_both_paths() {
+        let out = "R  src/Commands/Old.hs -> src/Commands/New.hs\n";
+        assert_eq!(
+            parse_porcelain(out),
+            vec!["src/Commands/Old.hs", "src/Commands/New.hs"]
+        );
+    }
+
+    #[test]
+    fn test_parse_porcelain_copied_includes_both_paths() {
+        let out = "C  src/Commands/A.hs -> src/Commands/B.hs\n";
+        assert_eq!(
+            parse_porcelain(out),
+            vec!["src/Commands/A.hs", "src/Commands/B.hs"]
+        );
+    }
+
+    #[test]
+    fn test_parse_porcelain_staged_and_modified() {
+        let out = "MM src/Commands/User.hs\n";
+        assert_eq!(parse_porcelain(out), vec!["src/Commands/User.hs"]);
+    }
+
+    #[test]
+    fn test_parse_porcelain_deleted() {
+        let out = " D src/Commands/Gone.hs\n";
+        assert_eq!(parse_porcelain(out), vec!["src/Commands/Gone.hs"]);
+    }
+
+    #[test]
+    fn test_parse_porcelain_empty() {
+        assert!(parse_porcelain("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_porcelain_skips_blank_and_short_lines() {
+        // Blank line, trailing newline, and a line too short to carry a path.
+        let out = "M  ok.hs\n\n??x\n";
+        assert_eq!(parse_porcelain(out), vec!["ok.hs"]);
+    }
+
+    #[test]
+    fn test_parse_porcelain_multiple_lines() {
+        let out = "M  a.hs\n?? b.hs\nR  c.hs -> d.hs\n";
+        assert_eq!(parse_porcelain(out), vec!["a.hs", "b.hs", "c.hs", "d.hs"]);
+    }
+
+    #[test]
+    fn test_find_locked_violations_no_manifest() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let result = find_locked_violations();
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        let violations = result.unwrap();
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn test_find_locked_violations_empty_manifest() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let dir = tempdir().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        fs::write(LOCK_MANIFEST, "").unwrap();
+
+        let result = find_locked_violations();
+
+        std::env::set_current_dir(original_dir).unwrap();
+
+        let violations = result.unwrap();
+        assert!(violations.is_empty());
     }
 
     #[test]

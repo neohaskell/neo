@@ -36,6 +36,9 @@ pub enum Commands {
         /// Watch mode with GHCi hot-reloading
         #[arg(long)]
         watch: bool,
+        /// Skip the pre-build check that aborts when locked files have been modified
+        #[arg(long)]
+        skip_lock_check: bool,
     },
     /// Reconcile, build, and run the application
     #[command(long_about = "Build the project and execute the application. \
@@ -115,6 +118,30 @@ mod tests {
         assert!(cli.ci);
         match cli.command {
             Some(Commands::Build { .. }) => (),
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_build_skip_lock_check() {
+        let cli = Cli::try_parse_from(["neo", "build", "--skip-lock-check"]).unwrap();
+        match cli.command {
+            Some(Commands::Build { watch, skip_lock_check }) => {
+                assert!(!watch);
+                assert!(skip_lock_check);
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_build_default_lock_check() {
+        let cli = Cli::try_parse_from(["neo", "build"]).unwrap();
+        match cli.command {
+            Some(Commands::Build { watch, skip_lock_check }) => {
+                assert!(!watch);
+                assert!(!skip_lock_check);
+            }
             _ => panic!("Expected Build command"),
         }
     }

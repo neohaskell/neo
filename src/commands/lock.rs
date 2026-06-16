@@ -6,8 +6,9 @@ use ratatui::{
 };
 
 use crate::cli::{LockArgs, LockSubcommand};
+use crate::errors::NeoError;
 use crate::output::OutputMode;
-use crate::lock::{LockManifest, discover_domain_files, fuzzy_match, LOCK_MANIFEST};
+use crate::lock::{LockManifest, discover_domain_files, fuzzy_match, find_locked_violations, LOCK_MANIFEST};
 use crate::theme::Theme;
 use crate::tui::selection::Selection;
 use crate::tui::banner::Banner;
@@ -60,39 +61,23 @@ pub async fn run(args: LockArgs, output_mode: &mut OutputMode) -> Result<()> {
     }
 }
 
-async fn check_locked_files(output_mode: &OutputMode) -> Result<()> {
-    let manifest = LockManifest::load()?;
-    if manifest.locked_files.is_empty() {
+/// Verify that no locked file has been modified in the current working tree.
+///
+/// "Modified" means any of: staged for commit, unstaged in the working tree,
+/// or untracked. Returns `Ok(())` when the lock manifest is missing/empty or
+/// when no locked file shows up in `git status --porcelain`. On violation,
+/// returns `Err(NeoError::LockViolation)` with a help block that lists every
+/// offending path and the three concrete fix recipes (revert, unlock, skip).
+///
+/// Used by both the git pre-commit hook (`neo lock check`) and the pre-build
+/// gate in `neo build`.
+pub async fn check_locked_files(output_mode: &OutputMode) -> Result<()> {
+    let _ = output_mode;
+    let violations = find_locked_violations()?;
+    if violations.is_empty() {
         return Ok(());
     }
-
-    let staged_files = crate::lock::get_staged_files()?;
-    let mut locked_staged = Vec::new();
-
-    for file in staged_files {
-        if manifest.is_locked(&file) {
-            locked_staged.push(file);
-        }
-    }
-
-    if !locked_staged.is_empty() {
-        let _ = output_mode;
-        eprintln!("Error: The following files are locked and cannot be committed:");
-        for file in &locked_staged {
-            eprintln!("  - {}", file);
-        }
-        eprintln!();
-        eprintln!("These files were locked by `neo lock` to freeze the event-sourced domain — committing them would silently break event replay.");
-        eprintln!();
-        eprintln!("Fix: unlock each file before committing, then re-stage and commit. For example:");
-        for file in &locked_staged {
-            eprintln!("  neo lock --remove {}", file);
-        }
-        eprintln!("(Or unlock everything at once with `neo lock --remove --all`.)");
-        std::process::exit(1);
-    }
-
-    Ok(())
+    Err(NeoError::lock_violation(violations).into())
 }
 
 async fn lock_all(output_mode: &mut OutputMode) -> Result<()> {

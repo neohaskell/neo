@@ -135,6 +135,17 @@ pub enum NeoError {
         #[label("from this entry")]
         span: Option<SourceSpan>,
     },
+
+    #[error("Build refused: {count} locked file(s) have been modified")]
+    #[diagnostic(
+        code(neo::lock_violation),
+        url(docsrs),
+        help("{help_text}")
+    )]
+    LockViolation {
+        count: usize,
+        help_text: String,
+    },
 }
 
 impl NeoError {
@@ -152,6 +163,32 @@ impl NeoError {
     /// path so the help text can point the user at it. If logging fails (no
     /// HOME, disk full, perms), the field reads as a fallback hint rather
     /// than a real path — the error itself is still surfaced normally.
+    /// Build a `LockViolation` from the list of locked-and-modified paths.
+    /// Pre-formats the help text so the diagnostic carries the full bad-input
+    /// listing + three fix recipes (revert, unlock, skip-flag) in a shape a
+    /// small LLM can act on without consulting any documentation.
+    pub fn lock_violation(paths: Vec<String>) -> Self {
+        let count = paths.len();
+        let paths_block = paths
+            .iter()
+            .map(|p| format!("  - `{}`", p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let first = paths.first().map(String::as_str).unwrap_or("<path>");
+        let help_text = format!(
+            "Pre-build lock check on `.locked-files` aborted because these locked files have been modified (staged, unstaged, or untracked):\n\
+             {paths_block}\n\n\
+             Locked files must remain unchanged — they were locked with `neo lock` to freeze the event-sourced domain, and any modification would silently break event replay.\n\n\
+             Fix one of:\n  \
+             1. Revert the change(s): `git checkout -- {first}`\n  \
+             2. Unlock the file(s): `neo lock --remove {first}` (or `neo lock --remove --all` to clear the whole manifest)\n  \
+             3. Bypass this check (NOT recommended — this is what the lock exists to prevent): `neo build --skip-lock-check`",
+            paths_block = paths_block,
+            first = first,
+        );
+        NeoError::LockViolation { count, help_text }
+    }
+
     pub fn subprocess_raw(
         operation: impl Into<String>,
         tail: impl Into<String>,
@@ -492,7 +529,67 @@ mod tests {
             NeoError::SubprocessFailed { operation: "o".to_string(), cause: "c".to_string(), fix: "f".to_string() },
             NeoError::SubprocessRaw { operation: "o".to_string(), tail: "t".to_string(), full_output: "stdout line\nstderr line".to_string(), log_path: "/tmp/log.jsonl".to_string() },
             stub_invalid_dep(),
+            NeoError::lock_violation(vec!["src/Commands/Foo.hs".to_string()]),
         ]
+    }
+
+    // ---------------- LockViolation: help acts as repair instructions ----------------
+
+    #[test]
+    fn lock_violation_help_contains_all_three_fix_recipes() {
+        let err = NeoError::lock_violation(vec!["src/Commands/User.hs".to_string()]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("git checkout -- src/Commands/User.hs"), "missing revert recipe: {}", help);
+        assert!(help.contains("neo lock --remove src/Commands/User.hs"), "missing unlock recipe: {}", help);
+        assert!(help.contains("neo lock --remove --all"), "missing unlock-all recipe: {}", help);
+        assert!(help.contains("neo build --skip-lock-check"), "missing skip-flag recipe: {}", help);
+    }
+
+    #[test]
+    fn lock_violation_help_quotes_every_offending_path() {
+        let err = NeoError::lock_violation(vec![
+            "src/Commands/A.hs".to_string(),
+            "src/Events/B.hs".to_string(),
+        ]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("`src/Commands/A.hs`"), "missing path A in help: {}", help);
+        assert!(help.contains("`src/Events/B.hs`"), "missing path B in help: {}", help);
+    }
+
+    #[test]
+    fn lock_violation_headline_carries_count() {
+        let err = NeoError::lock_violation(vec![
+            "a.hs".to_string(),
+            "b.hs".to_string(),
+            "c.hs".to_string(),
+        ]);
+        let rendered = err.to_string();
+        assert!(rendered.contains("Build refused"), "missing op: {}", rendered);
+        assert!(rendered.contains("3 locked file(s)"), "missing count: {}", rendered);
+    }
+
+    #[test]
+    fn lock_violation_help_names_pre_build_check() {
+        // The "operation" component of the rustc-style error contract.
+        let err = NeoError::lock_violation(vec!["x.hs".to_string()]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        assert!(help.contains("Pre-build lock check"), "missing op label: {}", help);
+        assert!(help.contains(".locked-files"), "missing manifest name: {}", help);
+    }
+
+    #[test]
+    fn lock_violation_help_warns_about_skip_flag() {
+        let err = NeoError::lock_violation(vec!["x.hs".to_string()]);
+        let help = err.help().map(|h| h.to_string()).unwrap_or_default();
+        // The skip flag must be presented as a last resort, not the default fix.
+        assert!(help.to_lowercase().contains("not recommended"), "skip flag should be discouraged: {}", help);
+    }
+
+    #[test]
+    fn lock_violation_empty_paths_does_not_panic() {
+        let err = NeoError::lock_violation(vec![]);
+        let _ = err.to_string();
+        let _ = err.help().map(|h| h.to_string());
     }
 
     #[test]

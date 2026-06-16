@@ -534,7 +534,7 @@ fn test_neo_lock_install_ci() {
 fn test_neo_lock_check_violation() {
     let temp = tempfile::tempdir().unwrap();
     let project_path = temp.path();
-    
+
     // 1. Init git
     std::process::Command::new("git").arg("init").current_dir(project_path).output().unwrap();
     std::process::Command::new("git").args(["config", "user.email", "test@example.com"]).current_dir(project_path).output().unwrap();
@@ -558,7 +558,8 @@ fn test_neo_lock_check_violation() {
     std::fs::write(&file_path, "modified content").unwrap();
     std::process::Command::new("git").args(["add", "src/Domain/Commands/CreateUser.hs"]).current_dir(project_path).output().unwrap();
 
-    // 5. Check violation
+    // 5. Check violation — new wording mirrors the pre-build error, with the
+    //    three fix recipes (revert / unlock / --skip-lock-check) inline.
     let mut cmd = neo_cmd();
     cmd.current_dir(project_path)
         .arg("lock")
@@ -566,8 +567,44 @@ fn test_neo_lock_check_violation() {
         .arg("--ci")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("locked and cannot be committed"))
-        .stderr(predicate::str::contains("neo lock --remove"));
+        .stderr(predicate::str::contains("Build refused"))
+        .stderr(predicate::str::contains("src/Domain/Commands/CreateUser.hs"))
+        .stderr(predicate::str::contains("neo lock --remove"))
+        .stderr(predicate::str::contains("--skip-lock-check"));
+}
+
+#[test]
+fn test_neo_lock_check_unstaged_violation() {
+    // Widened semantics: `neo lock check` now catches unstaged modifications
+    // too, not just staged ones. A user editing a locked file should see the
+    // violation immediately, before they get a chance to `git add`.
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path();
+
+    std::process::Command::new("git").arg("init").current_dir(project_path).output().unwrap();
+    std::process::Command::new("git").args(["config", "user.email", "test@example.com"]).current_dir(project_path).output().unwrap();
+    std::process::Command::new("git").args(["config", "user.name", "Test User"]).current_dir(project_path).output().unwrap();
+
+    let commands_dir = project_path.join("src/Domain/Commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    let file_path = commands_dir.join("CreateUser.hs");
+    std::fs::write(&file_path, "initial content").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path).arg("lock").arg("--ci").assert().success();
+
+    // Modify WITHOUT staging.
+    std::fs::write(&file_path, "modified content").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path)
+        .arg("lock")
+        .arg("check")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Build refused"))
+        .stderr(predicate::str::contains("src/Domain/Commands/CreateUser.hs"));
 }
 
 #[test]
@@ -645,7 +682,7 @@ fn test_neo_lock_ambiguous_ci() {
 fn test_neo_lock_no_matches_ci() {
     let temp = tempfile::tempdir().unwrap();
     let project_path = temp.path();
-    
+
     let mut cmd = neo_cmd();
     cmd.current_dir(project_path)
         .arg("lock")
@@ -654,4 +691,155 @@ fn test_neo_lock_no_matches_ci() {
         .assert()
         .success()
         .stdout(predicate::str::contains("No matches found"));
+}
+
+// ---- Pre-build lock check ----
+//
+// These tests exercise the `--skip-lock-check` flag and the gate that aborts
+// `neo build` when a locked file has been modified. The lock check fires
+// after `NeoConfig::load` and before reconcile/nix-build, so violation tests
+// fail fast (no Haskell compile in the loop). The "skip flag proceeds" test
+// runs through real reconcile + nix build and is therefore as slow as
+// `test_neo_build_ci`.
+
+/// Hand-roll a minimal NeoHaskell workspace (no `neo new`) so violation tests
+/// don't pay the starter-template download. Initializes git, writes the
+/// minimal `neo.json` that `NeoConfig::load` accepts, and configures a git
+/// identity so subsequent commits work.
+fn minimal_workspace(project_path: &std::path::Path) {
+    use std::process::Command as Cmd;
+    Cmd::new("git").arg("init").current_dir(project_path).output().unwrap();
+    Cmd::new("git").args(["config", "user.email", "test@example.com"]).current_dir(project_path).output().unwrap();
+    Cmd::new("git").args(["config", "user.name", "Test User"]).current_dir(project_path).output().unwrap();
+    std::fs::write(
+        project_path.join("neo.json"),
+        r#"{"name":"locktest","version":"0.1.0","neo-version":"0.1.0"}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn test_neo_build_refuses_modified_locked() {
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path();
+    minimal_workspace(project_path);
+
+    // Create + lock + commit a domain file.
+    let commands_dir = project_path.join("src/Domain/Commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    let file_path = commands_dir.join("CreateUser.hs");
+    std::fs::write(&file_path, "initial").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path).arg("lock").arg("--ci").assert().success();
+
+    // Modify and stage the locked file.
+    std::fs::write(&file_path, "modified").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "src/Domain/Commands/CreateUser.hs"])
+        .current_dir(project_path)
+        .output()
+        .unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path)
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Build refused"))
+        .stderr(predicate::str::contains("src/Domain/Commands/CreateUser.hs"))
+        .stderr(predicate::str::contains("--skip-lock-check"));
+}
+
+#[test]
+fn test_neo_build_unstaged_locked_modification_refused() {
+    // Proves the widened semantics: unstaged edits to a locked file also
+    // abort the build, not just staged ones.
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path();
+    minimal_workspace(project_path);
+
+    let commands_dir = project_path.join("src/Domain/Commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    let file_path = commands_dir.join("CreateUser.hs");
+    std::fs::write(&file_path, "initial").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path).arg("lock").arg("--ci").assert().success();
+
+    // Modify the file but do NOT stage.
+    std::fs::write(&file_path, "modified").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path)
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Build refused"))
+        .stderr(predicate::str::contains("src/Domain/Commands/CreateUser.hs"));
+}
+
+#[test]
+fn test_neo_build_untracked_path_in_manifest_refused() {
+    // Exercises the `??` porcelain status code: a path listed in
+    // `.locked-files` exists on disk but is untracked. The lock check should
+    // still flag it.
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path();
+    minimal_workspace(project_path);
+
+    let commands_dir = project_path.join("src/Domain/Commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    let ghost = commands_dir.join("Ghost.hs");
+    std::fs::write(&ghost, "untracked").unwrap();
+    std::fs::write(
+        project_path.join(".locked-files"),
+        "src/Domain/Commands/Ghost.hs",
+    )
+    .unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path)
+        .arg("build")
+        .arg("--ci")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Build refused"))
+        .stderr(predicate::str::contains("src/Domain/Commands/Ghost.hs"));
+}
+
+#[test]
+fn test_neo_build_skip_lock_check_bypasses_check() {
+    // The flag must let the build proceed past the lock-check stage even
+    // with a modified locked file. We don't assert on overall success — the
+    // hand-rolled workspace has no flake.nix or source code, so reconcile/
+    // nix-build will fail downstream. What we DO assert is that the failure
+    // is NOT the lock-violation diagnostic.
+    let temp = tempfile::tempdir().unwrap();
+    let project_path = temp.path();
+    minimal_workspace(project_path);
+
+    let commands_dir = project_path.join("src/Domain/Commands");
+    std::fs::create_dir_all(&commands_dir).unwrap();
+    let file_path = commands_dir.join("CreateUser.hs");
+    std::fs::write(&file_path, "initial").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path).arg("lock").arg("--ci").assert().success();
+
+    // Modify the locked file.
+    std::fs::write(&file_path, "modified").unwrap();
+
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project_path)
+        .arg("build")
+        .arg("--ci")
+        .arg("--skip-lock-check")
+        .assert()
+        // Build may pass or fail downstream — we don't care. The point is
+        // that the lock check did not block.
+        .stderr(predicate::str::contains("Build refused").not())
+        .stderr(predicate::str::contains("neo::lock_violation").not());
 }
