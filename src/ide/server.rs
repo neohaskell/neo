@@ -48,43 +48,79 @@ pub async fn ws_upgrade(
 async fn connection_loop(socket: WebSocket, session: crate::ide::session::Session, state: AppState) {
     let (mut sink, mut stream) = socket.split();
 
-    while let Some(msg) = stream.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::debug!(error = %e, session_id = %session.id, "ws read error, closing");
-                break;
-            }
-        };
+    // Per-connection outbound channel. Handlers (running in their own
+    // spawned tasks — see below) push notifications and final responses
+    // onto this queue; the loop body's only job is to drain it onto the
+    // WS sink. Decoupling this from the handler future is what makes
+    // mid-RPC notifications (e.g. heal progress logs) reach the client
+    // IMMEDIATELY, instead of buffering until the handler returns.
+    let (outbound_tx, mut outbound_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::ide::session::OutboundMessage>();
+    let session = session.with_outbound(outbound_tx.clone());
 
-        let text = match msg {
-            Message::Text(t) => t,
-            Message::Binary(_) => {
-                // We don't speak binary; ignore silently — the spec says the
-                // server MAY accept binary frames, but it's safer to drop.
-                continue;
-            }
-            Message::Ping(_) | Message::Pong(_) => continue,
-            Message::Close(_) => {
-                tracing::debug!(session_id = %session.id, "client closed ws");
-                break;
-            }
-        };
+    loop {
+        tokio::select! {
+            biased;
 
-        let response = handle_text_frame(&text, &session, &state).await;
-        // None == no response (notification). Skip the send.
-        let Some(response) = response else { continue };
-
-        let payload = match serde_json::to_string(&response) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to serialise response — closing connection");
-                break;
+            // Drain outbound messages (notifications + responses) first
+            // so claude's per-line stdout reaches the browser within
+            // milliseconds of arriving on the server.
+            out = outbound_rx.recv() => {
+                let Some(out) = out else { break };
+                let payload_res = match &out {
+                    crate::ide::session::OutboundMessage::Notification(n) => serde_json::to_string(n),
+                    crate::ide::session::OutboundMessage::Response(r) => serde_json::to_string(r),
+                };
+                let payload = match payload_res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to serialise outbound");
+                        continue;
+                    }
+                };
+                if let Err(e) = sink.send(Message::Text(payload)).await {
+                    tracing::debug!(error = %e, session_id = %session.id, "ws send failed, closing");
+                    break;
+                }
             }
-        };
-        if let Err(e) = sink.send(Message::Text(payload)).await {
-            tracing::debug!(error = %e, session_id = %session.id, "ws send failed, closing");
-            break;
+
+            msg = stream.next() => {
+                let Some(msg) = msg else { break };
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::debug!(error = %e, session_id = %session.id, "ws read error, closing");
+                        break;
+                    }
+                };
+
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Binary(_) => continue,
+                    Message::Ping(_) | Message::Pong(_) => continue,
+                    Message::Close(_) => {
+                        tracing::debug!(session_id = %session.id, "client closed ws");
+                        break;
+                    }
+                };
+
+                // Hand the frame to a per-request task so the connection
+                // loop can keep draining `outbound_rx` while the handler
+                // is awaiting its subprocess / network call. Each task
+                // pushes its eventual Response back onto the same outbound
+                // channel so this loop is the single point of WS write.
+                let session_for_task = session.clone();
+                let state_for_task = state.clone();
+                let outbound_for_task = outbound_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(response) =
+                        handle_text_frame(&text, &session_for_task, &state_for_task).await
+                    {
+                        let _ = outbound_for_task
+                            .send(crate::ide::session::OutboundMessage::Response(response));
+                    }
+                });
+            }
         }
     }
 }

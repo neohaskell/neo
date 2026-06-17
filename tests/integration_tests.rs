@@ -957,14 +957,30 @@ mod ide_ws {
         ws.send(Message::Text(payload.to_string()))
             .await
             .expect("send");
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
-            .await
-            .expect("recv timeout")
-            .expect("stream closed")
-            .expect("recv error");
-        match msg {
-            Message::Text(t) => serde_json::from_str(&t).expect("response is JSON"),
-            other => panic!("unexpected ws message: {other:?}"),
+        // Skip any server-pushed notifications (they have no `id`) and
+        // return the first frame that looks like a JSON-RPC response.
+        // Long-running handlers like heal stream `$/progress` events
+        // before the response, so a naive one-recv loop wouldn't get
+        // the answer.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let recv = tokio::time::timeout(Duration::from_secs(30), ws.next()).await;
+            let msg = recv
+                .expect("recv timeout")
+                .expect("stream closed")
+                .expect("recv error");
+            let text = match msg {
+                Message::Text(t) => t,
+                other => panic!("unexpected ws message: {other:?}"),
+            };
+            let value: serde_json::Value =
+                serde_json::from_str(&text).expect("frame is JSON");
+            if value.get("id").is_some() {
+                return value;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("never received a response, only notifications");
+            }
         }
     }
 
@@ -1532,6 +1548,132 @@ mod ide_ws {
         assert!(
             stderr_buf.contains("--add-dir") && stderr_buf.contains("--allowed-tools"),
             "stderr should include the spawn args, got:\n{stderr_buf}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_heal_streams_progress_notifications_over_ws() {
+        // The healing flow pushes `$/progress` notifications with claude's
+        // stdout/stderr lines so the frontend overlay can render them
+        // live. This test stubs claude with a script that prints a
+        // unique sentinel, runs heal over a real WS, drains every frame,
+        // and asserts that at least one $/progress notification carrying
+        // the sentinel arrived BEFORE the final RPC response.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event-model.json"), "{}").unwrap();
+
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join("claude");
+        let stub_body = "#!/bin/sh\n\
+            echo 'STREAMED_PROGRESS_SENTINEL'\n\
+            exit 0\n";
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            f.write_all(stub_body.as_bytes()).unwrap();
+        }
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let neo_bin = assert_cmd::cargo::cargo_bin("neo");
+        let path_value = format!(
+            "{}:{}",
+            stub_dir.path().display(),
+            neo_bin.parent().unwrap().display()
+        );
+        let port = reserve_port();
+        let mut child = std::process::Command::new(&neo_bin)
+            .arg("--ci")
+            .arg("ide")
+            .arg("--port")
+            .arg(port.to_string())
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", path_value)
+            .env("HOME", dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn neo ide");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut ws = ws_connect(port).await;
+        ws.send(Message::Text(
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/healEventModel","params":{"mode":"validate"}}).to_string(),
+        ))
+        .await
+        .expect("send heal request");
+
+        // Drain frames until we've seen the response AND read everything
+        // queued behind it (notifications can race past the response in
+        // the select loop). We keep reading for up to 30 s for the
+        // response, then a 1 s post-response drain to scoop up any
+        // trailing $/progress frames.
+        let mut progress_log_lines: Vec<String> = Vec::new();
+        let mut got_response = false;
+        let mut drain_until: Option<std::time::Instant> = None;
+        let overall_deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if std::time::Instant::now() > overall_deadline {
+                break;
+            }
+            if let Some(t) = drain_until {
+                if std::time::Instant::now() > t {
+                    break;
+                }
+            }
+            let recv = tokio::time::timeout(Duration::from_millis(500), ws.next()).await;
+            let msg = match recv {
+                Ok(Some(Ok(m))) => m,
+                Ok(Some(Err(_))) => break,
+                Ok(None) => break,
+                Err(_) => {
+                    if got_response {
+                        break;
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let Message::Text(t) = msg else { continue };
+            let value: serde_json::Value = match serde_json::from_str(&t) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if value.get("id").is_some() {
+                got_response = true;
+                drain_until = Some(std::time::Instant::now() + Duration::from_secs(1));
+                continue;
+            }
+            if value["method"] == "$/progress"
+                && value["params"]["token"] == "healEventModel"
+                && value["params"]["value"]["kind"] == "log"
+            {
+                if let Some(line) = value["params"]["value"]["line"].as_str() {
+                    progress_log_lines.push(line.to_string());
+                }
+            }
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(got_response, "never received the final heal RPC response");
+        assert!(
+            progress_log_lines
+                .iter()
+                .any(|l| l.contains("STREAMED_PROGRESS_SENTINEL")),
+            "expected a $/progress notification carrying the stub's stdout sentinel; got: {progress_log_lines:?}",
         );
     }
 }

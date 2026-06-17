@@ -6,7 +6,7 @@ import { Toolbar } from './ui/Toolbar'
 import { FileMenu } from './ui/FileMenu'
 import { Toast } from './ui/Toast'
 import { InvalidModelModal } from './ui/InvalidModelModal'
-import { HealingOverlay } from './ui/HealingOverlay'
+import { HealingOverlay, type HealLogLine } from './ui/HealingOverlay'
 import { newModel, jsonToModel, modelToJson } from './io/fileOps'
 import { saveToStorage, loadFromStorage } from './io/persistence'
 import { getEdgeTypeForConnection } from './ui/connectionRules'
@@ -59,7 +59,28 @@ function App() {
     preamble?: string
   } | null>(null)
   const [healing, setHealing] = useState(false)
+  const [healLog, setHealLog] = useState<HealLogLine[]>([])
   const clientRef = useRef<IdeClient | null>(null)
+
+  // Subscribe to `$/progress` notifications while a heal is in flight so the
+  // HealingOverlay can render claude's stdout/stderr line by line. Each
+  // notification arrives as `{ token, value: { kind: "log"|"begin"|"end",
+  // stream?, line? } }`.
+  useEffect(() => {
+    if (!healing) return
+    const client = clientRef.current
+    if (!client) return
+    setHealLog([])
+    const unsubscribe = client.onNotification('$/progress', (params: unknown) => {
+      const p = params as { token?: string; value?: { kind?: string; stream?: 'stdout' | 'stderr'; line?: string } } | undefined
+      if (!p || p.token !== 'healEventModel') return
+      const value = p.value
+      if (!value || value.kind !== 'log') return
+      if (typeof value.line !== 'string' || (value.stream !== 'stdout' && value.stream !== 'stderr')) return
+      setHealLog((prev) => [...prev, { stream: value.stream!, line: value.line! }])
+    })
+    return unsubscribe
+  }, [healing])
 
   const applyReadResult = useCallback(
     (readRes: RpcResult<ReadEventModelResult>) => {
@@ -501,7 +522,7 @@ function App() {
           onCancel={handleHealCancel}
         />
       )}
-      {healing && <HealingOverlay />}
+      {healing && <HealingOverlay log={healLog} />}
     </ModelContext.Provider>
   )
 }

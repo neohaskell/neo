@@ -4,6 +4,7 @@ mod commands;
 mod errlog;
 mod errors;
 mod ide;
+mod inspect;
 mod interpret;
 mod output;
 mod config;

@@ -36,6 +36,13 @@ interface PendingEnvelope {
   error?: { code: number; message: string; data?: unknown }
 }
 
+interface NotificationEnvelope {
+  method: string
+  params: unknown
+}
+
+export type NotificationListener = (params: unknown) => void
+
 /** Derive the same-origin WS URL from the current document. */
 export function defaultWsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -49,6 +56,7 @@ export class IdeClient {
   private opened: Promise<void>
   private state: ConnectionState = { status: 'connecting' }
   private listeners = new Set<(s: ConnectionState) => void>()
+  private notificationListeners = new Map<string, Set<NotificationListener>>()
 
   constructor(url: string = defaultWsUrl()) {
     this.ws = new WebSocket(url)
@@ -83,16 +91,19 @@ export class IdeClient {
       this.pending.clear()
     })
     this.ws.addEventListener('message', (ev) => {
-      let parsed: PendingEnvelope
+      let parsed: PendingEnvelope & Partial<NotificationEnvelope>
       try {
-        parsed = JSON.parse(ev.data as string) as PendingEnvelope
+        parsed = JSON.parse(ev.data as string) as PendingEnvelope &
+          Partial<NotificationEnvelope>
       } catch {
-        // Server should never send invalid JSON; ignore defensively.
         return
       }
       if (parsed.id === null || parsed.id === undefined) {
-        // Notification — no handlers in v1; drop. Will route here when
-        // $/progress et al. land.
+        // Server-pushed notification — route to subscribers by method.
+        if (typeof parsed.method !== 'string') return
+        const subs = this.notificationListeners.get(parsed.method)
+        if (!subs) return
+        for (const sub of subs) sub(parsed.params)
         return
       }
       const cb = this.pending.get(parsed.id)
@@ -166,6 +177,24 @@ export class IdeClient {
         })
       }
     })
+  }
+
+  /**
+   * Subscribe to server-pushed notifications under `method`. Returns an
+   * unsubscribe function. Multiple subscribers per method are fanned out
+   * in subscription order.
+   */
+  onNotification(method: string, listener: NotificationListener): () => void {
+    let subs = this.notificationListeners.get(method)
+    if (!subs) {
+      subs = new Set()
+      this.notificationListeners.set(method, subs)
+    }
+    subs.add(listener)
+    return () => {
+      subs!.delete(listener)
+      if (subs!.size === 0) this.notificationListeners.delete(method)
+    }
   }
 
   close(): void {

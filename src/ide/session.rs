@@ -40,10 +40,28 @@ impl std::fmt::Display for SessionId {
     }
 }
 
+/// An outbound WebSocket frame the connection loop should send to the
+/// client. Both notifications (from `session.notify`) and final
+/// responses (from completed RPC handlers) share this channel so the
+/// loop has a single, uniform sender to drain. That way notifications
+/// pushed mid-handler are sent IMMEDIATELY, instead of buffering until
+/// the handler returns.
+#[derive(Debug, Clone)]
+pub enum OutboundMessage {
+    Notification(crate::ide::rpc::Notification),
+    Response(crate::ide::rpc::Response),
+}
+
+pub type OutboundSender = tokio::sync::mpsc::UnboundedSender<OutboundMessage>;
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: SessionId,
     pub workspace: Arc<Workspace>,
+    /// Channel into the per-connection WS sender. `None` for sessions
+    /// minted outside a real connection (most unit tests). When `None`,
+    /// `notify` silently drops — handlers can call it unconditionally.
+    outbound_tx: Option<OutboundSender>,
 }
 
 impl Session {
@@ -51,8 +69,31 @@ impl Session {
         Self {
             id: SessionId::mint(),
             workspace,
+            outbound_tx: None,
         }
     }
+
+    /// Attach an outbound sink. Called by the transport at WS accept
+    /// time so handlers running under a real connection can push
+    /// notifications to the client mid-flight (progress logs, etc.).
+    pub fn with_outbound(mut self, tx: OutboundSender) -> Self {
+        self.outbound_tx = Some(tx);
+        self
+    }
+
+    /// Send a JSON-RPC notification to the client. Non-blocking, fire-
+    /// and-forget; drops silently if the connection is closed or the
+    /// session was minted without a sink (e.g. unit tests).
+    pub fn notify(&self, method: impl Into<String>, params: serde_json::Value) {
+        let Some(ref tx) = self.outbound_tx else { return };
+        let notif = crate::ide::rpc::Notification {
+            jsonrpc: crate::ide::rpc::JsonRpcVersion,
+            method: method.into(),
+            params,
+        };
+        let _ = tx.send(OutboundMessage::Notification(notif));
+    }
+
 }
 
 #[cfg(test)]

@@ -75,6 +75,34 @@ pub enum Commands {
         #[arg(long, default_value_t = 2323)]
         port: u16,
     },
+    /// Inspect a NeoHaskell project's domain layout (commands, events, queries, integrations)
+    #[command(long_about = "Print a structured view of the project's NeoHaskell domains. \
+                            By default emits everything as a single JSON document on stdout; \
+                            use a subcommand to filter (e.g. `neo inspect commands` for just \
+                            the command table). The heal flow for `event-model.json` uses the \
+                            same data internally — running this command shows you exactly what \
+                            the AI agent sees.")]
+    Inspect {
+        #[command(subcommand)]
+        subcommand: Option<InspectSubcommand>,
+    },
+}
+
+/// Per-section views of the inspected project. `None` = dump the whole project.
+#[derive(Subcommand)]
+pub enum InspectSubcommand {
+    /// List discovered domain directories under `src/`.
+    Domains,
+    /// List all commands per domain (name, file, events produced, HTTP-reachable flag).
+    Commands,
+    /// List event-sum constructors per domain.
+    Events,
+    /// List queries per domain (name, file, event constructors referenced).
+    Queries,
+    /// List integrations per domain (name, kind, events handled, commands emitted).
+    Integrations,
+    /// Derived wiring: which command produces which event, which integration listens to it, etc.
+    Wiring,
 }
 
 #[derive(clap::Args)]

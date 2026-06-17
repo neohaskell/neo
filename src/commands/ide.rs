@@ -165,16 +165,50 @@ fn serve_path(req_path: &str) -> Response {
     match IdeAssets::get(lookup) {
         Some(file) => {
             let mime = file.metadata.mimetype().to_string();
-            ([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response()
+            let cache_control = cache_control_for(lookup);
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, cache_control.to_string()),
+                ],
+                file.data.into_owned(),
+            )
+                .into_response()
         }
         None => match IdeAssets::get("index.html") {
             Some(file) => (
-                [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+                [
+                    (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+                    // SPA fallback IS index.html — must revalidate or users
+                    // get a stale shell pointing at deleted bundle hashes.
+                    (header::CACHE_CONTROL, "no-cache, must-revalidate".to_string()),
+                ],
                 file.data.into_owned(),
             )
                 .into_response(),
             None => (StatusCode::NOT_FOUND, "IDE assets missing").into_response(),
         },
+    }
+}
+
+/// Cache policy per asset.
+///
+/// - `index.html` and any other un-fingerprinted path → `no-cache,
+///   must-revalidate`. The browser must ask the server every reload —
+///   otherwise it keeps serving a stale shell that points at bundle
+///   filenames Vite has since renamed, and the user sees the old UI
+///   (or a blank page) after every rebuild.
+/// - Vite's hashed bundles under `assets/*` (e.g. `assets/index-CLyk1qxs.js`)
+///   → `public, max-age=31536000, immutable`. The hash in the filename
+///   IS the cache buster; the file at that exact URL never changes.
+fn cache_control_for(asset_path: &str) -> &'static str {
+    if asset_path == "index.html"
+        || asset_path == "favicon.svg"
+        || !asset_path.starts_with("assets/")
+    {
+        "no-cache, must-revalidate"
+    } else {
+        "public, max-age=31536000, immutable"
     }
 }
 
@@ -195,6 +229,69 @@ mod tests {
             .to_string();
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         (status, content_type, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn cache_control(resp: &Response) -> String {
+        resp.headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn cache_control_for_html_revalidates() {
+        // Regression: without `no-cache` on index.html the browser hangs
+        // on to a stale shell pointing at deleted bundle hashes after a
+        // rebuild, so reloads look like "nothing changed". Memory entry
+        // `project_ide_asset_cache_headers.md` covers the why.
+        assert_eq!(
+            cache_control_for("index.html"),
+            "no-cache, must-revalidate"
+        );
+    }
+
+    #[test]
+    fn cache_control_for_hashed_bundles_is_immutable() {
+        // Vite mangles hashes into the filename, so a given URL never
+        // changes content. Long, immutable cache is correct here.
+        assert_eq!(
+            cache_control_for("assets/index-CLyk1qxs.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control_for("assets/index-deadbeef.css"),
+            "public, max-age=31536000, immutable"
+        );
+    }
+
+    #[test]
+    fn cache_control_for_favicon_revalidates() {
+        // Favicons are NOT hashed by Vite — must revalidate or they go
+        // stale forever after a swap.
+        assert_eq!(
+            cache_control_for("favicon.svg"),
+            "no-cache, must-revalidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_path_sets_no_cache_on_index_html() {
+        let resp = serve_path("/");
+        assert_eq!(cache_control(&resp), "no-cache, must-revalidate");
+        let resp_named = serve_path("/index.html");
+        assert_eq!(cache_control(&resp_named), "no-cache, must-revalidate");
+    }
+
+    #[tokio::test]
+    async fn serve_path_sets_immutable_on_assets() {
+        // Pick a JS bundle from the embedded dist. Build hash changes
+        // every time the frontend recompiles, so look it up dynamically.
+        let bundle = IdeAssets::iter()
+            .find(|p| p.starts_with("assets/") && p.ends_with(".js"))
+            .expect("dist should contain a hashed JS bundle");
+        let resp = serve_path(&format!("/{bundle}"));
+        assert_eq!(cache_control(&resp), "public, max-age=31536000, immutable");
     }
 
     #[tokio::test]

@@ -73,6 +73,9 @@ pub async fn dispatch(
         Some(Commands::Ide { host, port }) => {
             commands::ide::run(host, port, output_mode).await?;
         }
+        Some(Commands::Inspect { subcommand }) => {
+            commands::inspect::run(subcommand)?;
+        }
         None => {
             let _ = output_mode;
             println!("The NeoHaskell CLI. Run `neo --help` for commands.");

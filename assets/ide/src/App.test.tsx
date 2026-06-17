@@ -44,11 +44,29 @@ function nextResponse<T>(queue: T[], label: string): T {
   return queue.shift()!
 }
 
+const notificationSubs = new Map<string, Set<(params: unknown) => void>>()
+function emitNotification(method: string, params: unknown) {
+  const subs = notificationSubs.get(method)
+  if (!subs) return
+  for (const sub of subs) sub(params)
+}
+
 vi.mock('./ipc/client', () => {
   class IdeClientStub {
     onState(listener: (s: unknown) => void) {
       listener({ status: 'open' })
       return () => {}
+    }
+    onNotification(method: string, listener: (params: unknown) => void) {
+      let subs = notificationSubs.get(method)
+      if (!subs) {
+        subs = new Set()
+        notificationSubs.set(method, subs)
+      }
+      subs.add(listener)
+      return () => {
+        subs!.delete(listener)
+      }
     }
     close() {}
   }
@@ -103,6 +121,7 @@ beforeEach(() => {
     readQueue: [{ ok: true, result: { content: null, validation: { status: 'notFound' } } }],
   })
   localStorage.clear()
+  notificationSubs.clear()
 })
 
 describe('App — base render', () => {
@@ -349,6 +368,63 @@ describe('App — event-model load + heal flow', () => {
     expect(screen.getByText(/healing event model/i)).toBeInTheDocument()
     // And go away after heal + reload.
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
+  })
+
+  it('streams $/progress log lines into the HealingOverlay during heal', async () => {
+    const user = userEvent.setup()
+    configureIpc({
+      readQueue: [
+        {
+          ok: true,
+          result: {
+            content: '{}',
+            validation: {
+              status: 'invalid',
+              errors: [{ pointer: '', message: 'oops', kind: 'schema' }],
+            },
+          },
+        },
+        { ok: true, result: { content: VALID_MODEL_JSON, validation: { status: 'valid' } } },
+      ],
+      healQueue: [{ ok: true, result: { outcome: { status: 'healed' } } }],
+      healDelayMs: 200,
+    })
+    render(<App />)
+    const modal = await screen.findByRole('dialog')
+    await user.click(within(modal).getByRole('button', { name: /heal with ai/i }))
+
+    // Overlay appears.
+    expect(await screen.findByRole('status')).toBeInTheDocument()
+
+    // Server pushes two progress notifications while the heal is in flight.
+    emitNotification('$/progress', {
+      token: 'healEventModel',
+      value: { kind: 'log', stream: 'stdout', line: 'STREAMED_STDOUT_LINE' },
+    })
+    emitNotification('$/progress', {
+      token: 'healEventModel',
+      value: { kind: 'log', stream: 'stderr', line: 'STREAMED_STDERR_LINE' },
+    })
+
+    // Both lines must surface in the overlay's log scroller.
+    await waitFor(() =>
+      expect(screen.getByTestId('heal-log').textContent).toContain('STREAMED_STDOUT_LINE'),
+    )
+    expect(screen.getByTestId('heal-log').textContent).toContain('STREAMED_STDERR_LINE')
+
+    // Notifications with a different token (or non-log kind) must NOT pollute
+    // the log scroller — assert by sending an unrelated progress event and
+    // confirming the next assertion still finds only the two lines above.
+    emitNotification('$/progress', {
+      token: 'unrelated',
+      value: { kind: 'log', stream: 'stdout', line: 'WRONG_TOKEN_LINE' },
+    })
+    emitNotification('$/progress', {
+      token: 'healEventModel',
+      value: { kind: 'begin', title: 'noise' },
+    })
+    expect(screen.getByTestId('heal-log').textContent).not.toContain('WRONG_TOKEN_LINE')
+    expect(screen.getByTestId('heal-log').textContent).not.toContain('noise')
   })
 
   it('manual Heal button (FileMenu) triggers heal even when the file is valid', async () => {
