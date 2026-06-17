@@ -5,14 +5,23 @@ import { Canvas } from './ui/Canvas'
 import { Toolbar } from './ui/Toolbar'
 import { FileMenu } from './ui/FileMenu'
 import { Toast } from './ui/Toast'
+import { InvalidModelModal } from './ui/InvalidModelModal'
+import { HealingOverlay } from './ui/HealingOverlay'
 import { newModel, jsonToModel, modelToJson } from './io/fileOps'
 import { saveToStorage, loadFromStorage } from './io/persistence'
 import { getEdgeTypeForConnection } from './ui/connectionRules'
 import { computeNodeAlignments } from './ui/layout/grid'
+import { autoLayoutMissingPositions } from './ui/layout/autoLayout'
 import type { EdgeType } from './model/types'
-import { IdeClient, type ConnectionState } from './ipc/client'
+import { IdeClient, type ConnectionState, type RpcResult } from './ipc/client'
 import { initialize, type InitializeResult } from './ipc/initialize'
-import { readEventModel, writeEventModel } from './ipc/eventModel'
+import {
+  readEventModel,
+  writeEventModel,
+  healEventModel,
+  type ReadEventModelResult,
+  type ValidationError,
+} from './ipc/eventModel'
 import { StatusBar } from './ipc/StatusBar'
 
 const CLIENT_INFO = { name: 'neoide-frontend', version: '0.0.1' }
@@ -45,7 +54,58 @@ function App() {
   // connection. The effect closes the client on unmount.
   const [conn, setConn] = useState<ConnectionState>({ status: 'connecting' })
   const [init, setInit] = useState<InitializeResult | null>(null)
+  const [pendingInvalid, setPendingInvalid] = useState<{
+    errors: ValidationError[]
+    preamble?: string
+  } | null>(null)
+  const [healing, setHealing] = useState(false)
   const clientRef = useRef<IdeClient | null>(null)
+
+  const applyReadResult = useCallback(
+    (readRes: RpcResult<ReadEventModelResult>) => {
+      if (!readRes.ok) {
+        setToastMessage(`Failed to read event-model.json: ${readRes.error.message}`)
+        return
+      }
+      const { content, validation } = readRes.result
+      switch (validation.status) {
+        case 'notFound':
+          // Fresh project — keep whatever the reducer started with
+          // (localStorage or the empty `newModel()`).
+          return
+        case 'valid':
+          if (content !== null) {
+            const parsed = jsonToModel(content)
+            // Fill in any missing node positions so the canvas renders a
+            // sensible default layout instead of stacking everything at the
+            // origin (common after AI healing, which often omits positions).
+            // Idempotent — a no-op when every node already has a real position.
+            const loaded = autoLayoutMissingPositions(parsed)
+            dispatch({ type: 'loadModel', model: loaded })
+            setDirty(loaded !== parsed)
+          }
+          return
+        case 'invalid':
+          setPendingInvalid({ errors: validation.errors })
+          return
+        case 'malformedJson':
+          setPendingInvalid({
+            errors: [
+              {
+                pointer: '',
+                message: `File is not valid JSON: ${validation.parseError}`,
+                kind: 'schema',
+              },
+            ],
+            preamble:
+              'event-model.json on disk is not valid JSON. An AI agent can attempt to repair it, or you can cancel and keep your local copy.',
+          })
+          return
+      }
+    },
+    [],
+  )
+
   useEffect(() => {
     const client = new IdeClient()
     clientRef.current = client
@@ -57,32 +117,87 @@ function App() {
         return
       }
       setInit(initRes.result)
-
-      // After initialize, try to load the canonical `event-model.json` from
-      // the workspace root. `content === null` means the file does not exist
-      // — fall through to whatever the reducer started with (localStorage or
-      // the empty `newModel()`).
       const readRes = await readEventModel(client)
-      if (!readRes.ok) {
-        console.error('readEventModel failed', readRes.error)
-        return
-      }
-      if (readRes.result.content === null) return
-      try {
-        const loaded = jsonToModel(readRes.result.content)
-        dispatch({ type: 'loadModel', model: loaded })
-        setDirty(false)
-      } catch (e) {
-        console.error('failed to parse event-model.json from workspace', e)
-        setToastMessage('event-model.json on disk is malformed — kept the local copy')
-      }
+      applyReadResult(readRes)
     })()
     return () => {
       unsubscribe()
       client.close()
       clientRef.current = null
     }
+  }, [applyReadResult])
+
+  const handleHealAccept = useCallback(async () => {
+    const client = clientRef.current
+    if (!client) {
+      setToastMessage('not connected to neo — cannot heal')
+      setPendingInvalid(null)
+      return
+    }
+    setHealing(true)
+    const healRes = await healEventModel(client)
+    if (!healRes.ok) {
+      setToastMessage(`Healing failed: ${healRes.error.message}`)
+      setHealing(false)
+      setPendingInvalid(null)
+      return
+    }
+    if (healRes.result.outcome.status === 'stillInvalid') {
+      setPendingInvalid({
+        errors: healRes.result.outcome.errors,
+        preamble:
+          'Healing ran but the file is still invalid. Click Heal to try again, or Cancel to keep your local copy.',
+      })
+      setHealing(false)
+      return
+    }
+    // Healed — reload from disk.
+    const reload = await readEventModel(client)
+    setHealing(false)
+    setPendingInvalid(null)
+    applyReadResult(reload)
+  }, [applyReadResult])
+
+  const handleHealCancel = useCallback(() => {
+    setPendingInvalid(null)
   }, [])
+
+  // Manual "Heal with AI" button on the FileMenu. Always invokes claude
+  // (mode='improve'), even when validation is passing — that's how the
+  // user asks the agent to refine layout / add inferred edges.
+  const handleManualHeal = useCallback(async () => {
+    const client = clientRef.current
+    if (!client) {
+      setToastMessage('not connected to neo — cannot heal')
+      return
+    }
+    if (dirty) {
+      const confirmed = window.confirm(
+        'You have unsaved changes. The AI will edit the file on disk; your unsaved work will be discarded on reload. Continue?',
+      )
+      if (!confirmed) return
+    }
+    setHealing(true)
+    const healRes = await healEventModel(client, 'improve')
+    if (!healRes.ok) {
+      setToastMessage(`Healing failed: ${healRes.error.message}`)
+      setHealing(false)
+      return
+    }
+    if (healRes.result.outcome.status === 'stillInvalid') {
+      setPendingInvalid({
+        errors: healRes.result.outcome.errors,
+        preamble:
+          'The AI improved the file but it now has validation errors. Cancel to keep the agent’s changes on disk, or Heal to ask the agent to fix them.',
+      })
+      setHealing(false)
+      return
+    }
+    // Reload from disk.
+    const reload = await readEventModel(client)
+    setHealing(false)
+    applyReadResult(reload)
+  }, [applyReadResult, dirty])
 
   const markDirty = useCallback(() => setDirty(true), [])
 
@@ -306,24 +421,12 @@ function App() {
       if (!confirmed) return
     }
     const res = await readEventModel(client)
-    if (!res.ok) {
-      setToastMessage(`Open failed: ${res.error.message}`)
-      return
-    }
-    if (res.result.content === null) {
+    if (res.ok && res.result.validation.status === 'notFound') {
       setToastMessage('event-model.json does not exist in the workspace yet')
       return
     }
-    try {
-      const loaded = jsonToModel(res.result.content)
-      dispatch({ type: 'loadModel', model: loaded })
-      setDirty(false)
-    } catch (e) {
-      setToastMessage(
-        `event-model.json on disk is malformed: ${e instanceof Error ? e.message : 'unknown error'}`,
-      )
-    }
-  }, [dirty])
+    applyReadResult(res)
+  }, [dirty, applyReadResult])
 
   const handleSave = useCallback(async () => {
     const client = clientRef.current
@@ -345,7 +448,14 @@ function App() {
     <ModelContext.Provider value={{ model, dispatch }}>
       <ReactFlowProvider>
         <div className="flex flex-col w-full h-full">
-          <FileMenu onNew={handleNew} onOpen={handleOpen} onSave={handleSave} dirty={dirty} />
+          <FileMenu
+            onNew={handleNew}
+            onOpen={handleOpen}
+            onSave={handleSave}
+            onHeal={handleManualHeal}
+            dirty={dirty}
+            healing={healing}
+          />
           <Toolbar
             onAddEvent={handleAddEvent}
             onAddCommand={handleAddCommand}
@@ -383,6 +493,15 @@ function App() {
         </div>
       </ReactFlowProvider>
       <Toast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+      {pendingInvalid && !healing && (
+        <InvalidModelModal
+          errors={pendingInvalid.errors}
+          preamble={pendingInvalid.preamble}
+          onHeal={handleHealAccept}
+          onCancel={handleHealCancel}
+        />
+      )}
+      {healing && <HealingOverlay />}
     </ModelContext.Provider>
   )
 }

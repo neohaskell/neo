@@ -2,14 +2,18 @@ interface FileMenuProps {
   onNew: () => void
   onOpen: () => void
   onSave: () => void
+  onHeal: () => void
   dirty: boolean
+  healing: boolean
 }
 
 const btnClass =
   'px-3 py-1.5 text-sm font-medium rounded border border-gray-300 hover:bg-gray-100'
+const healBtnClass =
+  'px-3 py-1.5 text-sm font-medium rounded border border-indigo-300 text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 disabled:cursor-not-allowed'
 
-export function FileMenu({ onNew, onOpen, onSave, dirty }: FileMenuProps) {
-  // Open and Save both flow through `neo ide`'s JSON-RPC bridge — they
+export function FileMenu({ onNew, onOpen, onSave, onHeal, dirty, healing }: FileMenuProps) {
+  // Open / Save / Heal all flow through `neo ide`'s JSON-RPC bridge — they
   // operate on `<workspace_root>/event-model.json`, not a browser file picker.
   // The local-file import/export buttons could be added back later as a
   // separate `Import…`/`Export…` pair if needed.
@@ -23,6 +27,14 @@ export function FileMenu({ onNew, onOpen, onSave, dirty }: FileMenuProps) {
       </button>
       <button className={btnClass} onClick={onSave}>
         Save
+      </button>
+      <button
+        className={healBtnClass}
+        onClick={onHeal}
+        disabled={healing}
+        title="Ask Claude to improve the model (fix layout, add inferred edges, etc.)"
+      >
+        {healing ? 'Healing…' : 'Heal with AI'}
       </button>
       {dirty && (
         <span className="text-orange-500 text-lg" title="Unsaved changes">

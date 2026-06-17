@@ -1,10 +1,13 @@
 import type { Node } from '@xyflow/react'
 import type { EventModel } from '../../model/types'
+import {
+  estimateNodeDimensions,
+  NODE_BREATHING_ROOM,
+} from '../nodes/nodeDimensions'
 
 const LANE_HEIGHT = 200
 const LANE_WIDTH = 4000
 const MIN_COLUMN_WIDTH = 200
-const NODE_WIDTH = 120
 const SLICE_PADDING = 40
 const COLUMN_HEIGHT = 3000
 const HEADER_HEIGHT = 40
@@ -25,11 +28,33 @@ export interface EntityLaneLayout {
 
 export function computeEntityLaneLayouts(model: EventModel): EntityLaneLayout[] {
   const sortedEntities = [...model.entities].sort((a, b) => a.order - b.order)
-  return sortedEntities.map((entity, index) => ({
-    entityId: entity.id,
-    yStart: HEADER_HEIGHT + TOP_MARGIN + index * LANE_HEIGHT,
-    height: LANE_HEIGHT,
-  }))
+  const layouts: EntityLaneLayout[] = []
+  let yCursor = HEADER_HEIGHT + TOP_MARGIN
+
+  for (const entity of sortedEntities) {
+    // Lane must be tall enough to contain every event/command assigned to
+    // this entity. Other node kinds (queries, integrations, UIs) sit in
+    // their own bands above or below — they don't size the lane.
+    let maxBottom = yCursor // tracks the actual bottom of contained nodes
+    for (const node of model.nodes) {
+      const inLane =
+        (node.type === 'event' || node.type === 'command') &&
+        node.entityId === entity.id
+      if (!inLane) continue
+      const pos = model.layout.nodePositions[node.id]
+      if (!pos) continue
+      const { height: nodeHeight } = estimateNodeDimensions(node.name)
+      const nodeBottom = pos.y + nodeHeight + NODE_BREATHING_ROOM
+      if (nodeBottom > maxBottom) maxBottom = nodeBottom
+    }
+    const neededHeight =
+      maxBottom > yCursor ? maxBottom - yCursor + SLICE_PADDING : 0
+    const height = Math.max(LANE_HEIGHT, neededHeight)
+    layouts.push({ entityId: entity.id, yStart: yCursor, height })
+    yCursor += height
+  }
+
+  return layouts
 }
 
 export function getEntityAtY(layouts: EntityLaneLayout[], y: number): string | null {
@@ -55,12 +80,23 @@ export interface GridNodes {
 }
 
 export function computeSliceLayouts(model: EventModel): SliceLayout[] {
+  // Anchor each slice column to where its nodes actually live (with
+  // padding), then ensure adjacent columns don't overlap or shrink the
+  // previous one. Empty slices float on top of the previous slice's right
+  // edge with MIN_COLUMN_WIDTH.
+  //
+  // The old implementation accumulated widths from x=0 ignoring absolute
+  // node positions, which made hand-authored models (with positions like
+  // x=270, x=490, x=710) render with slice columns at x=0..200, 200..400,
+  // 400..600 — completely detached from where the nodes were drawn. Now
+  // the columns visually wrap their nodes.
   const sortedSlices = [...model.slices].sort((a, b) => a.order - b.order)
   const layouts: SliceLayout[] = []
   let xCursor = 0
 
   for (const slice of sortedSlices) {
     const sliceNodes = model.nodes.filter((n) => n.sliceId === slice.id)
+    let xStart = xCursor
     let width = MIN_COLUMN_WIDTH
 
     if (sliceNodes.length > 0) {
@@ -69,18 +105,27 @@ export function computeSliceLayouts(model: EventModel): SliceLayout[] {
       for (const node of sliceNodes) {
         const pos = model.layout.nodePositions[node.id]
         if (pos) {
+          const { width: nodeWidth } = estimateNodeDimensions(node.name)
           minX = Math.min(minX, pos.x)
-          maxX = Math.max(maxX, pos.x + NODE_WIDTH)
+          maxX = Math.max(maxX, pos.x + nodeWidth + NODE_BREATHING_ROOM)
         }
       }
       if (minX !== Infinity) {
-        const span = maxX - minX + SLICE_PADDING * 2
-        width = Math.max(MIN_COLUMN_WIDTH, span)
+        // Symmetric breathing room on both sides. Right edge is computed
+        // above as `pos.x + nodeWidth + NODE_BREATHING_ROOM`; the left
+        // edge subtracts the same NODE_BREATHING_ROOM so the visual gap
+        // between the node and the column edge matches on both sides.
+        // SLICE_PADDING is added on top as extra column-level padding.
+        const desiredStart = minX - NODE_BREATHING_ROOM - SLICE_PADDING
+        xStart = Math.max(xCursor, desiredStart)
+        // Right edge tracks the rightmost node (with breathing room) + padding.
+        const rightEdge = maxX + SLICE_PADDING
+        width = Math.max(MIN_COLUMN_WIDTH, rightEdge - xStart)
       }
     }
 
-    layouts.push({ sliceId: slice.id, xStart: xCursor, width })
-    xCursor += width
+    layouts.push({ sliceId: slice.id, xStart, width })
+    xCursor = xStart + width
   }
 
   return layouts

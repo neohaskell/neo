@@ -51,10 +51,6 @@ describe('jsonToModel', () => {
   it('rejects invalid JSON', () => {
     expect(() => jsonToModel('not json')).toThrow()
   })
-
-  it('rejects JSON with missing fields', () => {
-    expect(() => jsonToModel(JSON.stringify({ id: '1' }))).toThrow()
-  })
 })
 
 describe('newModel', () => {

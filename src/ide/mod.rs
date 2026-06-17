@@ -14,6 +14,7 @@ pub mod rpc;
 pub mod server;
 pub mod session;
 pub mod transport;
+pub mod validate;
 pub mod workspace;
 
 use std::sync::Arc;

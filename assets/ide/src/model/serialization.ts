@@ -1,80 +1,16 @@
-import type { EventModel } from './types'
+// Thin JSON pass-throughs. The Rust backend (`src/ide/validate.rs` +
+// `assets/ide/src/model/event-model.schema.json`) is the authoritative
+// validator for the on-disk shape; by the time content reaches
+// `deserialize` here, it has already been schema-checked and is
+// guaranteed to match `EventModel`. If you find yourself adding
+// runtime checks here, the boundary moved — fix it on the backend.
 
-export interface ValidationError {
-  readonly message: string
-}
+import type { EventModel } from './types'
 
 export function serialize(model: EventModel): string {
   return JSON.stringify(model, null, 2)
 }
 
 export function deserialize(json: string): EventModel {
-  let raw: unknown
-  try {
-    raw = JSON.parse(json)
-  } catch {
-    throw new Error('Invalid JSON')
-  }
-
-  if (typeof raw !== 'object' || raw === null) {
-    throw new Error('Expected an object')
-  }
-
-  const obj = raw as Record<string, unknown>
-
-  if (typeof obj.id !== 'string') throw new Error('Missing or invalid "id"')
-  if (typeof obj.name !== 'string') throw new Error('Missing or invalid "name"')
-  if (!Array.isArray(obj.nodes)) throw new Error('Missing or invalid "nodes"')
-  if (!Array.isArray(obj.edges)) throw new Error('Missing or invalid "edges"')
-  if (!Array.isArray(obj.entities)) throw new Error('Missing or invalid "entities"')
-  if (!Array.isArray(obj.chapters)) throw new Error('Missing or invalid "chapters"')
-  if (!Array.isArray(obj.slices)) throw new Error('Missing or invalid "slices"')
-  if (typeof obj.layout !== 'object' || obj.layout === null) {
-    throw new Error('Missing or invalid "layout"')
-  }
-
-  const model = obj as unknown as EventModel
-
-  const errors = validateModel(model)
-  if (errors.length > 0) {
-    throw new Error(`Invalid model: ${errors.map((e) => e.message).join(', ')}`)
-  }
-
-  return model
-}
-
-export function validateModel(model: EventModel): ValidationError[] {
-  const errors: ValidationError[] = []
-  const nodeIds = new Set(model.nodes.map((n) => n.id))
-  const entityIds = new Set(model.entities.map((e) => e.id))
-  const chapterIds = new Set(model.chapters.map((c) => c.id))
-
-  for (const edge of model.edges) {
-    if (!nodeIds.has(edge.sourceId)) {
-      errors.push({ message: `Edge ${edge.id}: source node ${edge.sourceId} not found` })
-    }
-    if (!nodeIds.has(edge.targetId)) {
-      errors.push({ message: `Edge ${edge.id}: target node ${edge.targetId} not found` })
-    }
-  }
-
-  for (const node of model.nodes) {
-    if ('entityId' in node && node.entityId !== null) {
-      if (!entityIds.has(node.entityId)) {
-        errors.push({
-          message: `Node ${node.id}: entity ${node.entityId} not found`,
-        })
-      }
-    }
-  }
-
-  for (const slice of model.slices) {
-    if (slice.chapterId !== null && !chapterIds.has(slice.chapterId)) {
-      errors.push({
-        message: `Slice ${slice.id}: chapter ${slice.chapterId} not found`,
-      })
-    }
-  }
-
-  return errors
+  return JSON.parse(json) as EventModel
 }

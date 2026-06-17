@@ -100,8 +100,21 @@ async fn handle_text_frame(
 ) -> Option<Response> {
     match parse_incoming(text) {
         Ok(Incoming::Request(req)) => {
+            tracing::info!(
+                method = %req.method,
+                session_id = %session.id,
+                "rpc request",
+            );
             let id = req.id;
             let result = state.registry.dispatch(&req.method, session, req.params).await;
+            if let Err(ref err) = result {
+                tracing::warn!(
+                    method = %req.method,
+                    code = err.code,
+                    message = %err.message,
+                    "rpc request failed",
+                );
+            }
             Some(match result {
                 Ok(value) => Response::success(id, value),
                 Err(err) => Response::failure(id, err),

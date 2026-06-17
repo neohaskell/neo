@@ -38,9 +38,4 @@ describe('loadFromStorage', () => {
     localStorage.setItem(STORAGE_KEY, 'not valid json')
     expect(loadFromStorage()).toBeNull()
   })
-
-  it('returns null for invalid model data', () => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ id: '1' }))
-    expect(loadFromStorage()).toBeNull()
-  })
 })

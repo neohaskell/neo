@@ -24,6 +24,8 @@ use std::sync::Arc;
 struct IdeAssets;
 
 pub async fn run(host: IpAddr, port: u16, output_mode: &mut OutputMode) -> miette::Result<()> {
+    init_tracing();
+
     let addr = SocketAddr::new(host, port);
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -90,6 +92,7 @@ fn print_startup(output_mode: &OutputMode, url: &str, bind: &str, bind_hint: Opt
             Some(hint) => println!("[info]   bind  {bind}  ({hint})"),
             None => println!("[info]   bind  {bind}"),
         }
+        println!("[info]   logs  stderr (set RUST_LOG=neo=debug for verbose)");
         println!("[info] press Ctrl+C to stop the server");
     } else {
         // Interactive: plain `println!` with crossterm SGR styling. No ratatui
@@ -108,8 +111,37 @@ fn print_startup(output_mode: &OutputMode, url: &str, bind: &str, bind_hint: Opt
         }
         println!();
         println!("  Press {} to stop the server.", "Ctrl+C".bold());
+        println!(
+            "  {}",
+            "Server logs stream to stderr. Set RUST_LOG=neo=debug for verbose output."
+                .dark_grey()
+        );
         println!();
     }
+}
+
+/// Initialise the tracing subscriber for `neo ide`. Sends events to stderr
+/// so stdout stays clean for the URL banner and other user-facing output.
+///
+/// Default filter: `neo=info,warn` — every `tracing::info!` from our own
+/// modules surfaces, plus warnings/errors from deps. Override with
+/// `RUST_LOG=neo=debug` (or any standard `tracing-subscriber` filter spec)
+/// to get more detail, e.g. per-WS-message + raw `claude -p` line-by-line.
+///
+/// Idempotent — `try_init` returns `Err` if a subscriber is already set,
+/// which we silently swallow so tests and other callers don't double-init.
+fn init_tracing() {
+    use std::io::IsTerminal;
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("neo=info,warn"));
+    let use_ansi = std::io::stderr().is_terminal();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_ansi(use_ansi)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn print_shutdown(output_mode: &OutputMode) {

@@ -177,6 +177,25 @@ pub enum NeoError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("Healing `event-model.json` aborted: `claude` is not on PATH")]
+    #[diagnostic(
+        code(neo::ide::healing::claude_missing),
+        url(docsrs),
+        help("Install Claude Code: `npm install -g @anthropic-ai/claude-code` (requires Node 18+). After install, run `which claude` to confirm it is on PATH; if it still is not, open a new shell or check your PATH order. Healing shells out to the same `claude` CLI you use interactively — there is no fallback. Once `which claude` prints a path, click Heal again in the IDE.")
+    )]
+    HealingClaudeMissing,
+
+    #[error("Healing `event-model.json` via `claude -p` failed: {reason}")]
+    #[diagnostic(
+        code(neo::ide::healing::failed),
+        url(docsrs),
+        help("`claude -p` did not complete successfully. Last lines of its stderr:\n\n{stderr_tail}\n\nCommon causes and concrete fixes:\n  1. API key missing or invalid — run `claude login` (or `export ANTHROPIC_API_KEY=...`) and click Heal again.\n  2. Rate-limited — wait ~60 seconds and click Heal again.\n  3. Network error — verify connectivity with `curl -I https://api.anthropic.com`, then retry.\n  4. Timed out — the model file may be too large or the prompt too complex. Open `event-model.json` and shrink it (delete obviously-broken nodes), then click Heal.\n  5. Crash inside `claude` — re-run `claude -p \"hello\"` from a terminal in this workspace to confirm the CLI itself works. If it crashes there too, file a bug with the Claude Code team.")
+    )]
+    HealingFailed {
+        reason: String,
+        stderr_tail: String,
+    },
 }
 
 impl NeoError {
@@ -640,6 +659,11 @@ mod tests {
             },
             NeoError::IdeServe {
                 source: std::io::Error::other("server crashed"),
+            },
+            NeoError::HealingClaudeMissing,
+            NeoError::HealingFailed {
+                reason: "exit code 1".to_string(),
+                stderr_tail: "panic at the disco".to_string(),
             },
         ]
     }

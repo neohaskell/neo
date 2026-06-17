@@ -1182,4 +1182,356 @@ mod ide_ws {
 
         kill(child);
     }
+
+    // ── validation-on-read ────────────────────────────────────────────────
+    // The new `validation` field on `workspace/readEventModel` must surface
+    // schema + referential errors over the wire so the frontend can show
+    // the heal modal without re-validating client-side.
+
+    const VALID_EVENT_MODEL: &str = r#"{
+  "id": "m1",
+  "name": "demo",
+  "chapters": [],
+  "entities": [],
+  "slices": [],
+  "nodes": [],
+  "edges": [],
+  "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}"#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_read_event_model_reports_valid_over_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event-model.json"), VALID_EVENT_MODEL).unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["validation"]["status"], "valid",
+            "expected status=valid, got {resp}"
+        );
+        assert_eq!(
+            resp["result"]["content"].as_str().unwrap(),
+            VALID_EVENT_MODEL
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_read_event_model_reports_not_found_over_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["validation"]["status"], "notFound",
+            "expected status=notFound, got {resp}"
+        );
+        assert!(
+            resp["result"]["content"].is_null(),
+            "content must be null when notFound: {resp}"
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_read_event_model_reports_invalid_over_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        // Valid JSON but missing the required `id` field.
+        let bad = r#"{"name":"demo","chapters":[],"entities":[],"slices":[],"nodes":[],"edges":[],"layout":{"nodePositions":{},"viewport":{"x":0,"y":0,"zoom":1}}}"#;
+        std::fs::write(dir.path().join("event-model.json"), bad).unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["validation"]["status"], "invalid",
+            "expected status=invalid, got {resp}"
+        );
+        let errors = resp["result"]["validation"]["errors"]
+            .as_array()
+            .expect("errors array");
+        assert!(!errors.is_empty(), "expected at least one error: {resp}");
+        // Content is still returned so the modal can show context.
+        assert_eq!(resp["result"]["content"].as_str().unwrap(), bad);
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_read_event_model_reports_malformed_json_over_ws() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event-model.json"), "{not json").unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["validation"]["status"], "malformedJson",
+            "expected status=malformedJson, got {resp}"
+        );
+        assert!(
+            resp["result"]["validation"]["parseError"].is_string(),
+            "parseError must be populated: {resp}"
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_logs_rpc_requests_to_stderr() {
+        // Verifies the tracing subscriber installed by `commands/ide.rs`
+        // surfaces RPC traffic on stderr — the "what is happening" signal
+        // the heal flow relies on. We spawn `neo ide` with stderr piped,
+        // send one initialize + one readEventModel, then assert both
+        // method names appear in the captured stderr.
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let neo = assert_cmd::cargo::cargo_bin("neo");
+        let mut child = std::process::Command::new(&neo)
+            .current_dir(dir.path())
+            .arg("--ci")
+            .arg("ide")
+            .arg("--port")
+            .arg(port.to_string())
+            .env("RUST_LOG", "neo=info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn neo ide");
+
+        // Wait for listen.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut ws = ws_connect(port).await;
+        let _ = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+                   "params":{"clientInfo":{"name":"t","version":"0"}}}),
+        )
+        .await;
+        let _ = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":2,"method":"workspace/readEventModel","params":{}}),
+        )
+        .await;
+
+        // Kill the child and harvest the buffered stderr.
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr_buf = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut stderr_buf);
+        }
+
+        assert!(
+            stderr_buf.contains("rpc request") && stderr_buf.contains("method=initialize"),
+            "expected `rpc request` log for initialize, got stderr: {stderr_buf}",
+        );
+        assert!(
+            stderr_buf.contains("method=workspace/readEventModel"),
+            "expected `rpc request` log for readEventModel, got stderr: {stderr_buf}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_heal_event_model_missing_claude_surfaces_error() {
+        // Spawn `neo ide` with PATH stripped down so `claude` is not
+        // resolvable. The healing handler must surface a structured
+        // RpcError with the `neo::ide::healing::claude_missing` code.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event-model.json"), "{}").unwrap();
+        let port = reserve_port();
+        // spawn_ide currently inherits PATH; we need a custom spawn that
+        // strips claude. Do it inline rather than generalising spawn_ide.
+        use std::process::{Command, Stdio};
+        let neo_bin = assert_cmd::cargo::cargo_bin("neo");
+        // Minimal PATH that has nix-store paths for `git`/`ssh` etc but
+        // explicitly excludes anywhere `claude` lives. We use only the
+        // directory of `neo` itself.
+        let bin_dir = neo_bin.parent().unwrap().display().to_string();
+        let stripped_path = bin_dir;
+        let mut child = Command::new(&neo_bin)
+            .arg("--ci")
+            .arg("ide")
+            .arg("--port")
+            .arg(port.to_string())
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", stripped_path)
+            .env("HOME", dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn neo ide with stripped PATH");
+
+        // Wait for listen
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/healEventModel","params":{}}),
+        )
+        .await;
+
+        assert_eq!(
+            resp["error"]["code"], -32000,
+            "expected app error -32000, got {resp}"
+        );
+        let code = resp["error"]["data"]["diagnosticCode"]
+            .as_str()
+            .unwrap_or("");
+        assert_eq!(
+            code, "neo::ide::healing::claude_missing",
+            "diagnostic code must name the missing-claude variant, got {resp}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_logs_heal_failure_dumps_full_subprocess_output() {
+        // The user's report: "I only see that claude exited with code 1 but
+        // no idea of what failed and how". This test stubs `claude` with a
+        // shell script that prints distinct sentinels to stdout AND stderr
+        // before exiting non-zero, then asserts both surface in neo's
+        // captured stderr alongside the "claude failed" log line.
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("event-model.json"), "{}").unwrap();
+
+        // Stub claude that emits a stdout line, a stderr line, then exits 1.
+        // `/bin/sh` (not `env bash`) so the script runs even though the
+        // outer `env_clear()` strips PATH of bash.
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub = stub_dir.path().join("claude");
+        let stub_body = "#!/bin/sh\n\
+            echo 'STUB_STDOUT_SENTINEL: claude pretending to think'\n\
+            echo 'STUB_STDERR_SENTINEL: claude pretending to fail' 1>&2\n\
+            exit 1\n";
+        {
+            let mut f = std::fs::File::create(&stub).unwrap();
+            f.write_all(stub_body.as_bytes()).unwrap();
+        }
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        // Spawn `neo ide` with PATH pointing only at the stub dir so `claude`
+        // resolves to our shim. Also keep neo's own bin dir on PATH.
+        let neo_bin = assert_cmd::cargo::cargo_bin("neo");
+        let path_value = format!(
+            "{}:{}",
+            stub_dir.path().display(),
+            neo_bin.parent().unwrap().display()
+        );
+        let port = reserve_port();
+        let mut child = std::process::Command::new(&neo_bin)
+            .arg("--ci")
+            .arg("ide")
+            .arg("--port")
+            .arg(port.to_string())
+            .current_dir(dir.path())
+            .env_clear()
+            .env("PATH", path_value)
+            .env("HOME", dir.path())
+            .env("RUST_LOG", "neo=info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn neo ide with stub claude");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let mut ws = ws_connect(port).await;
+        let resp = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/healEventModel","params":{}}),
+        )
+        .await;
+        // The RPC itself fails — that's expected; we just want the logs.
+        assert!(
+            resp["error"]["data"]["diagnosticCode"]
+                .as_str()
+                .unwrap_or("")
+                == "neo::ide::healing::failed",
+            "expected healing::failed diagnostic, got {resp}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr_buf = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut stderr_buf);
+        }
+
+        // The full-dump log must include BOTH sentinels so the user sees
+        // exactly what claude wrote without scrolling through interleaved
+        // per-line streams.
+        assert!(
+            stderr_buf.contains("STUB_STDOUT_SENTINEL"),
+            "stderr should include captured stdout content, got:\n{stderr_buf}",
+        );
+        assert!(
+            stderr_buf.contains("STUB_STDERR_SENTINEL"),
+            "stderr should include captured stderr content, got:\n{stderr_buf}",
+        );
+        // And the failure-summary log must be present.
+        assert!(
+            stderr_buf.contains("heal: claude failed"),
+            "stderr should include the heal-failure summary log, got:\n{stderr_buf}",
+        );
+        // And the spawn-command log must echo the args so the user can copy-paste.
+        assert!(
+            stderr_buf.contains("--add-dir") && stderr_buf.contains("--allowed-tools"),
+            "stderr should include the spawn args, got:\n{stderr_buf}",
+        );
+    }
 }

@@ -10,6 +10,7 @@
 //! If a new method requires touching `src/ide/rpc.rs` or `src/ide/registry.rs`,
 //! the foundation is wrong — push back instead of patching.
 
+pub mod heal_event_model;
 pub mod initialize;
 pub mod read_event_model;
 pub mod write_event_model;
@@ -21,4 +22,5 @@ pub fn register_all(registry: MethodRegistry) -> MethodRegistry {
         .register("initialize", initialize::handle)
         .register("workspace/readEventModel", read_event_model::handle)
         .register("workspace/writeEventModel", write_event_model::handle)
+        .register("workspace/healEventModel", heal_event_model::handle)
 }
