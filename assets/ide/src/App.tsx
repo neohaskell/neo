@@ -64,6 +64,9 @@ function App() {
   const [healing, setHealing] = useState(false)
   const [cancellingHeal, setCancellingHeal] = useState(false)
   const [relayouting, setRelayouting] = useState(false)
+  // Bumped to re-fit the canvas after a server reload moves nodes (e.g.
+  // "Tidy by flow"), so the tidied diagram is framed instead of off-screen.
+  const [fitSignal, setFitSignal] = useState<number | undefined>(undefined)
   const [healLog, setHealLog] = useState<HealLogLine[]>([])
   const clientRef = useRef<IdeClient | null>(null)
 
@@ -345,6 +348,8 @@ function App() {
     const reload = await readEventModel(client)
     setRelayouting(false)
     applyReadResult(reload)
+    // Re-frame the canvas on the tidied (possibly moved) nodes.
+    setFitSignal((n) => (n ?? 0) + 1)
   }, [applyReadResult, dirty])
 
   const markDirty = useCallback(() => setDirty(true), [])
@@ -688,6 +693,7 @@ function App() {
                 onAssignChapterToSubmodel={handleAssignChapterToSubmodel}
                 flashingSliceId={flashingSliceId}
                 flashingEntityId={flashingEntityId}
+                fitSignal={fitSignal}
               />
             </div>
           </div>

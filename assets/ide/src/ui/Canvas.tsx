@@ -12,6 +12,7 @@ import {
   type Edge,
   applyNodeChanges,
   applyEdgeChanges,
+  useReactFlow,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { nodeTypes } from './nodes'
@@ -41,7 +42,20 @@ interface CanvasProps {
   onAssignChapterToSubmodel?: (chapterId: string, submodelId: string | null) => void
   flashingSliceId?: string | null
   flashingEntityId?: string | null
+  /** Bump this to re-fit the viewport to the content (e.g. after a server
+   *  reload such as "Tidy by flow", which moves nodes while React Flow's
+   *  mount-only `fitView` does not re-run). Leave undefined to skip. */
+  fitSignal?: number
 }
+
+/** Node types that are visual background (lanes/columns/bands) — excluded
+ *  from fit-to-view so the viewport frames the actual content. */
+const BACKGROUND_NODE_TYPES = new Set([
+  'entityLane',
+  'sliceColumn',
+  'chapterArrow',
+  'submodelBand',
+])
 
 function getSliceAtX(layouts: SliceLayout[], x: number): string | null {
   for (const layout of layouts) {
@@ -90,7 +104,26 @@ export function Canvas({
   onAssignChapterToSubmodel,
   flashingSliceId,
   flashingEntityId,
+  fitSignal,
 }: CanvasProps) {
+  const reactFlow = useReactFlow()
+
+  // Re-fit the viewport whenever `fitSignal` changes (a server reload moved
+  // the nodes). React Flow's `fitView` prop only runs on mount, so without
+  // this an off-origin layout — e.g. right after "Tidy by flow" — would leave
+  // the canvas looking empty until the user manually zoomed to fit.
+  useEffect(() => {
+    if (fitSignal === undefined) return
+    const id = setTimeout(() => {
+      const contentNodes = reactFlow
+        .getNodes()
+        .filter((n) => !BACKGROUND_NODE_TYPES.has(n.type ?? ''))
+      if (contentNodes.length > 0) {
+        reactFlow.fitView({ nodes: contentNodes, padding: 0.2, duration: 300 })
+      }
+    }, 0)
+    return () => clearTimeout(id)
+  }, [fitSignal, reactFlow])
   const [highlightedSliceId, setHighlightedSliceId] = useState<string | null>(null)
   const [highlightedEntityId, setHighlightedEntityId] = useState<string | null>(null)
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null)

@@ -1091,48 +1091,21 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
     }
 }
 
-fn rebalance_slice_columns(
-    model: &Value,
-    plan: &MaterializePlan,
-    diff: &mut HealDiff,
-) {
-    let positions = model
-        .get("layout")
-        .and_then(|l| l.get("nodePositions"))
-        .and_then(|p| p.as_object());
-
-    // Leftmost x per slice (from existing nodes only — pending nodes
-    // don't have positions yet; PositionCalculator handles those).
-    let mut slice_current_x: BTreeMap<String, f64> = BTreeMap::new();
-    if let Some(positions) = positions {
-        for node in plan.iter_existing_nodes() {
-            let Some(slice_id) = node.slice_id.as_ref() else {
-                continue;
-            };
-            let Some(pos) = positions.get(&node.id).and_then(|v| v.as_object()) else {
-                continue;
-            };
-            let Some(x) = pos.get("x").and_then(|v| v.as_f64()) else {
-                continue;
-            };
-            slice_current_x
-                .entry(slice_id.clone())
-                .and_modify(|cur| {
-                    if x < *cur {
-                        *cur = x;
-                    }
-                })
-                .or_insert(x);
-        }
-    }
-
-    // The wave pass (`order_slices_by_wave`) just rewrote existing slices'
-    // `order` into `diff.update_slices` — but the model JSON isn't mutated
-    // until `apply_diff`, so we must read the EFFECTIVE order (the wave
-    // order) here, not the stale `model.slices[].order`. Otherwise the
-    // first pass lays columns out against the old order and the second pass
-    // (model now carrying the wave order) computes different columns — i.e.
-    // the layout would never reach a fixed point.
+/// Compact, left-anchored column x per slice, ordered by the EFFECTIVE wave
+/// order (model order overridden by this diff's `update_slices`, plus pending
+/// `add_slices`). Columns start at `SLICE_COLUMN_OFFSET` and step by
+/// `DEFAULT_NODE_WIDTH + SLICE_COLUMN_GAP`.
+///
+/// This is the single source of horizontal placement — BOTH the existing-node
+/// x-fix (`rebalance_slice_columns`) and the new-node placement
+/// (`PositionCalculator`) read it, so `slice.order` and node x stay in
+/// lockstep AND the diagram stays anchored near the origin. It deliberately
+/// ignores each node's existing x: when the wave reorders slices, a slice that
+/// used to live far to the right must move to its new column near the origin.
+/// The previous `max(current_x, prev + pitch)` logic only ever pushed right,
+/// so a big reorder cascaded every column thousands of px off-screen, leaving
+/// the canvas blank.
+fn wave_slice_columns(model: &Value, diff: &HealDiff) -> BTreeMap<String, f64> {
     let mut order_override: BTreeMap<String, f64> = BTreeMap::new();
     for u in &diff.update_slices {
         if let Some(o) = u.set_order {
@@ -1140,9 +1113,6 @@ fn rebalance_slice_columns(
         }
     }
 
-    // Sorted (slice_id, order) list — existing slices from the model,
-    // pending slices appended (they already have orders assigned at
-    // materialise time, past the last existing one).
     let mut all_slices: Vec<(String, f64)> = Vec::new();
     if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
         for s in arr {
@@ -1166,32 +1136,38 @@ fn rebalance_slice_columns(
             .then_with(|| a.0.cmp(&b.0))
     });
 
-    // Monotonic resolution: each slice's column = max(its current
-    // claimed x, previous resolved + DEFAULT_NODE_WIDTH + GAP). Slices
-    // with no claimed x (pending or empty) inherit min_x.
-    let mut slice_resolved_x: BTreeMap<String, f64> = BTreeMap::new();
-    let mut prev_resolved: Option<f64> = None;
+    let mut cols: BTreeMap<String, f64> = BTreeMap::new();
+    let mut x = SLICE_COLUMN_OFFSET;
     for (slice_id, _order) in &all_slices {
-        let current = slice_current_x.get(slice_id).copied();
-        let min_x = prev_resolved.map(|p| p + DEFAULT_NODE_WIDTH + SLICE_COLUMN_GAP);
-        let resolved = match (current, min_x) {
-            (Some(c), Some(m)) if c < m => m,
-            (Some(c), _) => c,
-            (None, Some(m)) => m,
-            (None, None) => SLICE_COLUMN_OFFSET,
-        };
-        slice_resolved_x.insert(slice_id.clone(), resolved);
-        prev_resolved = Some(resolved);
+        cols.insert(slice_id.clone(), x);
+        x += DEFAULT_NODE_WIDTH + SLICE_COLUMN_GAP;
     }
+    cols
+}
 
-    // For each existing node whose x doesn't match its slice's resolved
-    // column, queue an x-only PositionFix.
+fn rebalance_slice_columns(
+    model: &Value,
+    plan: &MaterializePlan,
+    diff: &mut HealDiff,
+) {
+    let positions = model
+        .get("layout")
+        .and_then(|l| l.get("nodePositions"))
+        .and_then(|p| p.as_object());
+
+    // Compact, left-anchored columns in wave order — the SAME source
+    // PositionCalculator uses for new nodes, so order and x stay locked and
+    // a reorder can never push columns off-screen.
+    let cols = wave_slice_columns(model, diff);
+
+    // For each existing node whose x doesn't match its slice's column,
+    // queue an x-only PositionFix.
     let Some(positions) = positions else { return };
     for node in plan.iter_existing_nodes() {
         let Some(slice_id) = node.slice_id.as_ref() else {
             continue;
         };
-        let Some(target_x) = slice_resolved_x.get(slice_id).copied() else {
+        let Some(target_x) = cols.get(slice_id).copied() else {
             continue;
         };
         let Some(pos) = positions.get(&node.id).and_then(|v| v.as_object()) else {
@@ -1588,45 +1564,32 @@ impl PositionCalculator {
             .and_then(|l| l.get("nodePositions"))
             .and_then(|p| p.as_object());
 
-        // 1. Existing nodes seed slice_x (leftmost sibling x) and stack
-        // counts (every already-placed node bumps the rank for its
-        // (slice, type) bucket).
-        let mut slice_x: BTreeMap<String, f64> = BTreeMap::new();
+        // 1. Slice columns come from the shared compact-column layout (wave
+        // order, left-anchored) — the SAME source `rebalance_slice_columns`
+        // uses for existing nodes, so existing and new nodes in a slice share
+        // one column and the layout stays anchored near the origin.
+        let slice_x = wave_slice_columns(model, diff);
+
+        // 2. Stack counts: every already-placed (positioned) existing node
+        // bumps the rank for its (slice, type) bucket so additional nodes of
+        // the same kind stack vertically by STACK_DY instead of overlapping.
         let mut stack_ranks: BTreeMap<(String, String), usize> = BTreeMap::new();
-        let mut global_right: f64 = SLICE_COLUMN_OFFSET;
         if let Some(positions) = positions {
             for node in plan.iter_existing_nodes() {
                 let Some(slice_id) = node.slice_id.as_ref() else { continue };
-                let Some(pos) = positions.get(&node.id).and_then(|v| v.as_object()) else {
+                let positioned = positions
+                    .get(&node.id)
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get("x"))
+                    .and_then(|v| v.as_f64())
+                    .is_some();
+                if !positioned {
                     continue;
-                };
-                let Some(x) = pos.get("x").and_then(|v| v.as_f64()) else { continue };
-                slice_x
-                    .entry(slice_id.clone())
-                    .and_modify(|cur| {
-                        if x < *cur {
-                            *cur = x;
-                        }
-                    })
-                    .or_insert(x);
+                }
                 *stack_ranks
                     .entry((slice_id.clone(), node.r#type.clone()))
                     .or_insert(0) += 1;
-                let right = x + DEFAULT_NODE_WIDTH;
-                if right > global_right {
-                    global_right = right;
-                }
             }
-        }
-
-        // 2. Brand-new slices land past every existing node, in
-        // `add_slices` order (which is itself sorted by the order we
-        // assigned at materialisation time). This yields a deterministic
-        // left-to-right rhythm for new columns.
-        for slice in &diff.add_slices {
-            global_right += SLICE_COLUMN_GAP;
-            slice_x.insert(slice.id.clone(), global_right);
-            global_right += DEFAULT_NODE_WIDTH;
         }
 
         // 3. Entity indices: existing entities (in `order`) then new
@@ -2185,11 +2148,12 @@ mod tests {
     }
 
     #[test]
-    fn layout_places_new_slice_columns_past_rightmost_existing_node() {
-        // Existing model has a hand-placed slice at x=1500. The inspection
-        // adds a brand-new slice/command. The new node MUST land past
-        // x=1500 (not in the same column, not at a hash-random offset),
-        // so the new column doesn't overlap the existing one.
+    fn layout_new_slice_gets_clean_compact_column() {
+        // Existing nodes are scattered (one slice far right at x=1500). The
+        // inspection adds a brand-new slice/command. With compaction, the new
+        // node lands on the clean left-anchored grid (x = 40 + k*320), in its
+        // own column distinct from the existing slice's compacted column — so
+        // nothing overlaps and nothing ends up off at a hash-random offset.
         let mut model = minimal_model();
         model["layout"]["nodePositions"] = serde_json::json!({
             "cmd1": { "x": 40,   "y": 120 },
@@ -2222,12 +2186,26 @@ mod tests {
             .find(|e| e.node_id == new_cmd.id)
             .expect("ArchiveOrder must get a layout entry");
 
+        // On the compact grid: x = SLICE_COLUMN_OFFSET(40) + k*pitch(320).
+        let pitch = DEFAULT_NODE_WIDTH + SLICE_COLUMN_GAP;
+        let off = layout.x - SLICE_COLUMN_OFFSET;
         assert!(
-            layout.x > 1500.0 + DEFAULT_NODE_WIDTH,
-            "new slice's node x ({}) must land past the rightmost existing node \
-             (rightmost edge ≈ {}); otherwise the new column overlaps the existing one",
+            layout.x >= SLICE_COLUMN_OFFSET && (off % pitch).abs() < f64::EPSILON,
+            "new node x ({}) must sit on the compact grid (40 + k*{pitch})",
             layout.x,
-            1500.0 + DEFAULT_NODE_WIDTH,
+        );
+        // Distinct column from the existing PlaceOrder slice (cmd1). cmd1 is
+        // compacted to its own column via a fix_position (or already there).
+        let cmd1_x = diff
+            .fix_positions
+            .iter()
+            .find(|f| f.node_id == "cmd1")
+            .and_then(|f| f.to_x)
+            .unwrap_or(40.0);
+        assert!(
+            (layout.x - cmd1_x).abs() > f64::EPSILON,
+            "new slice column ({}) must differ from the existing slice column ({cmd1_x})",
+            layout.x,
         );
         assert!(
             (layout.y - Y_COMMAND_QUERY_INTEGRATION).abs() < f64::EPSILON,
@@ -2612,10 +2590,12 @@ mod tests {
     }
 
     #[test]
-    fn rebalance_pushes_colliding_slice_columns_apart() {
-        // Two slices each claim x=200 — `B` follows `A` in order, so
-        // it gets pushed past A's column extent. A's node stays put;
-        // B's node gets an x fix.
+    fn rebalance_compacts_columns_to_left_anchored_grid() {
+        // Both nodes start far to the right at x=900. Compaction anchors the
+        // columns at SLICE_COLUMN_OFFSET(40) and steps by pitch
+        // (DEFAULT_NODE_WIDTH 240 + GAP 80 = 320): A -> 40, B -> 360. Both
+        // move LEFT — the whole point of "tidy" is to pull a drifted layout
+        // back to the origin so it never ends up off-screen.
         let model = serde_json::json!({
             "id": "m1", "name": "demo",
             "chapters": [],
@@ -2631,8 +2611,8 @@ mod tests {
             "edges": [],
             "layout": {
                 "nodePositions": {
-                    "nA": { "x": 200, "y": 120 },
-                    "nB": { "x": 200, "y": 120 }
+                    "nA": { "x": 900, "y": 120 },
+                    "nB": { "x": 900, "y": 120 }
                 },
                 "viewport": { "x": 0, "y": 0, "zoom": 1 }
             }
@@ -2643,23 +2623,25 @@ mod tests {
         };
         let diff = compute_diff(&model, &inspection);
 
-        // A stays at 200; B moves past A (200 + W + GAP = 200 + 240 + 80 = 520).
+        let a_fix = diff
+            .fix_positions
+            .iter()
+            .find(|f| f.node_id == "nA")
+            .expect("A should be compacted left");
+        assert_eq!(a_fix.to_x, Some(40.0), "A -> column 0");
+        assert_eq!(a_fix.to_y, None, "y must not be touched");
         let b_fix = diff
             .fix_positions
             .iter()
             .find(|f| f.node_id == "nB")
-            .expect("B should get an x-fix");
-        assert_eq!(b_fix.to_x, Some(520.0));
+            .expect("B should get its own column");
+        assert_eq!(b_fix.to_x, Some(360.0), "B -> column 1 (40 + 320)");
         assert_eq!(b_fix.to_y, None, "y must not be touched");
-        assert!(
-            !diff.fix_positions.iter().any(|f| f.node_id == "nA"),
-            "A must not move",
-        );
     }
 
     #[test]
-    fn rebalance_leaves_well_spaced_slices_alone() {
-        // Slices with already-correct columns get no fixes.
+    fn rebalance_leaves_already_compact_slices_alone() {
+        // Slices already sitting on the compact grid (40, 360) get no x fix.
         let model = serde_json::json!({
             "id": "m1", "name": "demo",
             "chapters": [],
@@ -2676,7 +2658,7 @@ mod tests {
             "layout": {
                 "nodePositions": {
                     "nA": { "x": 40,  "y": 120 },
-                    "nB": { "x": 600, "y": 120 }
+                    "nB": { "x": 360, "y": 120 }
                 },
                 "viewport": { "x": 0, "y": 0, "zoom": 1 }
             }
@@ -2688,7 +2670,7 @@ mod tests {
         let diff = compute_diff(&model, &inspection);
         assert!(
             diff.fix_positions.iter().all(|f| f.to_x.is_none() && f.to_y.is_none()),
-            "no fixes should fire on a well-spaced layout; got {:?}",
+            "no fixes should fire on an already-compact layout; got {:?}",
             diff.fix_positions,
         );
     }
