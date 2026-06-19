@@ -68,6 +68,12 @@ pub struct HealDiff {
     pub add_nodes: Vec<NodeToAdd>,
     /// Edges to add between nodes (existing + freshly materialised).
     pub add_edges: Vec<EdgeToAdd>,
+    /// Heal-authored edges (`edge-heal-` id prefix) to remove because the
+    /// narrowed inspection no longer wires them — currently the over-
+    /// approximated `eventFeedsQuery` edges that the old all-local default
+    /// minted. `apply_remove_edges` double-gates on the `edge-heal-` prefix
+    /// so a user-drawn edge is never removed even if field-overlap disagrees.
+    pub remove_edges: Vec<EdgeRef>,
     /// Existing slices whose `chapterId` / `order` need updating to group
     /// them into their entity's chapter.
     pub update_slices: Vec<SliceUpdate>,
@@ -92,6 +98,7 @@ impl HealDiff {
             + self.add_slices.len()
             + self.add_nodes.len()
             + self.add_edges.len()
+            + self.remove_edges.len()
             + self.update_slices.len()
             + self.fix_integration_kinds.len()
             + self.fix_positions.len()
@@ -101,13 +108,14 @@ impl HealDiff {
     /// Short, human-readable one-line summary for logs and the heal overlay.
     pub fn summary(&self) -> String {
         format!(
-            "{} chapters, {} chapters removed, {} entities, {} slices, {} nodes, {} edges, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
+            "{} chapters, {} chapters removed, {} entities, {} slices, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
             self.add_chapters.len(),
             self.remove_chapters.len(),
             self.add_entities.len(),
             self.add_slices.len(),
             self.add_nodes.len(),
             self.add_edges.len(),
+            self.remove_edges.len(),
             self.update_slices.len(),
             self.fix_integration_kinds.len(),
             self.fix_positions.len(),
@@ -183,6 +191,20 @@ pub struct EdgeToAdd {
     pub source_handle: String,
     pub target_handle: String,
     /// Human-readable rationale, e.g. "command RequestPayment produces event PaymentRequested".
+    pub reason: String,
+}
+
+/// Identifies an edge by its content key `(type, source, target)` — the same
+/// triple `synth_edge_id` hashes. Used by `remove_edges` to drop stale
+/// heal-authored edges.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EdgeRef {
+    pub edge_type: String,
+    pub source_id: String,
+    pub target_id: String,
+    /// Human-readable rationale, e.g. "query CartSummary no longer reads any
+    /// field event ItemRemoved writes".
     pub reason: String,
 }
 
@@ -397,6 +419,11 @@ pub fn compute_diff_with_options(
                     ),
                 );
             }
+            // Migration: drop heal-authored `eventFeedsQuery` edges this query
+            // no longer subscribes to (the over-approximated all-local edges
+            // a prior heal minted). User-drawn edges are never touched.
+            let subscribed: BTreeSet<String> = q.subscribes_to.iter().cloned().collect();
+            plan.queue_stale_query_edges(&mut diff, &q_node_id, &subscribed, &q.name);
         }
 
         // Integrations: each gets its own slice + node, kind set from
@@ -1244,6 +1271,11 @@ struct MaterializePlan {
     slices_by_name: BTreeMap<String, String>,
     nodes_by_type_and_name: BTreeMap<(String, String), Vec<usize>>,
     edge_keys: BTreeSet<(String, String, String)>,
+    /// `(type, source, target)` of existing edges whose `id` starts with
+    /// `edge-heal-` — i.e. heal-authored. The provenance gate that lets the
+    /// removal pass drop stale heal edges without ever touching a user-drawn
+    /// one (whose id uses a different scheme).
+    existing_heal_edges: Vec<(String, String, String)>,
     /// `order` to assign to the next pending entity (one past the max).
     next_entity_order: f64,
     /// `order` to assign to the next pending slice.
@@ -1309,6 +1341,7 @@ impl MaterializePlan {
         }
 
         let mut edge_keys: BTreeSet<(String, String, String)> = BTreeSet::new();
+        let mut existing_heal_edges: Vec<(String, String, String)> = Vec::new();
         if let Some(arr) = model.get("edges").and_then(|e| e.as_array()) {
             for raw in arr {
                 let Some(t) = raw.get("type").and_then(|v| v.as_str()) else {
@@ -1321,6 +1354,13 @@ impl MaterializePlan {
                     continue;
                 };
                 edge_keys.insert((t.to_string(), s.to_string(), tg.to_string()));
+                let heal_authored = raw
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| id.starts_with("edge-heal-"));
+                if heal_authored {
+                    existing_heal_edges.push((t.to_string(), s.to_string(), tg.to_string()));
+                }
             }
         }
 
@@ -1368,8 +1408,49 @@ impl MaterializePlan {
             slices_by_name,
             nodes_by_type_and_name,
             edge_keys,
+            existing_heal_edges,
             next_entity_order: max_entity_order + 1.0,
             next_slice_order: max_slice_order + 1.0,
+        }
+    }
+
+    /// Name of an existing node by id, if present. Used by the edge-removal
+    /// pass to resolve an `eventFeedsQuery` source back to its event name.
+    fn node_name_by_id(&self, id: &str) -> Option<&str> {
+        self.nodes
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.name.as_str())
+    }
+
+    /// Queue removal of stale heal-authored `eventFeedsQuery` edges into
+    /// `q_node_id` whose source event name is NOT in `subscribed` (the
+    /// narrowed feeder set). Only heal-authored edges are in
+    /// `existing_heal_edges`, so a user-drawn edge is never queued — which
+    /// keeps the diff a fixed point (it is never re-proposed on the next run).
+    fn queue_stale_query_edges(
+        &self,
+        diff: &mut HealDiff,
+        q_node_id: &str,
+        subscribed: &BTreeSet<String>,
+        query_name: &str,
+    ) {
+        for (etype, src, tgt) in &self.existing_heal_edges {
+            if etype != "eventFeedsQuery" || tgt != q_node_id {
+                continue;
+            }
+            let src_name = self.node_name_by_id(src).unwrap_or("");
+            if subscribed.contains(src_name) {
+                continue;
+            }
+            diff.remove_edges.push(EdgeRef {
+                edge_type: etype.clone(),
+                source_id: src.clone(),
+                target_id: tgt.clone(),
+                reason: format!(
+                    "query {query_name} read model no longer reads any field event {src_name} writes (field-overlap narrowing)"
+                ),
+            });
         }
     }
 
@@ -1760,6 +1841,7 @@ mod tests {
                     name: "OrderSummary".to_string(),
                     file: PathBuf::new(),
                     subscribes_to: vec!["OrderPlaced".to_string(), "OrderShipped".to_string()],
+                    ..Default::default()
                 }],
                 integrations: vec![IntegrationInfo {
                     name: "Notifier".to_string(),
@@ -2801,6 +2883,7 @@ mod tests {
             name: "OrdersProjection".to_string(),
             file: PathBuf::new(),
             subscribes_to: vec!["OrderPlaced".to_string(), "OrderShipped".to_string()],
+            ..Default::default()
         }];
 
         let model = empty_model();
@@ -3118,6 +3201,120 @@ mod tests {
             entity_of("e2"),
             "ent-ledger",
             "PostingRecorded stays in the Ledger aggregate's swim lane",
+        );
+    }
+
+    /// Model with a query node fed by BOTH events via heal-authored
+    /// `eventFeedsQuery` edges (the over-approximated all-local shape) plus
+    /// one user-drawn edge, ready for the narrowing/removal pass.
+    fn model_with_over_approx_query_edges() -> Value {
+        serde_json::json!({
+            "id": "m1", "name": "demo", "chapters": [],
+            "entities": [{ "id": "ent1", "name": "Orders", "order": 0 }],
+            "slices": [
+                { "id": "sl1", "name": "PlaceOrder", "order": 0 },
+                { "id": "sl2", "name": "ShipOrder", "order": 1 },
+                { "id": "sl3", "name": "OrderSummary", "order": 2 }
+            ],
+            "nodes": [
+                { "id": "cmd1", "type": "command", "name": "PlaceOrder",   "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "cmd2", "type": "command", "name": "ShipOrder",    "sliceId": "sl2", "entityId": "ent1" },
+                { "id": "ev1",  "type": "event",   "name": "OrderPlaced",  "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "ev2",  "type": "event",   "name": "OrderShipped", "sliceId": "sl2", "entityId": "ent1" },
+                { "id": "qy1",  "type": "query",   "name": "OrderSummary", "sliceId": "sl3" }
+            ],
+            "edges": [
+                { "id": "edge-heal-1111111111111111", "type": "eventFeedsQuery", "sourceId": "ev1", "targetId": "qy1", "sourceHandle": "right", "targetHandle": "left" },
+                { "id": "edge-heal-2222222222222222", "type": "eventFeedsQuery", "sourceId": "ev2", "targetId": "qy1", "sourceHandle": "right", "targetHandle": "left" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    /// `fixture_inspection` but with `OrderSummary` narrowed to just OrderPlaced.
+    fn inspection_narrowed_to_order_placed() -> ProjectInspection {
+        let mut insp = fixture_inspection();
+        insp.domains[0].queries = vec![QueryInfo {
+            name: "OrderSummary".to_string(),
+            file: PathBuf::new(),
+            subscribes_to: vec!["OrderPlaced".to_string()],
+            ..Default::default()
+        }];
+        insp
+    }
+
+    #[test]
+    fn diff_removes_stale_heal_event_feeds_query_edges() {
+        let model = model_with_over_approx_query_edges();
+        let diff = compute_diff(&model, &inspection_narrowed_to_order_placed());
+        // OrderShipped→OrderSummary is no longer subscribed ⇒ queued for removal.
+        assert!(
+            diff.remove_edges.iter().any(|e| e.edge_type == "eventFeedsQuery"
+                && e.source_id == "ev2"
+                && e.target_id == "qy1"),
+            "stale heal edge must be queued for removal; got {:?}",
+            diff.remove_edges,
+        );
+        // OrderPlaced→OrderSummary is still subscribed ⇒ NOT removed.
+        assert!(
+            !diff.remove_edges.iter().any(|e| e.source_id == "ev1"),
+            "subscribed edge must NOT be removed",
+        );
+    }
+
+    #[test]
+    fn remove_edges_preserves_user_authored_edge() {
+        // Same narrowing, but the OrderShipped edge is USER-authored
+        // (id not `edge-heal-`). It is never queued for removal.
+        let mut model = model_with_over_approx_query_edges();
+        model["edges"].as_array_mut().unwrap()[1] = serde_json::json!({
+            "id": "edge-user-abc", "type": "eventFeedsQuery",
+            "sourceId": "ev2", "targetId": "qy1", "sourceHandle": "right", "targetHandle": "left"
+        });
+        let diff = compute_diff(&model, &inspection_narrowed_to_order_placed());
+        assert!(
+            !diff.remove_edges.iter().any(|e| e.source_id == "ev2"),
+            "user-authored edge must never be queued for removal; got {:?}",
+            diff.remove_edges,
+        );
+    }
+
+    #[test]
+    fn relayout_does_not_remove_edges() {
+        let model = model_with_over_approx_query_edges();
+        let diff = compute_diff_with_options(
+            &model,
+            &inspection_narrowed_to_order_placed(),
+            ComputeOptions::layout_only(),
+        );
+        assert!(
+            diff.remove_edges.is_empty(),
+            "layout-only relayout must never touch edges; got {:?}",
+            diff.remove_edges,
+        );
+    }
+
+    #[test]
+    fn heal_structural_is_fixed_point_after_narrowing_and_removal() {
+        // Isolate the structural phase (the edge narrowing + removal this
+        // change owns) from the orthogonal layout passes — full-pipeline
+        // fixed-point is already covered by `apply::pipeline_is_fixed_point`.
+        let mut model = model_with_over_approx_query_edges();
+        let insp = inspection_narrowed_to_order_placed();
+        let opts = ComputeOptions::structural_only();
+        let diff1 = compute_diff_with_options(&model, &insp, opts);
+        assert!(
+            diff1.remove_edges.len() == 1 && diff1.applied_count() > 0,
+            "first pass should remove the one stale edge; got summary: {}",
+            diff1.summary(),
+        );
+        crate::ide::heal::apply::apply_diff(&mut model, &diff1);
+        let diff2 = compute_diff_with_options(&model, &insp, opts);
+        assert_eq!(
+            diff2.applied_count(),
+            0,
+            "second structural pass must be a fixed point; got summary: {}",
+            diff2.summary(),
         );
     }
 }

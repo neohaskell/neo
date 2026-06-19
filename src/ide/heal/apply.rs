@@ -23,6 +23,7 @@ pub fn apply_diff(model: &mut Value, diff: &HealDiff) -> usize {
     applied += apply_position_fixes(model, diff);
     applied += apply_layout_entries(model, diff);
     applied += apply_add_edges(model, diff);
+    applied += apply_remove_edges(model, diff);
 
     applied
 }
@@ -315,6 +316,36 @@ fn apply_add_edges(model: &mut Value, diff: &HealDiff) -> usize {
     applied
 }
 
+/// Remove edges named in `diff.remove_edges`. Double-gated: an edge is dropped
+/// only when its `(type, source, target)` is requested AND its `id` starts
+/// with `edge-heal-` — so a user-authored edge (different id scheme) survives
+/// even if the diff asked for that triple. Mirrors `apply_remove_chapters`.
+fn apply_remove_edges(model: &mut Value, diff: &HealDiff) -> usize {
+    if diff.remove_edges.is_empty() {
+        return 0;
+    }
+    let Some(edges) = model.get_mut("edges").and_then(|v| v.as_array_mut()) else {
+        return 0;
+    };
+    let to_remove: std::collections::BTreeSet<(&str, &str, &str)> = diff
+        .remove_edges
+        .iter()
+        .map(|e| (e.edge_type.as_str(), e.source_id.as_str(), e.target_id.as_str()))
+        .collect();
+    let before = edges.len();
+    edges.retain(|e| {
+        let id = e.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if !id.starts_with("edge-heal-") {
+            return true; // user-authored: never removed
+        }
+        let t = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let s = e.get("sourceId").and_then(|v| v.as_str()).unwrap_or("");
+        let tg = e.get("targetId").and_then(|v| v.as_str()).unwrap_or("");
+        !to_remove.contains(&(t, s, tg))
+    });
+    before - edges.len()
+}
+
 fn ensure_array<'a>(model: &'a mut Value, key: &str) -> &'a mut Vec<Value> {
     let obj = model.as_object_mut().expect("model must be a JSON object");
     obj.entry(key.to_string()).or_insert_with(|| json!([]));
@@ -356,7 +387,7 @@ fn synth_edge_id(edge_type: &str, source_id: &str, target_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::ide::heal::diff::{
-        compute_diff, EdgeToAdd, EntityToAdd, HealDiff, KindFix, LayoutEntry, NodeToAdd,
+        compute_diff, EdgeRef, EdgeToAdd, EntityToAdd, HealDiff, KindFix, LayoutEntry, NodeToAdd,
         PositionFix, SliceToAdd,
     };
     use crate::inspect::{
@@ -416,6 +447,7 @@ mod tests {
                     name: "OrderSummary".to_string(),
                     file: PathBuf::new(),
                     subscribes_to: vec!["OrderPlaced".to_string()],
+                    ..Default::default()
                 }],
                 integrations: vec![IntegrationInfo {
                     name: "Notifier".to_string(),
@@ -473,6 +505,84 @@ mod tests {
         apply_diff(&mut model, &diff);
         let after = model["edges"].as_array().unwrap().len();
         assert_eq!(before, after, "applying same diff twice should be a no-op");
+    }
+
+    fn model_with_efq_edges() -> Value {
+        let mut model = minimal_model();
+        model["nodes"].as_array_mut().unwrap().push(json!({
+            "id": "qy1", "type": "query", "name": "OrderView", "sliceId": "sl1"
+        }));
+        model["edges"] = json!([
+            // heal-authored event→query edge
+            { "id": "edge-heal-deadbeef00000001", "type": "eventFeedsQuery", "sourceId": "ev1", "targetId": "qy1", "sourceHandle": "right", "targetHandle": "left" },
+            // user-authored event→query edge with the SAME (type,src,tgt)-ish but its own id scheme
+            { "id": "edge-user-0001", "type": "eventFeedsQuery", "sourceId": "ev1", "targetId": "qy1", "sourceHandle": "right", "targetHandle": "left" }
+        ]);
+        model
+    }
+
+    #[test]
+    fn apply_remove_edges_drops_matching_heal_edges() {
+        let mut model = model_with_efq_edges();
+        let diff = HealDiff {
+            remove_edges: vec![EdgeRef {
+                edge_type: "eventFeedsQuery".to_string(),
+                source_id: "ev1".to_string(),
+                target_id: "qy1".to_string(),
+                reason: String::new(),
+            }],
+            ..Default::default()
+        };
+        let removed = apply_diff(&mut model, &diff);
+        assert_eq!(removed, 1, "exactly the heal-authored edge removed");
+        let ids: Vec<&str> = model["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["edge-user-0001"], "user edge survives, heal edge gone");
+    }
+
+    #[test]
+    fn remove_edges_preserves_user_authored_edge() {
+        // Remove an edge that exists ONLY as a user-authored one ⇒ no-op.
+        let mut model = minimal_model();
+        model["nodes"].as_array_mut().unwrap().push(json!({
+            "id": "qy1", "type": "query", "name": "OrderView", "sliceId": "sl1"
+        }));
+        model["edges"] = json!([
+            { "id": "edge-user-xyz", "type": "eventFeedsQuery", "sourceId": "ev1", "targetId": "qy1" }
+        ]);
+        let diff = HealDiff {
+            remove_edges: vec![EdgeRef {
+                edge_type: "eventFeedsQuery".to_string(),
+                source_id: "ev1".to_string(),
+                target_id: "qy1".to_string(),
+                reason: String::new(),
+            }],
+            ..Default::default()
+        };
+        let removed = apply_diff(&mut model, &diff);
+        assert_eq!(removed, 0, "user-authored edge must never be removed");
+        assert_eq!(model["edges"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remove_edges_is_idempotent() {
+        let mut model = model_with_efq_edges();
+        let diff = HealDiff {
+            remove_edges: vec![EdgeRef {
+                edge_type: "eventFeedsQuery".to_string(),
+                source_id: "ev1".to_string(),
+                target_id: "qy1".to_string(),
+                reason: String::new(),
+            }],
+            ..Default::default()
+        };
+        apply_diff(&mut model, &diff);
+        let removed_again = apply_diff(&mut model, &diff);
+        assert_eq!(removed_again, 0, "second removal is a no-op");
     }
 
     #[test]
@@ -784,6 +894,7 @@ mod tests {
                 name: String::new(),
                 file: PathBuf::new(),
                 subscribes_to: vec![],
+                ..Default::default()
             },
         )
     }

@@ -77,13 +77,29 @@ pub struct CommandInfo {
     pub via_web_transport: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryInfo {
     pub name: String,
     pub file: PathBuf,
-    /// Event constructors referenced in the file body — best-guess subscriber list.
+    /// Final subscriber set: explicit event-constructor hits found in the file
+    /// body, else the field-overlap / value-level feeders computed in
+    /// `resolve_feeders`, else the all-local fallback. One `eventFeedsQuery`
+    /// edge is drawn per entry.
     pub subscribes_to: Vec<String>,
+    /// Entity fields the `combine` reads (`entity.<field>`). The read model's
+    /// true data dependency on the aggregate. Not serialised — internal to
+    /// inspection (no `neo inspect` consumer needs it).
+    #[serde(skip)]
+    pub reads_entity_fields: Vec<String>,
+    /// Scrutinee field when `combine` is `case entity.<field> of …`.
+    #[serde(skip)]
+    pub case_field: Option<String>,
+    /// Pattern values whose `combine` branch is a definitive `NoOp`
+    /// (`Some(empty)` = flat case parsed but no NoOp branch; `None` = no
+    /// parseable flat case ⇒ caller must not narrow a hub dependency).
+    #[serde(skip)]
+    pub noop_values: Option<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,22 +226,40 @@ fn inspect_domain(
     let mut queries = parse::queries_in_domain(&dir, global_event_names);
     let mut integrations = parse::integrations_in_domain(&dir, global_event_names);
 
-    // Infer subscriptions for orphan queries. A query lives in
-    // `<Domain>/Queries/`, so the entity whose read-model projection it
-    // builds is THIS domain's entity (e.g. `EvaluatedProposal` reads
-    // `ProposalEntity`). Such queries name no event constructor in source
-    // — they read entity-projection fields — so the token scan above comes
-    // back empty and the query renders as an orphan (no incoming edge). An
-    // entity's projection is updated by ALL of that entity's events, so
-    // when the scan found nothing we default the subscriber set to the
-    // domain's own local event constructors. A query that DID name a
-    // specific cross-domain (or local) event keeps exactly that scan
-    // result — we only fill the gap, never overwrite a real hit.
+    // Infer subscriptions for queries that name no event constructor in
+    // source. A NeoHaskell read model reads ENTITY FIELDS in its `combine`
+    // (never event constructors), so the token scan above comes back empty.
+    // Rather than the old "subscribe to ALL local events" over-approximation
+    // (which wired every event of an aggregate to every query — a spaghetti
+    // hairball), we derive the true feeders by FIELD-LEVEL data flow: an
+    // event feeds a query iff it writes an entity field the query reads, with
+    // a value-level refinement for the lifecycle/status "hub" field. See
+    // `resolve_feeders`. A query that DID name a specific event keeps that
+    // scan result — we only fill the gap, never overwrite a real hit.
     if !local_event_names.is_empty() {
+        let write_analysis = parse::event_write_sets_in_domain(&dir, &local_event_names);
+        let local_set: std::collections::BTreeSet<&str> =
+            local_event_names.iter().map(String::as_str).collect();
         for q in &mut queries {
-            if q.subscribes_to.is_empty() {
-                q.subscribes_to = local_event_names.clone();
+            // A query's raw token scan can catch event names mentioned in
+            // COMMENTS, not just real subscriptions — so we do not trust it for
+            // LOCAL events. Local feeders come from field-level data flow
+            // (`resolve_feeders`). Cross-domain event names, however, are
+            // genuine explicit subscriptions the local-only overlap can't see,
+            // so we preserve those and union them in.
+            let cross_domain: Vec<String> = q
+                .subscribes_to
+                .iter()
+                .filter(|e| !local_set.contains(e.as_str()))
+                .cloned()
+                .collect();
+            let mut feeders = resolve_feeders(q, &local_event_names, &write_analysis);
+            for c in cross_domain {
+                if !feeders.contains(&c) {
+                    feeders.push(c);
+                }
             }
+            q.subscribes_to = feeders;
         }
     }
 
@@ -241,6 +275,114 @@ fn inspect_domain(
         queries,
         integrations,
     }
+}
+
+/// Fraction of an aggregate's events that must write a field for it to count
+/// as a "hub" (e.g. a `lifecycle`/`status` field bumped on nearly every
+/// event). Hub fields don't discriminate between events under plain field
+/// overlap, so they get the value-level treatment instead.
+const HUB_FIELD_FRACTION: f64 = 0.6;
+
+/// Derive the precise event feeders for a read-model query from field-level
+/// data flow, falling back to the all-local over-approximation whenever the
+/// source can't be parsed with confidence. Pure function of the parsed
+/// inputs — deterministic and order-stable (filters source-ordered
+/// `local_event_names`).
+///
+/// Rules, in order:
+///   * No parseable fold OR no entity-field reads ⇒ all-local (no evidence).
+///   * `nonhub` feeders = events writing a NON-hub field the query reads.
+///   * If the query reads a hub field: it must be the field the `combine`
+///     cases on AND that case must be flat (a parseable NoOp set); then a
+///     hub-writing event feeds unless its set value is a definitive `NoOp`.
+///     Otherwise we cannot prove which hub-writers matter ⇒ all-local (never
+///     under-connect a status view).
+///   * Empty result ⇒ all-local (never orphan a query).
+fn resolve_feeders(
+    q: &QueryInfo,
+    local_event_names: &[String],
+    analysis: &parse::EntityWriteAnalysis,
+) -> Vec<String> {
+    use std::collections::BTreeSet;
+    let all_local = || local_event_names.to_vec();
+
+    if !analysis.fold_found || q.reads_entity_fields.is_empty() {
+        return all_local();
+    }
+    let reads: BTreeSet<&str> = q.reads_entity_fields.iter().map(String::as_str).collect();
+
+    // Hub fields: written by ≥ HUB_FIELD_FRACTION of the aggregate's events.
+    let event_count = local_event_names.len().max(1);
+    let mut write_count: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for fields in analysis.writes.values() {
+        for f in fields {
+            *write_count.entry(f.as_str()).or_insert(0) += 1;
+        }
+    }
+    let threshold = (HUB_FIELD_FRACTION * event_count as f64).ceil() as usize;
+    let hubs: BTreeSet<&str> = write_count
+        .iter()
+        .filter_map(|(f, c)| if *c >= threshold { Some(*f) } else { None })
+        .collect();
+
+    let reads_hub: BTreeSet<&str> = reads.intersection(&hubs).copied().collect();
+
+    // Non-hub field witnesses: an event genuinely providing a field the query
+    // reads, excluding hub fields.
+    let mut feeders: BTreeSet<&str> = BTreeSet::new();
+    for name in local_event_names {
+        if let Some(written) = analysis.writes.get(name) {
+            let provides_nonhub = written
+                .iter()
+                .any(|f| reads.contains(f.as_str()) && !hubs.contains(f.as_str()));
+            if provides_nonhub {
+                feeders.insert(name.as_str());
+            }
+        }
+    }
+
+    if !reads_hub.is_empty() {
+        // The query depends on a hub field. We can only narrow it when the
+        // combine cases on exactly that hub field with a parseable flat NoOp
+        // set; otherwise fall back rather than risk under-connecting.
+        let narrowable = match (&q.case_field, &q.noop_values) {
+            (Some(cf), Some(noop)) => {
+                reads_hub.len() == 1 && reads_hub.contains(cf.as_str()) && {
+                    let cf = cf.as_str();
+                    for name in local_event_names {
+                        let writes_hub = analysis
+                            .writes
+                            .get(name)
+                            .is_some_and(|w| w.contains(cf));
+                        if !writes_hub {
+                            continue;
+                        }
+                        // Feeds unless its set value is a definitive NoOp.
+                        let value = analysis.enum_values.get(name).and_then(|m| m.get(cf));
+                        let is_noop = value.is_some_and(|v| noop.contains(v));
+                        if !is_noop {
+                            feeders.insert(name.as_str());
+                        }
+                    }
+                    true
+                }
+            }
+            _ => false,
+        };
+        if !narrowable {
+            return all_local();
+        }
+    }
+
+    if feeders.is_empty() {
+        return all_local();
+    }
+    // Preserve source order of `local_event_names`.
+    local_event_names
+        .iter()
+        .filter(|n| feeders.contains(n.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -407,15 +549,17 @@ mod tests {
     }
 
     #[test]
-    fn inspect_keeps_specific_event_subscription_over_local_default() {
-        // A query that DOES name a specific event keeps only that one —
-        // the local-event default must NOT clobber a real token-scan hit.
+    fn inspect_local_comment_mention_does_not_pin_subscription() {
+        // A LOCAL event name appearing only in a comment must NOT pin the
+        // subscription — query files describe their projection in prose that
+        // references events, and that is not a real data dependency. With no
+        // parseable entity fold here, the query falls back to all-local (the
+        // safe over-approximation), NOT to just the comment-mentioned event.
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
         write(
             dir.path(),
             "src/App/Cart/Queries/AddedItems.hs",
-            // Names exactly one of the two events.
             "module App.Cart.Queries.AddedItems where\n-- driven by ItemAdded\nview = ItemAdded\n",
         );
         let out = inspect_project(dir.path());
@@ -427,10 +571,150 @@ mod tests {
             .expect("AddedItems query should be parsed");
         assert_eq!(
             q.subscribes_to,
-            vec!["ItemAdded".to_string()],
-            "a query that names a specific event must keep only that one; got {:?}",
+            vec!["CartCreated".to_string(), "ItemAdded".to_string()],
+            "a local comment mention must not pin the subscription; got {:?}",
             q.subscribes_to,
         );
+    }
+
+    /// A Cart aggregate with an `update` fold: `CartCreated` writes
+    /// `ownerId` + `itemCount`; `ItemAdded` writes only `itemCount`. Lets the
+    /// field-overlap path narrow precisely.
+    const ENTITY_HS_WITH_FOLD: &str = r#"
+module App.Cart.Entity where
+data CartEntity = CartEntity { ownerId :: Text, itemCount :: Int }
+update :: CartEvent -> CartEntity -> CartEntity
+update event entity =
+  case event of
+    CartCreated e ->
+      CartEntity
+        { ownerId = e.ownerId
+        , itemCount = 0
+        }
+    ItemAdded e ->
+      entity
+        { itemCount = entity.itemCount + e.quantity
+        }
+"#;
+
+    #[test]
+    fn inspect_field_overlap_narrows_to_writing_events() {
+        // OwnerView reads only `entity.ownerId`, which only `CartCreated`
+        // writes — so field-overlap narrows it to that single event instead
+        // of the all-local pair. `ItemAdded` (writes only `itemCount`) drops.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        write(dir.path(), "src/App/Cart/Entity.hs", ENTITY_HS_WITH_FOLD);
+        write(
+            dir.path(),
+            "src/App/Cart/Queries/OwnerView.hs",
+            "module App.Cart.Queries.OwnerView where\n  combine entity _ = Update OwnerView { owner = entity.ownerId }\n",
+        );
+        let out = inspect_project(dir.path());
+        let q = out.domains[0]
+            .queries
+            .iter()
+            .find(|q| q.name == "OwnerView")
+            .expect("OwnerView parsed");
+        assert_eq!(
+            q.subscribes_to,
+            vec!["CartCreated".to_string()],
+            "field-overlap must wire only the event writing a read field; got {:?}",
+            q.subscribes_to,
+        );
+    }
+
+    #[test]
+    fn inspect_falls_back_to_all_local_when_no_entity_fold() {
+        // A read model whose domain has no parseable `update`/`evolve` fold
+        // cannot be narrowed (no positive evidence) — keep all-local.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        write(
+            dir.path(),
+            "src/App/Cart/Queries/ItemView.hs",
+            "module App.Cart.Queries.ItemView where\n  combine entity _ = Update ItemView { n = entity.itemCount }\n",
+        );
+        let out = inspect_project(dir.path());
+        let q = out.domains[0]
+            .queries
+            .iter()
+            .find(|q| q.name == "ItemView")
+            .expect("ItemView parsed");
+        assert_eq!(
+            q.subscribes_to,
+            vec!["CartCreated".to_string(), "ItemAdded".to_string()],
+            "no entity fold ⇒ all-local fallback; got {:?}",
+            q.subscribes_to,
+        );
+    }
+
+    #[test]
+    fn inspect_value_level_drops_noop_states() {
+        // A status read model that `Update`s only on `Open` and `NoOp`s on
+        // `Closed` is fed only by the event that opens it — even though the
+        // `status` hub field is written by every event.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/App/Ticket/Core.hs",
+            "module App.Ticket.Core where\ndata TicketEvent = Opened {} | Closed {} deriving (Generic)\n",
+        );
+        write(
+            dir.path(),
+            "src/App/Ticket/Entity.hs",
+            "module App.Ticket.Entity where\nupdate :: TicketEvent -> TicketEntity -> TicketEntity\nupdate event entity =\n  case event of\n    Opened e -> entity { status = Open }\n    Closed e -> entity { status = Closed }\n",
+        );
+        write(
+            dir.path(),
+            "src/App/Ticket/Queries/OpenTickets.hs",
+            "module App.Ticket.Queries.OpenTickets where\n  combine entity _ =\n    case entity.status of\n      Open -> Update OpenTickets { id = entity.ticketId }\n      Closed -> NoOp\n",
+        );
+        let out = inspect_project(dir.path());
+        let q = out
+            .domains
+            .iter()
+            .find(|d| d.name == "Ticket")
+            .and_then(|d| d.queries.iter().find(|q| q.name == "OpenTickets"))
+            .expect("OpenTickets parsed");
+        assert_eq!(
+            q.subscribes_to,
+            vec!["Opened".to_string()],
+            "value-level must drop the NoOp (Closed) state's event; got {:?}",
+            q.subscribes_to,
+        );
+    }
+
+    #[test]
+    fn inspect_value_level_is_deterministic_under_event_reorder() {
+        // Same project, events declared in a different order ⇒ identical feeders.
+        let build = |evt_decl: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                dir.path(),
+                "src/App/Ticket/Core.hs",
+                &format!("module App.Ticket.Core where\ndata TicketEvent = {evt_decl} deriving (Generic)\n"),
+            );
+            write(
+                dir.path(),
+                "src/App/Ticket/Entity.hs",
+                "module App.Ticket.Entity where\nupdate :: TicketEvent -> TicketEntity -> TicketEntity\nupdate event entity =\n  case event of\n    Opened e -> entity { status = Open }\n    Closed e -> entity { status = Closed }\n",
+            );
+            write(
+                dir.path(),
+                "src/App/Ticket/Queries/OpenTickets.hs",
+                "module App.Ticket.Queries.OpenTickets where\n  combine entity _ =\n    case entity.status of\n      Open -> Update OpenTickets { id = entity.ticketId }\n      Closed -> NoOp\n",
+            );
+            let out = inspect_project(dir.path());
+            out.domains
+                .iter()
+                .find(|d| d.name == "Ticket")
+                .and_then(|d| d.queries.iter().find(|q| q.name == "OpenTickets"))
+                .unwrap()
+                .subscribes_to
+                .clone()
+        };
+        assert_eq!(build("Opened {} | Closed {}"), build("Closed {} | Opened {}"));
     }
 
     #[test]

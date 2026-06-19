@@ -14,7 +14,7 @@
 //! cross-reference table" — not a verifier. The agent can still spot-
 //! check anything that looks off.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -248,56 +248,15 @@ fn extract_dispatcher_arms(
     known_events: &[String],
     import_map: &std::collections::BTreeMap<String, String>,
 ) -> std::collections::BTreeMap<String, Vec<String>> {
-    let candidate_set: std::collections::BTreeSet<&str> =
-        known_events.iter().map(String::as_str).collect();
-    let lines: Vec<&str> = body.lines().collect();
-
-    let is_arm_start = |line: &str| -> bool {
-        let trimmed = line.trim_start();
-        let first = match trimmed.chars().next() {
-            Some(c) => c,
-            None => return false,
-        };
-        if first == '_' {
-            let next = trimmed.as_bytes().get(1).copied();
-            return matches!(next, None | Some(b' ') | Some(b'\t'));
-        }
-        if !first.is_ascii_uppercase() {
-            return false;
-        }
-        let end = trimmed
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(trimmed.len());
-        candidate_set.contains(&trimmed[..end])
-    };
-
+    let candidate_set: BTreeSet<&str> = known_events.iter().map(String::as_str).collect();
     let mut result: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    for i in 0..lines.len() {
-        let trimmed = lines[i].trim_start();
-        let first_word_end = trimmed
-            .find(|c: char| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(trimmed.len());
-        let first_word = &trimmed[..first_word_end];
-        if !candidate_set.contains(first_word) {
-            continue;
-        }
-
-        // Gather this arm's body: from this line to (exclusive) the next arm-start.
-        let mut arm = String::from(lines[i]);
-        for j in (i + 1)..lines.len() {
-            if is_arm_start(lines[j]) {
-                break;
-            }
-            arm.push('\n');
-            arm.push_str(lines[j]);
-        }
-
+    for (ctor, arm) in split_case_arms(body, &candidate_set) {
         for (fn_name, intg_name) in import_map {
             if contains_word(&arm, fn_name) {
                 let bucket = result.entry(intg_name.clone()).or_default();
-                if !bucket.contains(&first_word.to_string()) {
-                    bucket.push(first_word.to_string());
+                if !bucket.contains(&ctor) {
+                    bucket.push(ctor.clone());
                 }
             }
         }
@@ -345,11 +304,205 @@ fn parse_query_file(path: &Path, known_events: &[String]) -> Option<QueryInfo> {
     let body = std::fs::read_to_string(path).ok()?;
     let name = path.file_stem()?.to_str()?.to_string();
     let subscribes_to = filter_present(&body, known_events);
+    // A NeoHaskell read model is a `QueryOf <Entity> <ReadModel>` whose
+    // `combine` reads ENTITY fields (`entity.<field>`) — never event
+    // constructors. We extract the real data dependency from the combine so
+    // the wiring layer can compute precise event→query edges instead of the
+    // all-local over-approximation. See `event_write_sets_in_domain` for the
+    // matching writes side.
+    let combine = extract_method_body(&body, "combine").unwrap_or_default();
+    let reads_entity_fields = extract_entity_field_reads(&combine);
+    let (case_field, noop_values) = extract_combine_noop_values(&combine);
     Some(QueryInfo {
         name,
         file: path.to_path_buf(),
         subscribes_to,
+        reads_entity_fields,
+        case_field,
+        noop_values,
     })
+}
+
+/// Every `entity.<field>` accessor read inside a `combine` body, in source
+/// order, deduped. This is the read model's true data dependency on the
+/// aggregate's projection. Read-model fields that happen to share a name are
+/// not captured — only the `entity.`-qualified accessors.
+fn extract_entity_field_reads(combine: &str) -> Vec<String> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\bentity\.([a-z]\w*)").unwrap());
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for cap in re.captures_iter(combine) {
+        if let Some(m) = cap.get(1) {
+            let f = m.as_str().to_string();
+            if seen.insert(f.clone()) {
+                out.push(f);
+            }
+        }
+    }
+    out
+}
+
+/// For a read model whose `combine` is a single flat
+/// `case entity.<field> of <Ctor> -> Update|NoOp|Delete`, return the
+/// scrutinee field and the set of pattern values (last `.`-segment) whose
+/// branch is a definitive `NoOp`. We capture the NoOp set (not the Update
+/// set) on purpose: a parse MISS then leaves an event CONNECTED (over-
+/// approximation), never silently drops a real edge — the information-
+/// completeness guardrail. Returns `(None, None)` when the combine has no
+/// `case entity.<field> of`, and `(Some(field), None)` when the combine has
+/// more than one `case` (nested / not flat) so the caller falls back rather
+/// than trusting an incomplete NoOp set.
+fn extract_combine_noop_values(combine: &str) -> (Option<String>, Option<BTreeSet<String>>) {
+    static CASE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let case_re =
+        CASE_RE.get_or_init(|| Regex::new(r"case\s+entity\.([a-z]\w*)\s+of").unwrap());
+    let mut cases = case_re.captures_iter(combine);
+    let Some(first) = cases.next() else {
+        return (None, None);
+    };
+    let field = first.get(1).unwrap().as_str().to_string();
+    // More than one `case entity.<field> of` ⇒ nested / not a flat enum
+    // dispatch ⇒ we cannot safely enumerate NoOp values. Surface the field
+    // (so the caller knows the query cases on it) but no NoOp set ⇒ fallback.
+    if cases.next().is_some() {
+        return (Some(field), None);
+    }
+    // Branches: `  <Pattern> ->` then `Update|NoOp|Delete` on the same or the
+    // next non-empty line. Collect the pattern value (last segment) of every
+    // branch whose result is `NoOp`.
+    static BRANCH_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let branch_re = BRANCH_RE.get_or_init(|| {
+        Regex::new(r"(?m)^[ \t]+([A-Za-z_][\w.]*)[^\n]*->[ \t]*(?:\n[ \t]*)?(Update|NoOp|Delete)\b")
+            .unwrap()
+    });
+    let mut noop = BTreeSet::new();
+    for cap in branch_re.captures_iter(combine) {
+        let pat = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        let result = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        if result == "NoOp" {
+            if let Some(seg) = pat.rsplit('.').next() {
+                noop.insert(seg.to_string());
+            }
+        }
+    }
+    (Some(field), Some(noop))
+}
+
+/// Per-event written-field sets parsed from an aggregate's
+/// `update`/`evolve` fold, plus the bare-enum value each event sets a field
+/// to (for value-level hub narrowing). `fold_found = false` signals the
+/// caller to fall back to the all-local default (no positive evidence).
+#[derive(Debug, Clone, Default)]
+pub struct EntityWriteAnalysis {
+    /// event constructor → entity fields it GENUINELY writes (rhs ≠ `entity.<field>`).
+    pub writes: BTreeMap<String, BTreeSet<String>>,
+    /// event constructor → (field → bare-enum value it is set to, last `.`-segment).
+    pub enum_values: BTreeMap<String, BTreeMap<String, String>>,
+    /// `true` once an `update`/`evolve` fold was located and split into arms.
+    pub fold_found: bool,
+}
+
+/// Parse `<dir>/Entity.hs` (or `<dir>/Core.hs`) for the aggregate's
+/// `update :: Event -> Entity -> Entity` (or `evolve`) fold, returning which
+/// entity fields each event constructor writes. A field is GENUINELY written
+/// only when its record-update RHS is not the identity copy `entity.<field>`
+/// — full-record-copy aggregates (e.g. `ProposalEntity`) restate every field
+/// every arm, so the copy-through filter is what makes the writes set precise.
+pub fn event_write_sets_in_domain(dir: &Path, known_events: &[String]) -> EntityWriteAnalysis {
+    let mut src = String::new();
+    for fname in ["Entity.hs", "Core.hs"] {
+        let path = dir.join(fname);
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Prefer the file that actually defines the fold; fall back to the
+        // first readable candidate (older projects inline it in Core.hs).
+        if body.contains("update ") || body.contains("update::") || body.contains("evolve ") {
+            src = body;
+            break;
+        }
+        if src.is_empty() {
+            src = body;
+        }
+    }
+    let fold = extract_function_body(&src, "update")
+        .or_else(|| extract_function_body(&src, "evolve"));
+    let Some(fold) = fold else {
+        return EntityWriteAnalysis::default();
+    };
+    // Isolate the `case … of` arms (the body after the first `of`). If the
+    // fold has no case-of (single-event aggregate), scan the whole body.
+    let case_body = match fold.find(" of\n") {
+        Some(idx) => &fold[idx + 4..],
+        None => fold.as_str(),
+    };
+    let candidate_set: BTreeSet<&str> = known_events.iter().map(String::as_str).collect();
+    let mut writes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut enum_values: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    for (ctor, arm) in split_case_arms(case_body, &candidate_set) {
+        let (fields, values) = extract_record_writes(&arm);
+        if !fields.is_empty() {
+            writes.entry(ctor.clone()).or_default().extend(fields);
+        }
+        if !values.is_empty() {
+            enum_values.entry(ctor).or_default().extend(values);
+        }
+    }
+    EntityWriteAnalysis {
+        writes,
+        enum_values,
+        fold_found: true,
+    }
+}
+
+/// From one `case` arm of an aggregate fold, the entity fields it writes and
+/// the bare-enum value (last `.`-segment) of any field set to a single
+/// constructor token. A `field = rhs` pair is a write iff `rhs` is not the
+/// identity copy `entity.<field>`. Inner records (e.g. a `MetricScore {…}`
+/// built in a `let`) over-capture harmlessly — over-approximation is the
+/// safe direction; the wiring layer only ever DROPS an edge with positive
+/// evidence on both sides.
+fn extract_record_writes(arm: &str) -> (BTreeSet<String>, BTreeMap<String, String>) {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    // `field = rhs` in record syntax: the field ident is preceded by `{` or
+    // `,` (possibly across newlines); rhs runs to the next newline/`,`/`}`.
+    let re = RE.get_or_init(|| Regex::new(r"[{,]\s*([a-z]\w*)\s*=\s*([^\n,}]+)").unwrap());
+    let mut fields = BTreeSet::new();
+    let mut values = BTreeMap::new();
+    for cap in re.captures_iter(arm) {
+        let field = cap.get(1).unwrap().as_str();
+        let rhs = cap.get(2).unwrap().as_str().trim();
+        if rhs == format!("entity.{field}") {
+            continue; // copy-through, not a genuine write
+        }
+        fields.insert(field.to_string());
+        if let Some(value) = single_ctor_token(rhs) {
+            values.insert(field.to_string(), value);
+        }
+    }
+    (fields, values)
+}
+
+/// If `rhs` is a single constructor token (optionally module-qualified, e.g.
+/// `Lifecycle.Approved`), return its last `.`-segment (`Approved`). Returns
+/// `None` for applications (`Just e.x`), literals with whitespace, etc.
+fn single_ctor_token(rhs: &str) -> Option<String> {
+    let t = rhs.trim();
+    if t.is_empty() || t.contains(char::is_whitespace) {
+        return None;
+    }
+    let last = t.rsplit('.').next().unwrap_or(t);
+    let mut chars = last.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    if last.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(last.to_string())
+    } else {
+        None
+    }
 }
 
 fn parse_integration_file(path: &Path, known_events: &[String]) -> Option<IntegrationInfo> {
@@ -387,15 +540,15 @@ fn parse_integration_file(path: &Path, known_events: &[String]) -> Option<Integr
     })
 }
 
-/// Walk a `case <evt> of …` body and return only the event constructors
-/// whose arm body actually does something — i.e. whose RHS has any
-/// `Integration.<word>` other than `Integration.none`, or any
-/// `Command.Emit`. Wildcard arms (`_ -> …`) and arms whose only RHS is
-/// `Integration.none` MUST NOT count as "handled".
-fn active_handles_in_case_body(body: &str, candidates: &[String]) -> Vec<String> {
-    let candidate_set: std::collections::BTreeSet<&str> =
-        candidates.iter().map(String::as_str).collect();
-
+/// Split a `case <scrutinee> of …` body into `(head_ctor, arm_text)` pairs,
+/// one per arm whose head token is in `candidates`, in source order. Arms
+/// are delimited the way Haskell layout does: an arm runs from its head
+/// line to (exclusive) the next arm-start line. An arm-start is a line
+/// whose first non-space token is a candidate constructor OR a `_`
+/// wildcard (wildcards bound an arm but are not themselves emitted). This
+/// is the shared primitive behind `active_handles_in_case_body`,
+/// `extract_dispatcher_arms`, and the entity write-set parser.
+fn split_case_arms(body: &str, candidates: &BTreeSet<&str>) -> Vec<(String, String)> {
     let is_arm_start = |line: &str| -> bool {
         let trimmed = line.trim_start();
         let first = match trimmed.chars().next() {
@@ -412,18 +565,18 @@ fn active_handles_in_case_body(body: &str, candidates: &[String]) -> Vec<String>
         let end = trimmed
             .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(trimmed.len());
-        candidate_set.contains(&trimmed[..end])
+        candidates.contains(&trimmed[..end])
     };
 
     let lines: Vec<&str> = body.lines().collect();
-    let mut active = std::collections::BTreeSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     for i in 0..lines.len() {
         let trimmed = lines[i].trim_start();
         let first_word_end = trimmed
             .find(|c: char| !c.is_alphanumeric() && c != '_')
             .unwrap_or(trimmed.len());
         let first_word = &trimmed[..first_word_end];
-        if !candidate_set.contains(first_word) {
+        if !candidates.contains(first_word) {
             continue;
         }
         let mut arm = String::from(lines[i]);
@@ -434,8 +587,22 @@ fn active_handles_in_case_body(body: &str, candidates: &[String]) -> Vec<String>
             arm.push('\n');
             arm.push_str(lines[j]);
         }
+        out.push((first_word.to_string(), arm));
+    }
+    out
+}
+
+/// Walk a `case <evt> of …` body and return only the event constructors
+/// whose arm body actually does something — i.e. whose RHS has any
+/// `Integration.<word>` other than `Integration.none`, or any
+/// `Command.Emit`. Wildcard arms (`_ -> …`) and arms whose only RHS is
+/// `Integration.none` MUST NOT count as "handled".
+fn active_handles_in_case_body(body: &str, candidates: &[String]) -> Vec<String> {
+    let candidate_set: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+    let mut active = BTreeSet::new();
+    for (ctor, arm) in split_case_arms(body, &candidate_set) {
         if arm_is_active(&arm) {
-            active.insert(first_word.to_string());
+            active.insert(ctor);
         }
     }
     candidates
@@ -586,6 +753,56 @@ fn extract_function_body(src: &str, name: &str) -> Option<String> {
     }
 
     found_at.map(|start| src[start..end_at].to_string())
+}
+
+/// Slurp the body of a Haskell binding that may be indented — e.g. a
+/// `combine` / `queryId` method inside an `instance QueryOf … where` block.
+/// Finds the first line whose first non-space token is `<name>` (followed by
+/// a space, `(`, `:`, or `=`) at indent `N`, and returns it plus every
+/// following line until the next non-empty line at indent ≤ `N` that is not a
+/// continuation clause of the same binding. Generalises `extract_function_body`
+/// (which only sees column-0 definitions) to instance methods.
+fn extract_method_body(src: &str, name: &str) -> Option<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut start = None;
+    let mut header_indent = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix(name) {
+            if rest
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace() || c == '(' || c == ':' || c == '=')
+                .unwrap_or(false)
+            {
+                start = Some(i);
+                header_indent = line.len() - trimmed.len();
+                break;
+            }
+        }
+    }
+    let start = start?;
+    let mut end = lines.len();
+    for (j, line) in lines.iter().enumerate().skip(start + 1) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent <= header_indent {
+            // A continuation clause of the SAME binding (multi-clause method)
+            // does not end the body; the next sibling binding / `where` exit does.
+            let tw = line.trim_start();
+            let fw_end = tw
+                .find(|c: char| !c.is_alphanumeric() && c != '_')
+                .unwrap_or(tw.len());
+            if &tw[..fw_end] == name {
+                continue;
+            }
+            end = j;
+            break;
+        }
+    }
+    Some(lines[start..end].join("\n"))
 }
 
 /// Return the elements of `candidates` (in their original order) that
@@ -828,6 +1045,141 @@ data CartEvent
             vec!["ProposalPdfTranscribed".to_string(), "EvaluationTriggered".to_string()],
             "payload stem PdfTranscribed must be suppressed; EvaluationTriggered (ctor==module) kept once",
         );
+    }
+
+    #[test]
+    fn write_set_partial_update_lists_only_named_fields() {
+        let arm = "    PaymentApproved e ->\n      entity { lifecycle = Approved, approvedAt = Just e.at }";
+        let (fields, _values) = extract_record_writes(arm);
+        let got: Vec<&str> = fields.iter().map(String::as_str).collect();
+        assert_eq!(got, vec!["approvedAt", "lifecycle"]);
+    }
+
+    #[test]
+    fn write_set_full_record_excludes_copy_through() {
+        // `proposalId = entity.proposalId` is a copy-through (unchanged) and
+        // must NOT count as written; `summary = Just e.s` is a genuine write.
+        let arm = "  ProposalSummarized e ->\n    ProposalEntity\n      { proposalId = entity.proposalId\n      , summary = Just e.s\n      }";
+        let (fields, _values) = extract_record_writes(arm);
+        assert!(fields.contains("summary"), "got {fields:?}");
+        assert!(!fields.contains("proposalId"), "copy-through must drop: {fields:?}");
+    }
+
+    #[test]
+    fn write_set_records_hub_value_for_enum_field() {
+        let arm = "    PaymentApproved e -> entity { lifecycle = Approved }";
+        let (_fields, values) = extract_record_writes(arm);
+        assert_eq!(values.get("lifecycle").map(String::as_str), Some("Approved"));
+    }
+
+    #[test]
+    fn write_set_qualified_enum_value_strips_module() {
+        let arm = "    Requested e -> entity { lifecycle = Lifecycle.Requested }";
+        let (_fields, values) = extract_record_writes(arm);
+        assert_eq!(values.get("lifecycle").map(String::as_str), Some("Requested"));
+    }
+
+    #[test]
+    fn single_ctor_token_rejects_applications() {
+        assert_eq!(single_ctor_token("Approved").as_deref(), Some("Approved"));
+        assert_eq!(single_ctor_token("Lifecycle.Approved").as_deref(), Some("Approved"));
+        assert_eq!(single_ctor_token("Just e.x"), None);
+        assert_eq!(single_ctor_token("e.field"), None);
+    }
+
+    #[test]
+    fn event_write_sets_parses_update_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Entity.hs"),
+            "module X.Entity where\nupdate :: E -> Ent -> Ent\nupdate event entity =\n  case event of\n    Created e -> Ent { name = e.name, status = Open }\n    Closed e -> entity { status = Closed }\n",
+        )
+        .unwrap();
+        let a = event_write_sets_in_domain(root, &["Created".to_string(), "Closed".to_string()]);
+        assert!(a.fold_found);
+        assert!(a.writes["Created"].contains("name"));
+        assert!(a.writes["Created"].contains("status"));
+        assert_eq!(a.writes["Closed"].iter().map(String::as_str).collect::<Vec<_>>(), vec!["status"]);
+        assert_eq!(a.enum_values["Closed"].get("status").map(String::as_str), Some("Closed"));
+    }
+
+    #[test]
+    fn event_write_sets_handles_evolve_named_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Entity.hs"),
+            "module X.Entity where\nevolve :: E -> Ent -> Ent\nevolve event entity =\n  case event of\n    Tick e -> entity { count = e.n }\n",
+        )
+        .unwrap();
+        let a = event_write_sets_in_domain(root, &["Tick".to_string()]);
+        assert!(a.fold_found);
+        assert!(a.writes["Tick"].contains("count"));
+    }
+
+    #[test]
+    fn event_write_sets_absent_fold_is_low_confidence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Core.hs"), "module X.Core where\nfoo = 1\n").unwrap();
+        let a = event_write_sets_in_domain(dir.path(), &["Created".to_string()]);
+        assert!(!a.fold_found);
+        assert!(a.writes.is_empty());
+    }
+
+    #[test]
+    fn extract_method_body_slurps_indented_combine() {
+        let src = "instance QueryOf Ent View where\n  queryId e = e.id\n  combine entity _ =\n    case entity.status of\n      Open -> Update View {}\n      Closed -> NoOp\n\nderiveQuery ''View [''Ent]\n";
+        let body = extract_method_body(src, "combine").expect("combine body");
+        assert!(body.contains("case entity.status"));
+        assert!(body.contains("NoOp"));
+        assert!(!body.contains("queryId"), "must stop before sibling method: {body}");
+        assert!(!body.contains("deriveQuery"));
+    }
+
+    #[test]
+    fn extract_entity_field_reads_collects_accessors() {
+        let combine = "combine entity _ = Update V { a = entity.lifecycle, b = entity.amount, c = entity.lifecycle }";
+        assert_eq!(
+            extract_entity_field_reads(combine),
+            vec!["lifecycle".to_string(), "amount".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_combine_noop_values_flat_case() {
+        let combine = "combine entity _ =\n  case entity.lifecycle of\n    Lifecycle.Open -> Update V {}\n    Lifecycle.Closed -> NoOp\n    Lifecycle.Archived -> NoOp\n";
+        let (field, noop) = extract_combine_noop_values(combine);
+        assert_eq!(field.as_deref(), Some("lifecycle"));
+        let noop = noop.expect("flat case ⇒ Some");
+        assert!(noop.contains("Closed") && noop.contains("Archived"));
+        assert!(!noop.contains("Open"), "Open is an Update branch: {noop:?}");
+    }
+
+    #[test]
+    fn extract_combine_noop_values_inline_branches() {
+        // Inline `Pat -> Update (...)` / `Pat -> NoOp` on one line.
+        let combine = "combine entity _ =\n  case entity.lifecycle of\n    Lifecycle.Approved -> Update (mkRow entity)\n    Lifecycle.Pending -> NoOp\n";
+        let (_field, noop) = extract_combine_noop_values(combine);
+        let noop = noop.unwrap();
+        assert!(noop.contains("Pending"));
+        assert!(!noop.contains("Approved"));
+    }
+
+    #[test]
+    fn extract_combine_noop_values_nested_case_returns_none() {
+        // More than one `case entity.<f> of` ⇒ not flat ⇒ no NoOp set ⇒ caller falls back.
+        let combine = "combine entity _ =\n  case entity.fileRef of\n    Nothing -> NoOp\n    Just _ -> case entity.status of\n      Done -> Update V {}\n      _ -> NoOp\n";
+        let (_field, noop) = extract_combine_noop_values(combine);
+        assert!(noop.is_none(), "nested case must yield None NoOp set");
+    }
+
+    #[test]
+    fn extract_combine_noop_values_no_case_returns_none() {
+        let combine = "combine entity _ = Update V { x = entity.a }";
+        let (field, noop) = extract_combine_noop_values(combine);
+        assert!(field.is_none());
+        assert!(noop.is_none());
     }
 
     #[test]
