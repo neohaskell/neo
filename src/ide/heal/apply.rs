@@ -14,6 +14,7 @@ pub fn apply_diff(model: &mut Value, diff: &HealDiff) -> usize {
     let mut applied = 0;
 
     applied += apply_add_chapters(model, diff);
+    applied += apply_remove_chapters(model, diff);
     applied += apply_add_entities(model, diff);
     applied += apply_add_slices(model, diff);
     applied += apply_add_nodes(model, diff);
@@ -50,6 +51,25 @@ fn apply_add_chapters(model: &mut Value, diff: &HealDiff) -> usize {
         applied += 1;
     }
     applied
+}
+
+fn apply_remove_chapters(model: &mut Value, diff: &HealDiff) -> usize {
+    if diff.remove_chapters.is_empty() {
+        return 0;
+    }
+    let Some(chapters) = model.get_mut("chapters").and_then(|v| v.as_array_mut()) else {
+        return 0;
+    };
+    let to_remove: std::collections::BTreeSet<&str> =
+        diff.remove_chapters.iter().map(|s| s.as_str()).collect();
+    let before = chapters.len();
+    chapters.retain(|c| {
+        c.get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| !to_remove.contains(id))
+            .unwrap_or(true)
+    });
+    before - chapters.len()
 }
 
 fn apply_slice_updates(model: &mut Value, diff: &HealDiff) -> usize {
@@ -560,7 +580,6 @@ mod tests {
                 chapter_id: None,
                 order: 0.0,
                 reason: String::new(),
-                entity_id_hint: None,
             }],
             add_nodes: vec![NodeToAdd {
                 id: "node-new".to_string(),

@@ -1156,6 +1156,107 @@ mod ide_ws {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ide_ws_relayout_orders_by_flow_and_is_idempotent() {
+        // Over the wire: a spaghetti model whose stored slice order is the
+        // REVERSE of the causal flow. `workspace/relayoutEventModel` must
+        // reorder by the wave (initializer command first) on the first call
+        // and be a no-op (`applied == 0`) on the second. Pure-local — no
+        // NeoHaskell project, no network, no LLM.
+        let dir = tempfile::tempdir().unwrap();
+        let port = reserve_port();
+        let child = spawn_ide(dir.path(), port);
+
+        // Stored order First(0) < Second(1) < Third(2); causal flow is the
+        // reverse: Third(initializer cmd) -> Second(integration) -> First.
+        let spaghetti = json!({
+            "id": "m", "name": "ws-relayout",
+            "chapters": [],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "s1", "name": "First",  "chapterId": null, "order": 0 },
+                { "id": "s2", "name": "Second", "chapterId": null, "order": 1 },
+                { "id": "s3", "name": "Third",  "chapterId": null, "order": 2 }
+            ],
+            "nodes": [
+                { "id": "c0", "type": "command", "name": "Initiate",  "sliceId": "s3", "entityId": "e" },
+                { "id": "e0", "type": "event",   "name": "Initiated", "sliceId": "s3", "entityId": "e" },
+                { "id": "i0", "type": "integration", "name": "Bridge", "sliceId": "s2", "kind": "inbound" },
+                { "id": "c1", "type": "command", "name": "Continue",  "sliceId": "s1", "entityId": "e" },
+                { "id": "e1", "type": "event",   "name": "Continued", "sliceId": "s1", "entityId": "e" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent",       "sourceId": "c0", "targetId": "e0" },
+                { "id": "x2", "type": "eventTriggersIntegration",   "sourceId": "e0", "targetId": "i0" },
+                { "id": "x3", "type": "integrationTriggersCommand", "sourceId": "i0", "targetId": "c1" },
+                { "id": "x4", "type": "commandProducesEvent",       "sourceId": "c1", "targetId": "e1" }
+            ],
+            "layout": {
+                "nodePositions": {
+                    "c0": { "x": 800, "y": 120 }, "e0": { "x": 800, "y": 400 },
+                    "i0": { "x": 400, "y": 120 },
+                    "c1": { "x": 40,  "y": 120 }, "e1": { "x": 40,  "y": 400 }
+                },
+                "viewport": { "x": 0, "y": 0, "zoom": 1 }
+            }
+        });
+        std::fs::write(
+            dir.path().join("event-model.json"),
+            serde_json::to_string_pretty(&spaghetti).unwrap(),
+        )
+        .unwrap();
+
+        let mut ws = ws_connect(port).await;
+
+        // First relayout — should apply the wave order.
+        let resp1 = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":1,"method":"workspace/relayoutEventModel","params":{}}),
+        )
+        .await;
+        assert!(resp1["error"].is_null(), "relayout failed: {resp1}");
+        assert!(
+            resp1["result"]["applied"].as_u64().unwrap() > 0,
+            "first relayout should reorder: {resp1}",
+        );
+
+        // The file on disk now follows the wave: Third < Second < First.
+        let patched: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("event-model.json")).unwrap(),
+        )
+        .unwrap();
+        let order_of = |name: &str| {
+            patched["slices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .unwrap()["order"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            order_of("Third") < order_of("Second") && order_of("Second") < order_of("First"),
+            "wave order Third<Second<First; got T={} S={} F={}",
+            order_of("Third"), order_of("Second"), order_of("First"),
+        );
+
+        // Second relayout — fixed point.
+        let resp2 = send_recv(
+            &mut ws,
+            json!({"jsonrpc":"2.0","id":2,"method":"workspace/relayoutEventModel","params":{}}),
+        )
+        .await;
+        assert!(resp2["error"].is_null(), "second relayout failed: {resp2}");
+        assert_eq!(
+            resp2["result"]["applied"].as_u64().unwrap(),
+            0,
+            "second relayout must be a no-op: {resp2}",
+        );
+
+        kill(child);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ide_ws_event_model_read_returns_null_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
         let port = reserve_port();

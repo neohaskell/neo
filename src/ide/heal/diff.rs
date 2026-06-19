@@ -49,8 +49,15 @@ const SLICE_COLUMN_OFFSET: f64 = 40.0;
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HealDiff {
-    /// Chapters to add (one per inspection entity whose slices need a home).
+    /// Chapters to add (one per causal flow whose heal-owned slices need a
+    /// home — see `order_slices_by_wave`).
     pub add_chapters: Vec<ChapterToAdd>,
+    /// Heal-created chapters (`chapter-heal-` prefix) to remove because no
+    /// slice references them any more. Migrates models built under the old
+    /// one-chapter-per-entity scheme to one-chapter-per-flow without leaving
+    /// orphaned chapter arrows floating on the canvas. Never removes a
+    /// user-authored chapter.
+    pub remove_chapters: Vec<String>,
     /// Entities to add (one per inspection domain that lacks a matching entity).
     pub add_entities: Vec<EntityToAdd>,
     /// Slices to add (one per command/query/integration/orphan-event name
@@ -80,6 +87,7 @@ impl HealDiff {
     /// Total number of repairs this diff would apply (excludes residuals).
     pub fn applied_count(&self) -> usize {
         self.add_chapters.len()
+            + self.remove_chapters.len()
             + self.add_entities.len()
             + self.add_slices.len()
             + self.add_nodes.len()
@@ -93,8 +101,9 @@ impl HealDiff {
     /// Short, human-readable one-line summary for logs and the heal overlay.
     pub fn summary(&self) -> String {
         format!(
-            "{} chapters, {} entities, {} slices, {} nodes, {} edges, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
+            "{} chapters, {} chapters removed, {} entities, {} slices, {} nodes, {} edges, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
             self.add_chapters.len(),
+            self.remove_chapters.len(),
             self.add_entities.len(),
             self.add_slices.len(),
             self.add_nodes.len(),
@@ -134,11 +143,6 @@ pub struct SliceToAdd {
     pub chapter_id: Option<String>,
     pub order: f64,
     pub reason: String,
-    /// Domain entity that this slice belongs to — set when the slice is
-    /// created during processing of an inspection domain. Drives chapter
-    /// grouping in the post-pass. Not serialised to disk on the slice.
-    #[serde(skip)]
-    pub entity_id_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,7 +307,6 @@ pub fn compute_diff_with_options(
                 &cmd.name,
                 &format!("slice for command {}", cmd.name),
                 entity_id.as_deref(),
-                entity_id.as_deref(),
                 None,
                 &format!("command {} discovered in domain {}", cmd.name, domain.name),
             );
@@ -320,7 +323,6 @@ pub fn compute_diff_with_options(
                     ev_name,
                     primary,
                     &format!("slice for command {primary}"),
-                    entity_id.as_deref(),
                     entity_id.as_deref(),
                     None,
                     &format!(
@@ -357,7 +359,6 @@ pub fn compute_diff_with_options(
                 &ev.name,
                 &format!("slice for orphan event {}", ev.name),
                 entity_id.as_deref(),
-                entity_id.as_deref(),
                 None,
                 &format!(
                     "event {} declared in domain {} (no producing command)",
@@ -375,7 +376,6 @@ pub fn compute_diff_with_options(
                 &q.name,
                 &q.name,
                 &format!("slice for query {}", q.name),
-                entity_id.as_deref(),
                 None,
                 None,
                 &format!("query {} discovered in domain {}", q.name, domain.name),
@@ -412,7 +412,6 @@ pub fn compute_diff_with_options(
                 &intg.name,
                 &intg.name,
                 &format!("slice for integration {}", intg.name),
-                entity_id.as_deref(),
                 None,
                 Some(inspection_kind),
                 &format!(
@@ -540,16 +539,17 @@ pub fn compute_diff_with_options(
         }
     }
 
-    // --- 4.5. Chapter grouping ---------------------------------------
+    // --- 4.5. Wave ordering + chapter grouping -----------------------
     //
-    // Heal-created slices (id prefix `slice-heal-`) get grouped under a
-    // chapter named after their domain's entity. Must run BEFORE the
-    // rebalance + layout passes — those passes use slice `order` to
-    // compute x columns, so reordering here makes the position assignment
-    // match the final layout instead of triggering a second-run fix.
-    let nodes_snapshot = diff.add_nodes.clone();
-    group_slices_into_chapters(model, inspection, &nodes_snapshot, &mut diff);
-    // After grouping, sort pending slices by their reassigned order so
+    // Order slices left-to-right by the event-modeling WAVE (a pure
+    // function of the node/edge graph: initializer-rooted, longest-path
+    // layered, one contiguous block per causal flow), and group every
+    // heal-owned slice into one chapter per flow. Must run BEFORE the
+    // rebalance + layout passes — those use slice `order` to compute x
+    // columns, so setting the wave order here makes the x assignment match
+    // the final layout instead of triggering a second-run fix.
+    order_slices_by_wave(model, &plan, &mut diff);
+    // After ordering, sort pending slices by their reassigned order so
     // PositionCalculator iterates them in the new left-to-right rhythm.
     diff.add_slices.sort_by(|a, b| {
         a.order
@@ -610,151 +610,50 @@ pub fn compute_diff_with_options(
     diff
 }
 
-fn group_slices_into_chapters(
-    model: &Value,
-    inspection: &ProjectInspection,
-    add_nodes_snapshot: &[NodeToAdd],
-    diff: &mut HealDiff,
-) {
-    // 1. Build entity_id → name from existing entities + diff.add_entities.
-    let mut entity_name: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(arr) = model.get("entities").and_then(|v| v.as_array()) {
-        for e in arr {
-            if let (Some(id), Some(name)) = (
-                e.get("id").and_then(|v| v.as_str()),
-                e.get("name").and_then(|v| v.as_str()),
-            ) {
-                entity_name.insert(id.to_string(), name.to_string());
-            }
-        }
-    }
-    for e in &diff.add_entities {
-        entity_name.insert(e.id.clone(), e.name.clone());
-    }
+/// Order every slice left-to-right by the event-modeling WAVE and group
+/// heal-owned slices into one chapter per causal flow.
+///
+/// Replaces the old alphabetical-by-entity grouping. The wave order is a
+/// pure function of the node/edge graph (`compute_wave_order`): an
+/// initializer command (one not triggered by any `integrationTriggersCommand`
+/// edge) anchors the left of its flow; each consequence sits one column
+/// right of its deepest cause; independent flows are contiguous blocks.
+///
+/// Chapter policy (user decision D1): a chapter is created per causal flow,
+/// named after the flow's root slice. Only HEAL-owned slices (`slice-heal-`
+/// id prefix) are (re)assigned to a chapter — user-authored slices keep
+/// their existing `chapterId`. Heal-created chapters (`chapter-heal-` prefix)
+/// that no slice references any more are queued for removal, migrating models
+/// built under the old one-chapter-per-entity scheme.
+fn order_slices_by_wave(model: &Value, plan: &MaterializePlan, diff: &mut HealDiff) {
+    let wave = compute_wave_order(model, plan, diff);
 
-    // 2. Build a symbol_name → entity_id index from the inspection so we
-    // can map ANY heal-slice (named after a command/query/event/integration)
-    // back to its domain's entity, even when the slice's only nodes are
-    // queries/integrations that don't carry entityId per the schema.
-    let mut name_to_entity_id: BTreeMap<String, String> = BTreeMap::new();
-    for domain in &inspection.domains {
-        let entity_id_for_domain = entity_name
-            .iter()
-            .find(|(_, n)| n.as_str() == domain.name.as_str())
-            .map(|(id, _)| id.clone());
-        let Some(eid) = entity_id_for_domain else {
-            continue;
-        };
-        for c in &domain.commands {
-            name_to_entity_id.entry(c.name.clone()).or_insert(eid.clone());
-        }
-        for q in &domain.queries {
-            name_to_entity_id.entry(q.name.clone()).or_insert(eid.clone());
-        }
-        for i in &domain.integrations {
-            name_to_entity_id.entry(i.name.clone()).or_insert(eid.clone());
-        }
-        for e in &domain.events {
-            name_to_entity_id.entry(e.name.clone()).or_insert(eid.clone());
-        }
-    }
-
-    // 3. Build slice_id → entity_id map by combining (in priority order):
-    //    - SliceToAdd.entity_id_hint (new slices we just queued)
-    //    - newly-added nodes' entity_id
-    //    - existing nodes' entityId for heal-prefixed slices already in the model
-    //    - the inspection symbol map (fallback for query/integration slices)
-    let mut slice_entity: BTreeMap<String, String> = BTreeMap::new();
-    for s in &diff.add_slices {
-        if let Some(eid) = &s.entity_id_hint {
-            slice_entity.entry(s.id.clone()).or_insert(eid.clone());
-        }
-    }
-    for n in add_nodes_snapshot {
-        // Only re-chapter slices the heal pass created. A user-authored
-        // slice that just happens to receive a new node from this run
-        // must keep its existing chapter assignment.
-        if !n.slice_id.starts_with("slice-heal-") {
-            continue;
-        }
-        if let Some(eid) = &n.entity_id {
-            slice_entity.entry(n.slice_id.clone()).or_insert(eid.clone());
-        }
-    }
-    if let Some(arr) = model.get("nodes").and_then(|v| v.as_array()) {
-        for n in arr {
-            let Some(slice_id) = n.get("sliceId").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if !slice_id.starts_with("slice-heal-") {
-                continue;
-            }
-            let Some(entity_id) = n.get("entityId").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            slice_entity
-                .entry(slice_id.to_string())
-                .or_insert(entity_id.to_string());
-        }
-    }
-    // Fallback path: walk every heal slice in the model AND the pending
-    // diff.add_slices, look up its NAME in the inspection symbol map.
-    let mut all_heal_slices: Vec<(String, String)> = Vec::new();
-    if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
-        for s in arr {
-            let (Some(id), Some(name)) = (
-                s.get("id").and_then(|v| v.as_str()),
-                s.get("name").and_then(|v| v.as_str()),
-            ) else {
-                continue;
-            };
-            if id.starts_with("slice-heal-") {
-                all_heal_slices.push((id.to_string(), name.to_string()));
-            }
-        }
-    }
-    for s in &diff.add_slices {
-        all_heal_slices.push((s.id.clone(), s.name.clone()));
-    }
-    for (id, name) in &all_heal_slices {
-        if slice_entity.contains_key(id) {
-            continue;
-        }
-        if let Some(eid) = name_to_entity_id.get(name) {
-            slice_entity.insert(id.clone(), eid.clone());
-        }
-    }
-
-    if slice_entity.is_empty() {
-        return;
-    }
-
-    // 3. Build existing model slice info we may need to update.
+    // Existing model slice records (chapter + order + name).
     let mut model_slice_chapter: BTreeMap<String, Option<String>> = BTreeMap::new();
-    let mut model_slice_name: BTreeMap<String, String> = BTreeMap::new();
     let mut model_slice_order: BTreeMap<String, f64> = BTreeMap::new();
+    let mut model_slice_name: BTreeMap<String, String> = BTreeMap::new();
     if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
         for s in arr {
             let Some(id) = s.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let chapter = s
+            let chap = s
                 .get("chapterId")
                 .and_then(|v| if v.is_null() { None } else { v.as_str() })
-                .map(|s| s.to_string());
-            model_slice_chapter.insert(id.to_string(), chapter);
-            if let Some(n) = s.get("name").and_then(|v| v.as_str()) {
-                model_slice_name.insert(id.to_string(), n.to_string());
-            }
+                .map(|x| x.to_string());
+            model_slice_chapter.insert(id.to_string(), chap);
             if let Some(o) = s.get("order").and_then(|v| v.as_f64()) {
                 model_slice_order.insert(id.to_string(), o);
+            }
+            if let Some(n) = s.get("name").and_then(|v| v.as_str()) {
+                model_slice_name.insert(id.to_string(), n.to_string());
             }
         }
     }
 
-    // 4. Existing chapter lookup by name + max chapter order.
+    // Existing chapters: name -> id, and the set of heal-created chapter ids.
     let mut chapter_by_name: BTreeMap<String, String> = BTreeMap::new();
-    let mut max_chapter_order: f64 = -1.0;
+    let mut existing_heal_chapters: BTreeSet<String> = BTreeSet::new();
     if let Some(arr) = model.get("chapters").and_then(|v| v.as_array()) {
         for c in arr {
             if let (Some(id), Some(name)) = (
@@ -762,128 +661,433 @@ fn group_slices_into_chapters(
                 c.get("name").and_then(|v| v.as_str()),
             ) {
                 chapter_by_name.insert(name.to_string(), id.to_string());
-            }
-            if let Some(o) = c.get("order").and_then(|v| v.as_f64()) {
-                if o > max_chapter_order {
-                    max_chapter_order = o;
+                if id.starts_with("chapter-heal-") {
+                    existing_heal_chapters.insert(id.to_string());
                 }
             }
         }
     }
-    let mut next_chapter_order = max_chapter_order + 1.0;
 
-    // 5. Slice order cursor: start past every NON-heal slice's order, so
-    // the assignment is idempotent across runs (re-running won't keep
-    // pushing heal slices further right because we're not counting their
-    // own orders towards the baseline).
-    let mut max_non_heal_slice_order: f64 = -1.0;
+    // Resolve the final chapterId for every slice. Heal-owned slices get
+    // their flow's chapter (created on demand); user-authored slices keep
+    // their existing chapterId untouched.
+    let mut resolved_chapter: BTreeMap<String, String> = BTreeMap::new(); // flow name -> chapter id
+    let mut final_chapter: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for sid in wave.slice_order.keys() {
+        if sid.starts_with("slice-heal-") {
+            let (root_name, rank) = wave
+                .slice_flow
+                .get(sid)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), 0));
+            let chap_id = if let Some(id) = resolved_chapter.get(&root_name) {
+                id.clone()
+            } else if let Some(id) = chapter_by_name.get(&root_name) {
+                resolved_chapter.insert(root_name.clone(), id.clone());
+                id.clone()
+            } else {
+                let id = synth_id("chapter", &root_name);
+                diff.add_chapters.push(ChapterToAdd {
+                    id: id.clone(),
+                    name: root_name.clone(),
+                    order: rank as f64,
+                    reason: format!("chapter for causal flow starting at {root_name}"),
+                });
+                resolved_chapter.insert(root_name.clone(), id.clone());
+                id
+            };
+            final_chapter.insert(sid.clone(), Some(chap_id));
+        } else {
+            let existing = model_slice_chapter.get(sid).cloned().unwrap_or(None);
+            final_chapter.insert(sid.clone(), existing);
+        }
+    }
+
+    // Apply order (all slices) + chapter (heal slices) to pending + existing.
+    for sid in wave.slice_order.keys() {
+        let new_order = wave.slice_order[sid];
+        let new_chapter = final_chapter.get(sid).cloned().unwrap_or(None);
+
+        // Pending slice (queued this pass) — mutate in place.
+        if let Some(s) = diff.add_slices.iter_mut().find(|s| &s.id == sid) {
+            s.order = new_order as f64;
+            s.chapter_id = new_chapter.clone();
+            continue;
+        }
+
+        // Existing model slice — emit a SliceUpdate only when something moved.
+        let cur_order = model_slice_order.get(sid).copied();
+        let cur_chapter = model_slice_chapter.get(sid).cloned().unwrap_or(None);
+        let order_changed = cur_order
+            .map(|c| (c - new_order as f64).abs() > 0.5)
+            .unwrap_or(true);
+        let chapter_changed = cur_chapter.as_deref() != new_chapter.as_deref();
+        if !order_changed && !chapter_changed {
+            continue;
+        }
+        diff.update_slices.push(SliceUpdate {
+            slice_id: sid.clone(),
+            slice_name: model_slice_name.get(sid).cloned().unwrap_or_default(),
+            set_chapter_id: if chapter_changed {
+                new_chapter.clone()
+            } else {
+                None
+            },
+            set_order: if order_changed {
+                Some(new_order as f64)
+            } else {
+                None
+            },
+            reason: "group into causal-flow chapter, order by wave".to_string(),
+        });
+    }
+
+    // Remove heal-created chapters no longer referenced by any slice.
+    let mut live: BTreeSet<String> = BTreeSet::new();
+    for ch in final_chapter.values().filter_map(|o| o.as_ref()) {
+        live.insert(ch.clone());
+    }
+    for ch_id in &existing_heal_chapters {
+        if !live.contains(ch_id) {
+            diff.remove_chapters.push(ch_id.clone());
+        }
+    }
+}
+
+/// Result of the deterministic wave-ordering pass — a pure function of the
+/// model's node/edge graph (existing ∪ pending-in-`diff`).
+struct WaveOrder {
+    /// Final left-to-right order index for every slice id.
+    slice_order: BTreeMap<String, usize>,
+    /// slice id -> (flow root slice name, flow rank). One flow per weakly
+    /// connected component of the slice-precedence graph; the root is the
+    /// flow's initializer (or, lacking one, its left-most slice).
+    slice_flow: BTreeMap<String, (String, usize)>,
+}
+
+/// `(name, id)` total-order key for a slice — the single source of
+/// determinism: every tie in the wave pass resolves on this.
+fn nkey(slice_name: &BTreeMap<String, String>, s: &str) -> (String, String) {
+    (slice_name.get(s).cloned().unwrap_or_default(), s.to_string())
+}
+
+/// Union-find root with path compression over a `BTreeMap` forest.
+fn uf_find(parent: &mut BTreeMap<String, String>, x: &str) -> String {
+    let mut root = x.to_string();
+    while parent.get(&root).map(|p| p != &root).unwrap_or(false) {
+        root = parent[&root].clone();
+    }
+    let mut cur = x.to_string();
+    while parent.get(&cur).map(|p| p != &root).unwrap_or(false) {
+        let next = parent[&cur].clone();
+        parent.insert(cur, root.clone());
+        cur = next;
+    }
+    root
+}
+
+/// Deterministic DFS recording every arc to a node currently on the stack as
+/// a back edge. Visiting neighbours in `nkey` order makes the feedback set a
+/// pure function of the graph. Recursion depth is bounded by the longest
+/// causal chain — event models are small (tens of slices), so this is safe.
+fn dfs_back_edges(
+    u: &str,
+    succ: &BTreeMap<String, BTreeSet<String>>,
+    slice_name: &BTreeMap<String, String>,
+    visited: &mut BTreeSet<String>,
+    on_stack: &mut BTreeSet<String>,
+    back_edges: &mut BTreeSet<(String, String)>,
+) {
+    visited.insert(u.to_string());
+    on_stack.insert(u.to_string());
+    let mut kids: Vec<String> = succ
+        .get(u)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    kids.sort_by(|a, b| nkey(slice_name, a).cmp(&nkey(slice_name, b)));
+    for v in kids {
+        if on_stack.contains(&v) {
+            back_edges.insert((u.to_string(), v.clone()));
+        } else if !visited.contains(&v) {
+            dfs_back_edges(&v, succ, slice_name, visited, on_stack, back_edges);
+        }
+    }
+    on_stack.remove(u);
+}
+
+/// Compute the wave order. Pure function of `(plan nodes+edges, model slices,
+/// diff pending slices)`. See `order_slices_by_wave` for the contract.
+fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) -> WaveOrder {
+    // 1. node -> slice (existing ∪ pending).
+    let mut node_slice: BTreeMap<String, String> = BTreeMap::new();
+    for n in plan.iter_all_nodes() {
+        if let Some(sid) = &n.slice_id {
+            node_slice.insert(n.id.clone(), sid.clone());
+        }
+    }
+
+    // slice id -> name (model slices ∪ pending add_slices).
+    let mut slice_name: BTreeMap<String, String> = BTreeMap::new();
     if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
         for s in arr {
-            let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            if id.starts_with("slice-heal-") {
-                continue;
+            if let (Some(id), Some(name)) = (
+                s.get("id").and_then(|v| v.as_str()),
+                s.get("name").and_then(|v| v.as_str()),
+            ) {
+                slice_name.insert(id.to_string(), name.to_string());
             }
-            if let Some(o) = s.get("order").and_then(|v| v.as_f64()) {
-                if o > max_non_heal_slice_order {
-                    max_non_heal_slice_order = o;
+        }
+    }
+    for s in &diff.add_slices {
+        slice_name
+            .entry(s.id.clone())
+            .or_insert_with(|| s.name.clone());
+    }
+    let all_slices: BTreeSet<String> = slice_name.keys().cloned().collect();
+
+    // 2. slice-precedence arcs + the integration-triggered command set.
+    let mut succ: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut all_arcs: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut triggered: BTreeSet<String> = BTreeSet::new();
+    for (etype, src, tgt) in &plan.edge_keys {
+        if etype.as_str() == "integrationTriggersCommand" {
+            triggered.insert(tgt.clone());
+        }
+        let (Some(ss), Some(ts)) = (node_slice.get(src), node_slice.get(tgt)) else {
+            continue;
+        };
+        if ss == ts {
+            continue; // intra-slice — no precedence
+        }
+        succ.entry(ss.clone()).or_default().insert(ts.clone());
+        all_arcs.insert((ss.clone(), ts.clone()));
+    }
+    for s in &all_slices {
+        succ.entry(s.clone()).or_default();
+    }
+
+    // 3. initializer per slice — a slice holding a command not triggered by
+    //    an integration.
+    let mut is_init: BTreeMap<String, bool> =
+        all_slices.iter().map(|s| (s.clone(), false)).collect();
+    for n in plan.iter_all_nodes() {
+        if n.r#type == "command" {
+            if let Some(sid) = &n.slice_id {
+                if !triggered.contains(&n.id) {
+                    is_init.insert(sid.clone(), true);
                 }
             }
         }
     }
-    let mut next_slice_order = max_non_heal_slice_order + 1.0;
 
-    // 6. Group slices by entity (sorted by entity name for deterministic
-    // chapter creation order, then slices alphabetically within entity).
-    let mut by_entity: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (slice_id, entity_id) in &slice_entity {
-        by_entity
-            .entry(entity_id.clone())
-            .or_default()
-            .push(slice_id.clone());
+    // 4. deterministic back-edge removal (saga cycles) -> forward DAG.
+    let mut sorted_slices: Vec<String> = all_slices.iter().cloned().collect();
+    sorted_slices.sort_by(|a, b| nkey(&slice_name, a).cmp(&nkey(&slice_name, b)));
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    let mut on_stack: BTreeSet<String> = BTreeSet::new();
+    let mut back_edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for root in &sorted_slices {
+        if !visited.contains(root) {
+            dfs_back_edges(
+                root,
+                &succ,
+                &slice_name,
+                &mut visited,
+                &mut on_stack,
+                &mut back_edges,
+            );
+        }
     }
-    let mut sorted_entities: Vec<(String, Vec<String>)> = by_entity.into_iter().collect();
-    sorted_entities.sort_by(|a, b| {
-        let na = entity_name.get(&a.0).cloned().unwrap_or_default();
-        let nb = entity_name.get(&b.0).cloned().unwrap_or_default();
-        na.cmp(&nb)
-    });
 
-    // 7. For each entity group: find/create chapter, then assign every
-    // slice in the group a chapter + contiguous order (new slices
-    // updated in-place; existing model slices via SliceUpdate).
-    let slice_name_for = |id: &str, diff: &HealDiff| -> String {
-        if let Some(s) = diff.add_slices.iter().find(|s| s.id == id) {
-            return s.name.clone();
+    let mut fsucc: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut fpreds: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for s in &all_slices {
+        fsucc.entry(s.clone()).or_default();
+        fpreds.entry(s.clone()).or_default();
+    }
+    for (u, vs) in &succ {
+        for v in vs {
+            if back_edges.contains(&(u.clone(), v.clone())) {
+                continue;
+            }
+            fsucc.get_mut(u).unwrap().insert(v.clone());
+            fpreds.get_mut(v).unwrap().insert(u.clone());
         }
-        model_slice_name.get(id).cloned().unwrap_or_default()
-    };
-    for (entity_id, mut slice_ids) in sorted_entities {
-        let ename = entity_name
-            .get(&entity_id)
-            .cloned()
-            .unwrap_or_else(|| entity_id.clone());
+    }
 
-        let chapter_id = if let Some(existing) = chapter_by_name.get(&ename) {
-            existing.clone()
-        } else {
-            let id = synth_id("chapter", &ename);
-            diff.add_chapters.push(ChapterToAdd {
-                id: id.clone(),
-                name: ename.clone(),
-                order: next_chapter_order,
-                reason: format!("chapter for entity {ename}"),
-            });
-            chapter_by_name.insert(ename.clone(), id.clone());
-            next_chapter_order += 1.0;
-            id
-        };
+    // 5. longest-path layering on the forward DAG (Kahn).
+    let mut layer: BTreeMap<String, usize> =
+        all_slices.iter().map(|s| (s.clone(), 0usize)).collect();
+    let mut indeg: BTreeMap<String, usize> = all_slices
+        .iter()
+        .map(|s| (s.clone(), fpreds[s].len()))
+        .collect();
+    let mut queue: Vec<String> = all_slices
+        .iter()
+        .filter(|s| indeg[*s] == 0)
+        .cloned()
+        .collect();
+    queue.sort_by(|a, b| nkey(&slice_name, a).cmp(&nkey(&slice_name, b)));
+    let mut qi = 0;
+    while qi < queue.len() {
+        let u = queue[qi].clone();
+        qi += 1;
+        let lu = layer[&u];
+        let mut kids: Vec<String> = fsucc[&u].iter().cloned().collect();
+        kids.sort_by(|a, b| nkey(&slice_name, a).cmp(&nkey(&slice_name, b)));
+        for v in kids {
+            if lu + 1 > layer[&v] {
+                layer.insert(v.clone(), lu + 1);
+            }
+            let d = indeg.get_mut(&v).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                queue.push(v);
+            }
+        }
+    }
 
-        slice_ids.sort_by(|a, b| {
-            let na = slice_name_for(a, diff);
-            let nb = slice_name_for(b, diff);
-            na.cmp(&nb)
+    // 6. weakly-connected components (flows) via union-find over all arcs.
+    let mut parent: BTreeMap<String, String> =
+        all_slices.iter().map(|s| (s.clone(), s.clone())).collect();
+    for (a, b) in &all_arcs {
+        let ra = uf_find(&mut parent, a);
+        let rb = uf_find(&mut parent, b);
+        if ra != rb {
+            parent.insert(ra, rb);
+        }
+    }
+    let mut comp_members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for s in &all_slices {
+        let r = uf_find(&mut parent, s);
+        comp_members.entry(r).or_default().push(s.clone());
+    }
+
+    // Component root (initializer-first, then smallest (layer, name_key)) +
+    // min layer, then rank components by (min_layer, name_key(root)).
+    struct Comp {
+        members: Vec<String>,
+        root: String,
+        min_layer: usize,
+    }
+    let mut comps: Vec<Comp> = Vec::new();
+    for (_r, members) in comp_members {
+        let min_layer = members.iter().map(|s| layer[s]).min().unwrap_or(0);
+        let mut root: Option<String> = None;
+        let mut root_key: Option<(usize, (String, String))> = None;
+        let mut root_is_init = false;
+        for m in &members {
+            let mi = is_init[m];
+            let k = (layer[m], nkey(&slice_name, m));
+            let better = match (&root_key, root_is_init, mi) {
+                (None, _, _) => true,
+                (Some(_), false, true) => true,  // m initializes, current doesn't
+                (Some(_), true, false) => false, // current initializes, m doesn't
+                (Some(rk), _, _) => k < *rk,     // same init-ness: smaller key wins
+            };
+            if better {
+                root = Some(m.clone());
+                root_key = Some(k);
+                root_is_init = mi;
+            }
+        }
+        let root = root.unwrap_or_default();
+        comps.push(Comp {
+            members,
+            root,
+            min_layer,
         });
-
-        for slice_id in &slice_ids {
-            let assigned_order = next_slice_order;
-            next_slice_order += 1.0;
-
-            // Pending slice (in diff.add_slices)? Update in-place.
-            if let Some(s) = diff.add_slices.iter_mut().find(|s| &s.id == slice_id) {
-                s.chapter_id = Some(chapter_id.clone());
-                s.order = assigned_order;
-                continue;
-            }
-
-            // Existing slice — emit a SliceUpdate only when something changes.
-            let current_chapter = model_slice_chapter
-                .get(slice_id)
-                .cloned()
-                .unwrap_or(None);
-            let current_order = model_slice_order.get(slice_id).copied();
-            let chapter_changed = current_chapter.as_deref() != Some(chapter_id.as_str());
-            let order_changed = current_order
-                .map(|c| (c - assigned_order).abs() > 0.5)
-                .unwrap_or(true);
-            if !chapter_changed && !order_changed {
-                continue;
-            }
-            diff.update_slices.push(SliceUpdate {
-                slice_id: slice_id.clone(),
-                slice_name: slice_name_for(slice_id, diff),
-                set_chapter_id: if chapter_changed {
-                    Some(chapter_id.clone())
-                } else {
-                    None
-                },
-                set_order: if order_changed {
-                    Some(assigned_order)
-                } else {
-                    None
-                },
-                reason: format!("group with entity {ename}"),
-            });
+    }
+    comps.sort_by(|a, b| {
+        (a.min_layer, nkey(&slice_name, &a.root))
+            .cmp(&(b.min_layer, nkey(&slice_name, &b.root)))
+    });
+    let mut comp_rank: BTreeMap<String, usize> = BTreeMap::new();
+    let mut flow_root: BTreeMap<String, String> = BTreeMap::new();
+    for (rank, c) in comps.iter().enumerate() {
+        let root_name = slice_name.get(&c.root).cloned().unwrap_or_default();
+        for m in &c.members {
+            comp_rank.insert(m.clone(), rank);
+            flow_root.insert(m.clone(), root_name.clone());
         }
+    }
+
+    // 7. priority-queue Kahn sweep over the forward DAG. Key term order:
+    //    (component_rank, layer, barycenter-of-emitted-preds, name_key).
+    let mut findeg: BTreeMap<String, usize> = all_slices
+        .iter()
+        .map(|s| (s.clone(), fpreds[s].len()))
+        .collect();
+    let mut final_order: BTreeMap<String, usize> = BTreeMap::new();
+    let mut heap: std::collections::BinaryHeap<
+        std::cmp::Reverse<(usize, usize, i64, String, String)>,
+    > = std::collections::BinaryHeap::new();
+    let key_of = |s: &str,
+                  final_order: &BTreeMap<String, usize>|
+     -> (usize, usize, i64, String, String) {
+        let preds = &fpreds[s];
+        let fr: i64 = if !preds.is_empty() {
+            let sum: usize = preds
+                .iter()
+                .map(|p| final_order.get(p).copied().unwrap_or(0))
+                .sum();
+            ((sum as f64) / (preds.len() as f64)).round() as i64
+        } else if is_init[s] {
+            -1
+        } else {
+            0
+        };
+        let (nm, id) = nkey(&slice_name, s);
+        (comp_rank[s], layer[s], fr, nm, id)
+    };
+    for s in &all_slices {
+        if findeg[s] == 0 {
+            heap.push(std::cmp::Reverse(key_of(s, &final_order)));
+        }
+    }
+    let mut next = 0usize;
+    while let Some(std::cmp::Reverse(key)) = heap.pop() {
+        let s = key.4.clone();
+        if final_order.contains_key(&s) {
+            continue;
+        }
+        final_order.insert(s.clone(), next);
+        next += 1;
+        let mut kids: Vec<String> = fsucc[&s].iter().cloned().collect();
+        kids.sort_by(|a, b| nkey(&slice_name, a).cmp(&nkey(&slice_name, b)));
+        for v in kids {
+            let d = findeg.get_mut(&v).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                heap.push(std::cmp::Reverse(key_of(&v, &final_order)));
+            }
+        }
+    }
+    // Safety net (defensive — the forward graph is acyclic so this is empty).
+    let mut leftover: Vec<String> = all_slices
+        .iter()
+        .filter(|s| !final_order.contains_key(*s))
+        .cloned()
+        .collect();
+    leftover.sort_by(|a, b| nkey(&slice_name, a).cmp(&nkey(&slice_name, b)));
+    for s in leftover {
+        final_order.insert(s.clone(), next);
+        next += 1;
+    }
+
+    let mut slice_flow: BTreeMap<String, (String, usize)> = BTreeMap::new();
+    for s in &all_slices {
+        slice_flow.insert(
+            s.clone(),
+            (
+                flow_root.get(s).cloned().unwrap_or_default(),
+                comp_rank.get(s).copied().unwrap_or(0),
+            ),
+        );
+    }
+    WaveOrder {
+        slice_order: final_order,
+        slice_flow,
     }
 }
 
@@ -922,6 +1126,20 @@ fn rebalance_slice_columns(
         }
     }
 
+    // The wave pass (`order_slices_by_wave`) just rewrote existing slices'
+    // `order` into `diff.update_slices` — but the model JSON isn't mutated
+    // until `apply_diff`, so we must read the EFFECTIVE order (the wave
+    // order) here, not the stale `model.slices[].order`. Otherwise the
+    // first pass lays columns out against the old order and the second pass
+    // (model now carrying the wave order) computes different columns — i.e.
+    // the layout would never reach a fixed point.
+    let mut order_override: BTreeMap<String, f64> = BTreeMap::new();
+    for u in &diff.update_slices {
+        if let Some(o) = u.set_order {
+            order_override.insert(u.slice_id.clone(), o);
+        }
+    }
+
     // Sorted (slice_id, order) list — existing slices from the model,
     // pending slices appended (they already have orders assigned at
     // materialise time, past the last existing one).
@@ -931,7 +1149,11 @@ fn rebalance_slice_columns(
             let Some(id) = s.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
-            let order = s.get("order").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let order = order_override
+                .get(id)
+                .copied()
+                .or_else(|| s.get("order").and_then(|v| v.as_f64()))
+                .unwrap_or(0.0);
             all_slices.push((id.to_string(), order));
         }
     }
@@ -1201,7 +1423,6 @@ impl MaterializePlan {
         diff: &mut HealDiff,
         name: &str,
         reason: &str,
-        entity_hint: Option<&str>,
     ) -> String {
         if let Some(id) = self.slices_by_name.get(name) {
             return id.clone();
@@ -1216,7 +1437,6 @@ impl MaterializePlan {
             chapter_id: None,
             order,
             reason: reason.to_string(),
-            entity_id_hint: entity_hint.map(|s| s.to_string()),
         });
         id
     }
@@ -1234,7 +1454,6 @@ impl MaterializePlan {
         name: &str,
         slice_name: &str,
         slice_reason: &str,
-        slice_entity_hint: Option<&str>,
         entity_id: Option<&str>,
         kind: Option<&str>,
         node_reason: &str,
@@ -1247,7 +1466,7 @@ impl MaterializePlan {
                 }
             }
         }
-        let slice_id = self.ensure_slice(diff, slice_name, slice_reason, slice_entity_hint);
+        let slice_id = self.ensure_slice(diff, slice_name, slice_reason);
         let id = synth_node_id(node_type, name);
         let idx = self.nodes.len();
         let summary = NodeSummary {
@@ -2184,10 +2403,12 @@ mod tests {
     }
 
     #[test]
-    fn grouping_creates_chapter_per_entity_for_heal_slices() {
-        // Empty model + inspection with two domains → each domain's
-        // entity gets its own freshly-created chapter, and every
-        // heal-created slice for that entity lands in it.
+    fn grouping_creates_chapter_per_flow_for_heal_slices() {
+        // Empty model + inspection with two INDEPENDENT domains (no shared
+        // events) → two separate causal flows → one chapter per flow, each
+        // named after the flow's root slice (the initializer command),
+        // NOT after the entity. (Entity is a vertical swim lane; chapter is
+        // a horizontal story — they are different axes.)
         let inspection = ProjectInspection {
             root: PathBuf::from("/"),
             domains: vec![
@@ -2228,17 +2449,28 @@ mod tests {
         let model = empty_model();
         let diff = compute_diff(&model, &inspection);
 
-        // Two chapters created (one per entity).
+        // Two chapters created (one per causal flow), named after the flow
+        // roots — the command slices — not the entities.
         assert_eq!(diff.add_chapters.len(), 2, "{:?}", diff.add_chapters);
         let chapter_names: BTreeSet<&str> = diff
             .add_chapters
             .iter()
             .map(|c| c.name.as_str())
             .collect();
-        assert!(chapter_names.contains("Orders"));
-        assert!(chapter_names.contains("Payments"));
+        assert!(
+            chapter_names.contains("PlaceOrder"),
+            "chapter named after the flow root slice; got {chapter_names:?}",
+        );
+        assert!(
+            chapter_names.contains("CapturePayment"),
+            "chapter named after the flow root slice; got {chapter_names:?}",
+        );
+        // The old entity-named chapters must NOT appear.
+        assert!(!chapter_names.contains("Orders"));
+        assert!(!chapter_names.contains("Payments"));
 
-        // Each slice's chapter_id resolves to the chapter for its entity.
+        // Each slice lands in its own flow's chapter (same name as the slice
+        // here, since each flow is a single command slice).
         let chapter_for_name = |name: &str| {
             diff.add_chapters
                 .iter()
@@ -2247,23 +2479,40 @@ mod tests {
                 .id
                 .clone()
         };
-        let orders_chapter = chapter_for_name("Orders");
-        let payments_chapter = chapter_for_name("Payments");
         for s in &diff.add_slices {
-            let expected = if s.name == "PlaceOrder" {
-                &orders_chapter
-            } else if s.name == "CapturePayment" {
-                &payments_chapter
-            } else {
-                panic!("unexpected slice {}", s.name);
-            };
+            let expected = chapter_for_name(&s.name);
             assert_eq!(
                 s.chapter_id.as_deref(),
                 Some(expected.as_str()),
-                "slice {} should be in its entity's chapter",
+                "slice {} should be in its own flow's chapter",
                 s.name,
             );
         }
+
+        // Chapters are ordered left-to-right by flow (deterministic
+        // name-key tiebreak among same-depth flows): CapturePayment (0)
+        // before PlaceOrder (1).
+        let order_of = |name: &str| {
+            diff.add_chapters
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap()
+                .order
+        };
+        assert!(
+            order_of("CapturePayment") < order_of("PlaceOrder"),
+            "flows order deterministically by name-key among equal depth",
+        );
+
+        // And the slices themselves carry the matching wave order.
+        let slice_order = |name: &str| {
+            diff.add_slices
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .order
+        };
+        assert!(slice_order("CapturePayment") < slice_order("PlaceOrder"));
     }
 
     #[test]
@@ -2606,5 +2855,287 @@ mod tests {
                 e.source_id,
             );
         }
+    }
+
+    // ─── Wave-ordering tests (the core feature) ──────────────────────
+
+    /// Run only the layout/wave pass (empty inspection) against a model that
+    /// already carries its slices, nodes and edges. Returns slice NAME ->
+    /// final `order` after one `compute_diff` + `apply_diff`.
+    fn wave_orders(model: &Value) -> BTreeMap<String, f64> {
+        let mut m = model.clone();
+        let inspection = ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![],
+        };
+        let diff = compute_diff(&m, &inspection);
+        crate::ide::heal::apply::apply_diff(&mut m, &diff);
+        let mut out = BTreeMap::new();
+        for s in m["slices"].as_array().unwrap() {
+            out.insert(
+                s["name"].as_str().unwrap().to_string(),
+                s["order"].as_f64().unwrap(),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn wave_order_follows_causal_flow_not_alphabetical() {
+        // Linear wave: Zeta(cmd+evt) -> Alpha(intg) -> Beta(cmd+evt) ->
+        // Gamma(query). Alphabetical order would be Alpha,Beta,Gamma,Zeta;
+        // the WAVE order is Zeta,Alpha,Beta,Gamma because Zeta holds the
+        // initializer command (one not triggered by any integration).
+        // Initial orders are all 0 so a non-reordering impl can't pass.
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [], "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "s1", "name": "Zeta",  "chapterId": null, "order": 0 },
+                { "id": "s2", "name": "Alpha", "chapterId": null, "order": 0 },
+                { "id": "s3", "name": "Beta",  "chapterId": null, "order": 0 },
+                { "id": "s4", "name": "Gamma", "chapterId": null, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "c1", "type": "command", "name": "C1", "sliceId": "s1", "entityId": "e" },
+                { "id": "ev1","type": "event",   "name": "E1", "sliceId": "s1", "entityId": "e" },
+                { "id": "i1", "type": "integration", "name": "I1", "sliceId": "s2", "kind": "inbound" },
+                { "id": "c2", "type": "command", "name": "C2", "sliceId": "s3", "entityId": "e" },
+                { "id": "ev2","type": "event",   "name": "E2", "sliceId": "s3", "entityId": "e" },
+                { "id": "q1", "type": "query",   "name": "Q1", "sliceId": "s4" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent",      "sourceId": "c1",  "targetId": "ev1" },
+                { "id": "x2", "type": "eventTriggersIntegration",  "sourceId": "ev1", "targetId": "i1" },
+                { "id": "x3", "type": "integrationTriggersCommand","sourceId": "i1",  "targetId": "c2" },
+                { "id": "x4", "type": "commandProducesEvent",      "sourceId": "c2",  "targetId": "ev2" },
+                { "id": "x5", "type": "eventFeedsQuery",           "sourceId": "ev2", "targetId": "q1" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let o = wave_orders(&model);
+        assert_eq!(o["Zeta"], 0.0, "initializer slice is leftmost; got {o:?}");
+        assert_eq!(o["Alpha"], 1.0, "integration follows its triggering event; got {o:?}");
+        assert_eq!(o["Beta"], 2.0, "triggered command follows the integration; got {o:?}");
+        assert_eq!(o["Gamma"], 3.0, "read-model follows its event; got {o:?}");
+    }
+
+    #[test]
+    fn wave_order_disconnected_flows_are_contiguous() {
+        // Two independent flows: m->n and x->y (no shared nodes). Each flow
+        // must occupy a contiguous block — never interleaved as m,x,n,y.
+        // (This is the topology the design's adversarial pass first failed
+        // before the component-rank primary key was added.)
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [], "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "a1", "name": "m", "chapterId": null, "order": 0 },
+                { "id": "a2", "name": "n", "chapterId": null, "order": 0 },
+                { "id": "b1", "name": "x", "chapterId": null, "order": 0 },
+                { "id": "b2", "name": "y", "chapterId": null, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "ca", "type": "command", "name": "CA", "sliceId": "a1", "entityId": "e" },
+                { "id": "ea", "type": "event",   "name": "EA", "sliceId": "a1", "entityId": "e" },
+                { "id": "qa", "type": "query",   "name": "QA", "sliceId": "a2" },
+                { "id": "cb", "type": "command", "name": "CB", "sliceId": "b1", "entityId": "e" },
+                { "id": "eb", "type": "event",   "name": "EB", "sliceId": "b1", "entityId": "e" },
+                { "id": "qb", "type": "query",   "name": "QB", "sliceId": "b2" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent", "sourceId": "ca", "targetId": "ea" },
+                { "id": "x2", "type": "eventFeedsQuery",      "sourceId": "ea", "targetId": "qa" },
+                { "id": "x3", "type": "commandProducesEvent", "sourceId": "cb", "targetId": "eb" },
+                { "id": "x4", "type": "eventFeedsQuery",      "sourceId": "eb", "targetId": "qb" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let o = wave_orders(&model);
+        let a_max = o["m"].max(o["n"]);
+        let b_min = o["x"].min(o["y"]);
+        assert!(
+            a_max < b_min,
+            "each flow must be a contiguous block, not interleaved; got {o:?}",
+        );
+        assert!(o["m"] < o["n"], "command precedes its read-model");
+        assert!(o["x"] < o["y"], "command precedes its read-model");
+    }
+
+    #[test]
+    fn wave_order_breaks_saga_cycle_deterministically() {
+        // Cyclic saga: P(cmd+evt) -> Q(intg) -> R(cmd+evt) -> S(intg) -> P.
+        // Integration S re-triggers P's command, closing the loop. The pass
+        // must terminate, yield 4 distinct contiguous orders, and be
+        // identical on a re-run (the back edge is excluded deterministically).
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [], "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "p", "name": "P", "chapterId": null, "order": 0 },
+                { "id": "q", "name": "Q", "chapterId": null, "order": 0 },
+                { "id": "r", "name": "R", "chapterId": null, "order": 0 },
+                { "id": "s", "name": "S", "chapterId": null, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "cp", "type": "command", "name": "CP", "sliceId": "p", "entityId": "e" },
+                { "id": "ep", "type": "event",   "name": "EP", "sliceId": "p", "entityId": "e" },
+                { "id": "iq", "type": "integration", "name": "IQ", "sliceId": "q", "kind": "inbound" },
+                { "id": "cr", "type": "command", "name": "CR", "sliceId": "r", "entityId": "e" },
+                { "id": "er", "type": "event",   "name": "ER", "sliceId": "r", "entityId": "e" },
+                { "id": "is", "type": "integration", "name": "IS", "sliceId": "s", "kind": "inbound" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent",      "sourceId": "cp", "targetId": "ep" },
+                { "id": "x2", "type": "eventTriggersIntegration",  "sourceId": "ep", "targetId": "iq" },
+                { "id": "x3", "type": "integrationTriggersCommand","sourceId": "iq", "targetId": "cr" },
+                { "id": "x4", "type": "commandProducesEvent",      "sourceId": "cr", "targetId": "er" },
+                { "id": "x5", "type": "eventTriggersIntegration",  "sourceId": "er", "targetId": "is" },
+                { "id": "x6", "type": "integrationTriggersCommand","sourceId": "is", "targetId": "cp" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let o1 = wave_orders(&model);
+        let mut vals: Vec<f64> = o1.values().copied().collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(
+            vals,
+            vec![0.0, 1.0, 2.0, 3.0],
+            "saga must terminate with 4 distinct contiguous orders; got {o1:?}",
+        );
+        let o2 = wave_orders(&model);
+        assert_eq!(o1, o2, "saga ordering must be deterministic across runs");
+    }
+
+    #[test]
+    fn wave_order_deterministic_under_input_shuffle() {
+        // Same graph, node/edge/slice arrays reversed -> identical orders.
+        let forward = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [], "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "s1", "name": "Zeta",  "chapterId": null, "order": 0 },
+                { "id": "s2", "name": "Alpha", "chapterId": null, "order": 0 },
+                { "id": "s3", "name": "Beta",  "chapterId": null, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "c1", "type": "command", "name": "C1", "sliceId": "s1", "entityId": "e" },
+                { "id": "ev1","type": "event",   "name": "E1", "sliceId": "s1", "entityId": "e" },
+                { "id": "i1", "type": "integration", "name": "I1", "sliceId": "s2", "kind": "inbound" },
+                { "id": "c2", "type": "command", "name": "C2", "sliceId": "s3", "entityId": "e" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent",      "sourceId": "c1",  "targetId": "ev1" },
+                { "id": "x2", "type": "eventTriggersIntegration",  "sourceId": "ev1", "targetId": "i1" },
+                { "id": "x3", "type": "integrationTriggersCommand","sourceId": "i1",  "targetId": "c2" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let mut reversed = forward.clone();
+        for key in ["nodes", "edges", "slices"] {
+            let mut arr = reversed[key].as_array().unwrap().clone();
+            arr.reverse();
+            reversed[key] = Value::Array(arr);
+        }
+        assert_eq!(
+            wave_orders(&forward),
+            wave_orders(&reversed),
+            "wave order must be independent of input array ordering",
+        );
+    }
+
+    #[test]
+    fn wave_order_cross_entity_flow_is_one_chapter_and_events_keep_their_aggregate() {
+        // A saga spanning two aggregates (entities). The whole causal flow is
+        // ONE chapter (a horizontal story), but each event stays in its own
+        // aggregate's swim lane — an event is tied to exactly one entity (its
+        // aggregate), and the wave pass NEVER rewrites entityId. Heal-prefixed
+        // slice ids so chapter-per-flow applies.
+        let mut model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [],
+            "entities": [
+                { "id": "ent-acct",   "name": "Acct",   "order": 0 },
+                { "id": "ent-ledger", "name": "Ledger", "order": 1 }
+            ],
+            "slices": [
+                { "id": "slice-heal-1", "name": "OpenAccount",   "chapterId": null, "order": 0 },
+                { "id": "slice-heal-2", "name": "PostLedger",    "chapterId": null, "order": 0 },
+                { "id": "slice-heal-3", "name": "RecordPosting", "chapterId": null, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "c1", "type": "command", "name": "OpenAccount",    "sliceId": "slice-heal-1", "entityId": "ent-acct" },
+                { "id": "e1", "type": "event",   "name": "AccountOpened",  "sliceId": "slice-heal-1", "entityId": "ent-acct" },
+                { "id": "i1", "type": "integration", "name": "PostLedger", "sliceId": "slice-heal-2", "kind": "inbound" },
+                { "id": "c2", "type": "command", "name": "RecordPosting",  "sliceId": "slice-heal-3", "entityId": "ent-ledger" },
+                { "id": "e2", "type": "event",   "name": "PostingRecorded","sliceId": "slice-heal-3", "entityId": "ent-ledger" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent",       "sourceId": "c1", "targetId": "e1" },
+                { "id": "x2", "type": "eventTriggersIntegration",   "sourceId": "e1", "targetId": "i1" },
+                { "id": "x3", "type": "integrationTriggersCommand", "sourceId": "i1", "targetId": "c2" },
+                { "id": "x4", "type": "commandProducesEvent",       "sourceId": "c2", "targetId": "e2" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let inspection = ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![],
+        };
+        let diff = compute_diff(&model, &inspection);
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+
+        // One chapter for the whole cross-entity flow.
+        let chapters = model["chapters"].as_array().unwrap();
+        assert_eq!(
+            chapters.len(),
+            1,
+            "a cross-entity flow is a single chapter; got {chapters:?}",
+        );
+        let chapter_id = chapters[0]["id"].as_str().unwrap();
+        for s in model["slices"].as_array().unwrap() {
+            assert_eq!(
+                s["chapterId"].as_str(),
+                Some(chapter_id),
+                "every slice in the flow shares the one chapter",
+            );
+        }
+
+        // Wave order spans the saga left-to-right across the two aggregates.
+        let order = |name: &str| {
+            model["slices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .unwrap()["order"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(order("OpenAccount") < order("PostLedger"));
+        assert!(order("PostLedger") < order("RecordPosting"));
+
+        // Events stay tied to their aggregate — entityId is never rewritten.
+        let entity_of = |id: &str| {
+            model["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == id)
+                .unwrap()["entityId"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            entity_of("e1"),
+            "ent-acct",
+            "AccountOpened stays in the Acct aggregate's swim lane",
+        );
+        assert_eq!(
+            entity_of("e2"),
+            "ent-ledger",
+            "PostingRecorded stays in the Ledger aggregate's swim lane",
+        );
     }
 }

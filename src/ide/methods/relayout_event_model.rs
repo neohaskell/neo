@@ -177,6 +177,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relayout_orders_slices_by_wave_and_is_fixed_point() {
+        // A spaghetti model: stored slice order (First=0, Second=1, Third=2)
+        // is the REVERSE of the causal flow. The flow is Third(initializer
+        // command) -> Second(integration) -> First(triggered command), wired
+        // by an eventTriggersIntegration + integrationTriggersCommand chain.
+        // Relayout must reorder by the wave (Third < Second < First) and be a
+        // fixed point on the second call. No NeoHaskell project in the
+        // workspace, so only the layout/wave pass runs (no materialisation).
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "s1", "name": "First",  "chapterId": null, "order": 0 },
+                { "id": "s2", "name": "Second", "chapterId": null, "order": 1 },
+                { "id": "s3", "name": "Third",  "chapterId": null, "order": 2 }
+            ],
+            "nodes": [
+                { "id": "c0", "type": "command", "name": "Initiate",  "sliceId": "s3", "entityId": "e" },
+                { "id": "e0", "type": "event",   "name": "Initiated", "sliceId": "s3", "entityId": "e" },
+                { "id": "i0", "type": "integration", "name": "Bridge", "sliceId": "s2", "kind": "inbound" },
+                { "id": "c1", "type": "command", "name": "Continue",  "sliceId": "s1", "entityId": "e" },
+                { "id": "e1", "type": "event",   "name": "Continued", "sliceId": "s1", "entityId": "e" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent",       "sourceId": "c0", "targetId": "e0" },
+                { "id": "x2", "type": "eventTriggersIntegration",   "sourceId": "e0", "targetId": "i0" },
+                { "id": "x3", "type": "integrationTriggersCommand", "sourceId": "i0", "targetId": "c1" },
+                { "id": "x4", "type": "commandProducesEvent",       "sourceId": "c1", "targetId": "e1" }
+            ],
+            "layout": {
+                "nodePositions": {
+                    "c0": { "x": 800, "y": 120 }, "e0": { "x": 800, "y": 400 },
+                    "i0": { "x": 400, "y": 120 },
+                    "c1": { "x": 40,  "y": 120 }, "e1": { "x": 40,  "y": 400 }
+                },
+                "viewport": { "x": 0, "y": 0, "zoom": 1 }
+            }
+        });
+        let model_path = workspace.join("event-model.json");
+        std::fs::write(&model_path, serde_json::to_string_pretty(&model).unwrap()).unwrap();
+
+        let session = fixture_session(workspace);
+        let result = handle(session, RelayoutEventModelParams {}).await.unwrap();
+        assert!(result.applied > 0, "relayout should reorder; summary={}", result.summary);
+
+        // Verify the wave order: Third (initializer) before Second before First.
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+        let order_of = |name: &str| {
+            patched["slices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == name)
+                .unwrap()["order"]
+                .as_f64()
+                .unwrap()
+        };
+        assert!(
+            order_of("Third") < order_of("Second") && order_of("Second") < order_of("First"),
+            "wave order should be Third < Second < First; got Third={}, Second={}, First={}",
+            order_of("Third"), order_of("Second"), order_of("First"),
+        );
+
+        // Second relayout is a no-op — the model is now canonical.
+        let after_first = std::fs::read_to_string(&model_path).unwrap();
+        let session2 = fixture_session(workspace);
+        let result2 = handle(session2, RelayoutEventModelParams {}).await.unwrap();
+        assert_eq!(result2.applied, 0, "second relayout must be a fixed point; summary={}", result2.summary);
+        assert_eq!(
+            std::fs::read_to_string(&model_path).unwrap(),
+            after_first,
+            "second relayout must leave the file byte-identical",
+        );
+    }
+
+    #[tokio::test]
     async fn relayout_returns_zero_applied_when_file_already_canonical() {
         // No NeoHaskell project, valid model with positioned nodes in
         // the right bands → relayout has nothing to do.

@@ -26,7 +26,7 @@ export function FileMenu({
   healing,
   relayouting,
 }: FileMenuProps) {
-  // Open / Save / Heal / Re-layout all flow through `neo ide`'s
+  // Open / Save / Heal / Tidy by flow all flow through `neo ide`'s
   // JSON-RPC bridge — they operate on `<workspace_root>/event-model.json`,
   // not a browser file picker.
   return (
@@ -44,9 +44,9 @@ export function FileMenu({
         className={relayoutBtnClass}
         onClick={onRelayout}
         disabled={relayouting || healing}
-        title="Clean up layout (chapters, slice columns, node positions) without changing the model structure or spawning the AI."
+        title="Order slices and chapters left-to-right by the event-modeling wave (initializer commands first), and clean up columns & node positions — no structural changes, no AI."
       >
-        {relayouting ? 'Re-laying out…' : 'Re-layout'}
+        {relayouting ? 'Tidying…' : 'Tidy by flow'}
       </button>
       <button
         className={healBtnClass}

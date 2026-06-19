@@ -313,33 +313,33 @@ function App() {
     applyReadResult(reload)
   }, [applyReadResult, dirty])
 
-  // Quick "Re-layout" button (FileMenu). Runs the deterministic layout
-  // pass server-side — no LLM, no model structural changes — and reloads
-  // the file. Disabled when a heal is in flight (mutual exclusion).
+  // "Tidy by flow" button (FileMenu). Runs the deterministic layout +
+  // wave-ordering pass server-side — no LLM, no model structural changes —
+  // and reloads the file. Disabled when a heal is in flight (mutual exclusion).
   const handleRelayout = useCallback(async () => {
     const client = clientRef.current
     if (!client) {
-      setToastMessage('not connected to neo — cannot re-layout')
+      setToastMessage('not connected to neo — cannot tidy')
       return
     }
     if (dirty) {
       const confirmed = window.confirm(
-        'You have unsaved changes. Re-layout will overwrite the file on disk; your unsaved work will be discarded on reload. Continue?',
+        'You have unsaved changes. Tidy by flow will overwrite the file on disk; your unsaved work will be discarded on reload. Continue?',
       )
       if (!confirmed) return
     }
     setRelayouting(true)
     const res = await relayoutEventModel(client)
     if (!res.ok) {
-      setToastMessage(`Re-layout failed: ${res.error.message}`)
+      setToastMessage(`Tidy by flow failed: ${res.error.message}`)
       setRelayouting(false)
       return
     }
     if (res.result.applied === 0) {
-      setToastMessage('Layout already canonical — no changes.')
+      setToastMessage('Already tidy — slices already follow the flow.')
     } else {
       setToastMessage(
-        `Re-layout applied ${res.result.applied} fix${res.result.applied === 1 ? '' : 'es'}.`,
+        `Tidied by flow — ${res.result.applied} change${res.result.applied === 1 ? '' : 's'}.`,
       )
     }
     const reload = await readEventModel(client)
