@@ -35,9 +35,16 @@ export interface WriteEventModelResult {
 export type HealOutcome =
   | { status: 'healed' }
   | { status: 'stillInvalid'; errors: ValidationError[] }
+  | { status: 'cancelled'; deterministicApplied: number }
 
 export interface HealEventModelResult {
   outcome: HealOutcome
+}
+
+export interface CancelHealEventModelResult {
+  /** `true` when a heal was in flight and the cancel signal fired.
+   *  `false` when nothing was running (no-op cancel — safe to ignore). */
+  cancelled: boolean
 }
 
 export function readEventModel(
@@ -72,5 +79,39 @@ export function healEventModel(
   return client.request<{ mode: HealMode }, HealEventModelResult>(
     'workspace/healEventModel',
     { mode },
+  )
+}
+
+/** Abort an in-flight `healEventModel` request. The server kills the
+ *  `claude` subprocess (if running) and persists whatever the
+ *  deterministic pre-pass already patched. The in-flight `healEventModel`
+ *  promise will resolve with `outcome.status === 'cancelled'`. */
+export function cancelHealEventModel(
+  client: IdeClient,
+): Promise<RpcResult<CancelHealEventModelResult>> {
+  return client.request<Record<string, never>, CancelHealEventModelResult>(
+    'workspace/cancelHealEventModel',
+    {},
+  )
+}
+
+export interface RelayoutEventModelResult {
+  /** Number of layout fixes applied. 0 = file's layout was already canonical. */
+  applied: number
+  /** Short human-readable summary of what changed. */
+  summary: string
+}
+
+/** Run the deterministic layout pass ONLY — chapter grouping, y-band
+ *  fixes, slice-column rebalance, missing-position fills. Does NOT add
+ *  any nodes/edges/entities and never spawns the AI agent. Use this when
+ *  the user wants to clean up the canvas layout without touching the
+ *  model's structure. */
+export function relayoutEventModel(
+  client: IdeClient,
+): Promise<RpcResult<RelayoutEventModelResult>> {
+  return client.request<Record<string, never>, RelayoutEventModelResult>(
+    'workspace/relayoutEventModel',
+    {},
   )
 }

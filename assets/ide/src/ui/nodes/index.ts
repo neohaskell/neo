@@ -7,6 +7,7 @@ import { UIPlaceholderNodeComponent } from './UIPlaceholderNode'
 import { EntityLaneNodeComponent } from './EntityLaneNode'
 import { SliceColumnNodeComponent } from './SliceColumnNode'
 import { ChapterArrowNodeComponent } from './ChapterArrowNode'
+import { SubmodelBandNodeComponent } from './SubmodelBandNode'
 
 export const nodeTypes: NodeTypes = {
   event: EventNodeComponent,
@@ -17,4 +18,5 @@ export const nodeTypes: NodeTypes = {
   entityLane: EntityLaneNodeComponent,
   sliceColumn: SliceColumnNodeComponent,
   chapterArrow: ChapterArrowNodeComponent,
+  submodelBand: SubmodelBandNodeComponent,
 }

@@ -17,6 +17,7 @@ import '@xyflow/react/dist/style.css'
 import { nodeTypes } from './nodes'
 import { toReactFlowNodes, toReactFlowEdges } from './adapter'
 import { buildGridNodes, computeSliceLayouts, computeEntityLaneLayouts, getEntityAtY, CHAPTER_ARROW_Y, type SliceLayout } from './layout/grid'
+import { buildSubmodelBandNodes, submodelsInUse } from './layout/submodels'
 import type { EventModel } from '../model/types'
 
 interface CanvasProps {
@@ -35,6 +36,9 @@ interface CanvasProps {
   onChapterRename?: (chapterId: string, name: string) => void
   onChapterSliceRange?: (chapterId: string, startSliceId: string, endSliceId: string) => void
   onChapterDelete?: (chapterId: string) => void
+  onSubmodelRename?: (submodelId: string, name: string) => void
+  onSubmodelDelete?: (submodelId: string) => void
+  onAssignChapterToSubmodel?: (chapterId: string, submodelId: string | null) => void
   flashingSliceId?: string | null
   flashingEntityId?: string | null
 }
@@ -81,6 +85,9 @@ export function Canvas({
   onChapterRename,
   onChapterSliceRange,
   onChapterDelete,
+  onSubmodelRename,
+  onSubmodelDelete,
+  onAssignChapterToSubmodel,
   flashingSliceId,
   flashingEntityId,
 }: CanvasProps) {
@@ -173,15 +180,34 @@ export function Canvas({
       model, onEntityRename, onSliceRename, activeHighlight, flashingSliceId,
       handleSliceSelect, highlightedEntityId, flashingEntityId, selectedEntityId,
       handleEntitySelect, onChapterRename, selectedChapterId, handleChapterSelect,
-      handleChapterEndDrag, handleChapterEndDrop,
+      handleChapterEndDrag, handleChapterEndDrop, model.submodels, onAssignChapterToSubmodel,
     ),
-    [model, onEntityRename, onSliceRename, activeHighlight, flashingSliceId, handleSliceSelect, highlightedEntityId, flashingEntityId, selectedEntityId, handleEntitySelect, onChapterRename, selectedChapterId, handleChapterSelect, handleChapterEndDrag, handleChapterEndDrop],
+    [model, onEntityRename, onSliceRename, activeHighlight, flashingSliceId, handleSliceSelect, highlightedEntityId, flashingEntityId, selectedEntityId, handleEntitySelect, onChapterRename, selectedChapterId, handleChapterSelect, handleChapterEndDrag, handleChapterEndDrop, onAssignChapterToSubmodel],
   )
 
-  // Grid nodes (background) come first, then domain nodes (foreground)
+  const submodelBandNodes = useMemo(
+    () => buildSubmodelBandNodes(model, onSubmodelRename, onSubmodelDelete),
+    [model, onSubmodelRename, onSubmodelDelete],
+  )
+
+  // When submodels are in use they become the vertical organiser. The
+  // entity swim-lanes (full-width horizontal bands) and slice columns
+  // (full-height vertical strips) both assume ONE shared timeline, so they
+  // visually fight the stacked bands — suppress them and let the submodel
+  // bands carry the grouping. Chapter arrows stay (they host the
+  // submodel-assignment control).
+  const inUseSubmodels = submodelsInUse(model)
+
+  // Background nodes first (submodel bands behind everything), then domain nodes.
   const modelNodes = useMemo(
-    () => [...gridNodes.entityLaneNodes, ...gridNodes.sliceColumnNodes, ...gridNodes.chapterArrowNodes, ...domainNodes],
-    [gridNodes, domainNodes],
+    () => [
+      ...submodelBandNodes,
+      ...(inUseSubmodels ? [] : gridNodes.entityLaneNodes),
+      ...(inUseSubmodels ? [] : gridNodes.sliceColumnNodes),
+      ...gridNodes.chapterArrowNodes,
+      ...domainNodes,
+    ],
+    [submodelBandNodes, inUseSubmodels, gridNodes, domainNodes],
   )
 
   const [nodes, setNodes] = useState<Node[]>(modelNodes)
@@ -373,7 +399,7 @@ export function Canvas({
         deleteKeyCode="Backspace"
         zoomOnDoubleClick={false}
         fitView
-        fitViewOptions={{ nodes: nodes.filter((n) => n.type !== 'entityLane' && n.type !== 'sliceColumn' && n.type !== 'chapterArrow') }}
+        fitViewOptions={{ nodes: nodes.filter((n) => n.type !== 'entityLane' && n.type !== 'sliceColumn' && n.type !== 'chapterArrow' && n.type !== 'submodelBand') }}
       >
         <Background />
         <Controls />

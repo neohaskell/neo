@@ -12,5 +12,13 @@ export function serialize(model: EventModel): string {
 }
 
 export function deserialize(json: string): EventModel {
-  return JSON.parse(json) as EventModel
+  const parsed = JSON.parse(json) as EventModel
+  // `submodels` is a newer, optional-on-disk field (the Rust schema does not
+  // require it). Normalise its absence to an empty array so every in-memory
+  // model satisfies the `EventModel` type and the layout code can treat it
+  // uniformly. Chapters keep `submodelId` as-is (undefined ≡ ungrouped).
+  if (!Array.isArray(parsed.submodels)) {
+    return { ...parsed, submodels: [] }
+  }
+  return parsed
 }

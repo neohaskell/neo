@@ -261,4 +261,34 @@ describe('autoLayoutMissingPositions', () => {
     const out = autoLayoutMissingPositions(withNodes)
     expect(out.layout.nodePositions.lonely).toBeDefined()
   })
+
+  it('does NOT band-snap a node that belongs to a submodel', () => {
+    // A command inside a submodel band legitimately sits far below the
+    // global command band (y = 1020). The absolute y-band rule must not
+    // yank it back to y ≈ 120, or vertical stacking would be destroyed.
+    const model: EventModel = {
+      id: 'm',
+      name: 'demo',
+      submodels: [{ id: 'sm1', name: 'Feature', order: 0 }],
+      chapters: [{ id: 'c1', name: 'C', order: 0, submodelId: 'sm1' }],
+      entities: [],
+      slices: [{ id: 's1', name: 'S', chapterId: 'c1', order: 0 }],
+      nodes: [{ id: 'cmd', type: 'command', name: 'Do', entityId: null, sliceId: 's1' }],
+      edges: [],
+      layout: {
+        nodePositions: { cmd: { x: 60, y: 1020 } },
+        viewport: { x: 0, y: 0, zoom: 1 },
+      },
+    }
+    const out = autoLayoutMissingPositions(model)
+    expect(out.layout.nodePositions.cmd).toEqual({ x: 60, y: 1020 })
+    // Same node WITHOUT submodel membership IS snapped back into band.
+    const ungrouped: EventModel = {
+      ...model,
+      submodels: [],
+      chapters: [{ id: 'c1', name: 'C', order: 0, submodelId: null }],
+    }
+    const snapped = autoLayoutMissingPositions(ungrouped)
+    expect(snapped.layout.nodePositions.cmd.y).toBeLessThan(300)
+  })
 })

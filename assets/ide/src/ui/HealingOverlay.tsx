@@ -13,9 +13,16 @@ interface HealingOverlayProps {
   /** Live tail of claude's output, streamed via `$/progress` notifications.
    *  Newest line at the bottom. Empty array shows just the spinner. */
   log?: HealLogLine[]
+  /** Click handler for the Cancel button in the overlay header. When
+   *  omitted, the button is not rendered (useful for the rare callers
+   *  that just want a non-interruptible overlay). */
+  onCancel?: () => void
+  /** Disable the Cancel button while a cancel is already in flight, so
+   *  rapid double-clicks don't fire repeat `cancelHealEventModel` calls. */
+  cancelling?: boolean
 }
 
-export function HealingOverlay({ message, log }: HealingOverlayProps) {
+export function HealingOverlay({ message, log, onCancel, cancelling }: HealingOverlayProps) {
   const scrollerRef = useRef<HTMLDivElement>(null)
 
   // Parse the raw streamed lines into a typed timeline of "thoughts".
@@ -48,6 +55,17 @@ export function HealingOverlay({ message, log }: HealingOverlayProps) {
               ? 'waiting for the agent…'
               : `${events.length} ${events.length === 1 ? 'step' : 'steps'}`}
           </div>
+          {onCancel && (
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={cancelling}
+              data-testid="heal-cancel"
+              className="px-3 py-1.5 text-xs rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
+            >
+              {cancelling ? 'Cancelling…' : 'Cancel'}
+            </button>
+          )}
         </div>
         <div
           ref={scrollerRef}
@@ -138,6 +156,55 @@ function HealEventCard({ event }: { event: HealEvent }) {
           {event.label}…
         </div>
       )
+    case 'auto_repair':
+      return (
+        <div
+          data-testid="heal-event-auto-repair"
+          className="border border-emerald-300 bg-emerald-50 rounded-md px-3 py-2"
+        >
+          <div className="flex items-center gap-2 text-sm text-emerald-900">
+            <span aria-hidden className="text-emerald-600 font-semibold">✓</span>
+            <span className="font-medium">Auto-repaired {event.appliedCount}{' '}
+              {event.appliedCount === 1 ? 'item' : 'items'}</span>
+            {event.residualCount > 0 && (
+              <span className="text-emerald-700">
+                · {event.residualCount} residual{event.residualCount === 1 ? '' : 's'} need
+                LLM
+              </span>
+            )}
+          </div>
+          {event.summary && (
+            <div className="text-xs text-emerald-800/80 mt-0.5">{event.summary}</div>
+          )}
+        </div>
+      )
+    case 'api_retry': {
+      const reason =
+        event.errorStatus === 529
+          ? 'Anthropic API is overloaded'
+          : event.errorStatus === 429
+            ? 'Anthropic API rate-limited the request'
+            : `Anthropic API returned HTTP ${event.errorStatus} (${event.error})`
+      const delaySec = (event.delayMs / 1000).toFixed(1)
+      return (
+        <div
+          data-testid="heal-event-api-retry"
+          className="border border-amber-200 bg-amber-50 rounded-md px-3 py-2"
+        >
+          <div className="flex items-center gap-2 text-sm text-amber-900">
+            <div
+              aria-hidden
+              className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin shrink-0"
+            />
+            <span className="font-medium">{reason}.</span>
+            <span className="text-amber-700">
+              retrying attempt {event.attempt}
+              {event.maxRetries > 0 && `/${event.maxRetries}`} in {delaySec}s…
+            </span>
+          </div>
+        </div>
+      )
+    }
     case 'raw':
       return (
         <div

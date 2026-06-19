@@ -7,6 +7,7 @@ interface ToolbarProps {
   onAddEntity: () => void
   onAddSlice: () => void
   onAddChapter: () => void
+  onAddSubmodel: () => void
 }
 
 const btnClass =
@@ -21,6 +22,7 @@ export function Toolbar({
   onAddEntity,
   onAddSlice,
   onAddChapter,
+  onAddSubmodel,
 }: ToolbarProps) {
   return (
     <div className="flex gap-2 p-2 border-b border-gray-200 bg-white flex-wrap">
@@ -48,6 +50,9 @@ export function Toolbar({
       </button>
       <button className={`${btnClass}`} onClick={onAddChapter}>
         + Chapter
+      </button>
+      <button className={`${btnClass} bg-indigo-100 text-indigo-800`} onClick={onAddSubmodel}>
+        + Submodel
       </button>
     </div>
   )

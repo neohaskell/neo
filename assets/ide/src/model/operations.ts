@@ -10,6 +10,7 @@ import type {
   Entity,
   Chapter,
   Slice,
+  Submodel,
 } from './types'
 
 let counter = 0
@@ -24,6 +25,7 @@ export function createEventModel(name: string): EventModel {
     id: uid(),
     name,
     chapters: [],
+    submodels: [],
     entities: [],
     nodes: [],
     edges: [],
@@ -333,6 +335,63 @@ export function removeChapter(
     chapters: model.chapters.filter((c) => c.id !== chapterId),
     slices: model.slices.map((s) =>
       s.chapterId === chapterId ? { ...s, chapterId: null } : s,
+    ),
+  }
+}
+
+// ── Submodels (vertical feature bands grouping chapters) ────
+
+export function addSubmodel(
+  model: EventModel,
+  params: { name: string },
+): EventModel {
+  const submodel: Submodel = {
+    id: uid(),
+    name: params.name,
+    order: model.submodels.length,
+  }
+  return { ...model, submodels: [...model.submodels, submodel] }
+}
+
+export function renameSubmodel(
+  model: EventModel,
+  submodelId: string,
+  name: string,
+): EventModel {
+  return {
+    ...model,
+    submodels: model.submodels.map((s) =>
+      s.id === submodelId ? { ...s, name } : s,
+    ),
+  }
+}
+
+/** Remove a submodel and detach (do not delete) any chapters it owned. */
+export function removeSubmodel(
+  model: EventModel,
+  submodelId: string,
+): EventModel {
+  return {
+    ...model,
+    submodels: model.submodels.filter((s) => s.id !== submodelId),
+    chapters: model.chapters.map((c) =>
+      c.submodelId === submodelId ? { ...c, submodelId: null } : c,
+    ),
+  }
+}
+
+/** Assign a chapter to a submodel (or detach it when `submodelId` is null). */
+export function assignChapterToSubmodel(
+  model: EventModel,
+  chapterId: string,
+  submodelId: string | null,
+): EventModel {
+  if (!model.chapters.some((c) => c.id === chapterId)) return model
+  if (submodelId !== null && !model.submodels.some((s) => s.id === submodelId)) return model
+  return {
+    ...model,
+    chapters: model.chapters.map((c) =>
+      c.id === chapterId ? { ...c, submodelId } : c,
     ),
   }
 }

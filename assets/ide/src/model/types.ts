@@ -132,6 +132,17 @@ export interface Chapter {
   readonly id: string
   readonly name: string
   readonly order: number // left to right ordering
+  readonly submodelId?: string | null // owning submodel (vertical band); null/absent = ungrouped
+}
+
+// A submodel is a FEATURE-level grouping that owns one or more chapters
+// (which in turn own slices). Submodels stack vertically (top to bottom by
+// `order`) so a large model reads as a vertical list of self-contained
+// features instead of one endless horizontal timeline.
+export interface Submodel {
+  readonly id: string
+  readonly name: string
+  readonly order: number // top to bottom ordering
 }
 
 // ── Layout ──────────────────────────────────────────────────
@@ -158,6 +169,7 @@ export interface EventModel {
   readonly id: string
   readonly name: string
   readonly chapters: readonly Chapter[]
+  readonly submodels: readonly Submodel[]
   readonly entities: readonly Entity[]
   readonly nodes: readonly ModelNode[]
   readonly edges: readonly ModelEdge[]

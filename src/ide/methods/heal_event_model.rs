@@ -25,6 +25,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 
 use crate::errors::NeoError;
+use crate::ide::heal::apply::apply_diff;
+use crate::ide::heal::diff::{compute_diff, HealDiff};
 use crate::ide::methods::read_event_model::EVENT_MODEL_FILENAME;
 use crate::ide::session::Session;
 use crate::ide::validate::{self, ErrorKind, ValidationError, ValidationOutcome, SCHEMA_JSON};
@@ -57,6 +59,11 @@ pub enum HealMode {
 pub enum HealOutcome {
     Healed,
     StillInvalid { errors: Vec<ValidationError> },
+    /// User clicked Cancel on the heal overlay while the LLM was running.
+    /// The subprocess was killed; the deterministic pre-pass's patches
+    /// (if any) were still written to disk so the user keeps the free
+    /// wins. `deterministicApplied` is the count from that pre-pass.
+    Cancelled { deterministic_applied: usize },
 }
 
 #[derive(Debug, Serialize)]
@@ -67,7 +74,12 @@ pub struct HealEventModelResult {
 
 /// Knobs that production callers don't touch but tests override. Production
 /// goes through `handle(...)` which uses `HealConfig::default()` — `claude`
-/// on PATH, 5-minute timeout.
+/// on PATH, 15-minute timeout. The budget covers (a) sonnet/opus thinking
+/// at ~5k–20k tokens streamed at human-readable rate, (b) several Read
+/// tool calls against the workspace, (c) the final StructuredOutput emit,
+/// AND (d) any 529 backoff cycles (up to 10 retries with growing delays —
+/// 30s+ on a bad Anthropic capacity day). 5 minutes was the original v1
+/// number and turned out to clip real heals against medium-sized models.
 #[derive(Debug, Clone)]
 pub struct HealConfig {
     /// Path to the `claude` binary. Default: `"claude"` (resolved via PATH).
@@ -80,7 +92,7 @@ impl Default for HealConfig {
     fn default() -> Self {
         Self {
             claude_binary: PathBuf::from("claude"),
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_secs(900),
         }
     }
 }
@@ -100,37 +112,141 @@ pub(crate) async fn handle_with_config(
     let path = session.workspace.root.join(EVENT_MODEL_FILENAME);
     tracing::info!(path = %path.display(), ?mode, "heal: starting");
 
-    let content = std::fs::read_to_string(&path).map_err(|e| {
+    let original_content = std::fs::read_to_string(&path).map_err(|e| {
         NeoError::io_at(
             "reading `event-model.json` to start healing",
             path.clone(),
             e,
         )
     })?;
+    let workspace_root = session.workspace.root.clone();
 
-    let initial_errors = match validate::validate_event_model(&content) {
-        ValidationOutcome::Valid => {
-            if mode == HealMode::Validate {
-                tracing::info!("heal: file already valid, no-op (mode=validate)");
-                return Ok(HealEventModelResult {
-                    outcome: HealOutcome::Healed,
-                });
-            }
-            tracing::info!(
-                "heal: file already valid but mode=improve — running claude anyway to refine layout/edges",
-            );
-            Vec::new()
+    // ───── Phase 1: deterministic pre-pass ─────────────────────────────
+    //
+    // The vast majority of heal repairs are mechanical: missing edges
+    // implied by `command.produces`, `query.subscribes_to`, etc. We do
+    // those in Rust against a parsed `ProjectInspection` and never burn
+    // an LLM round-trip on them. Only fuzzy residuals (missing nodes,
+    // typos, orphans) trickle through to claude.
+    let inspection_t0 = Instant::now();
+    let inspection = crate::inspect::inspect_project(&workspace_root);
+    let inspection_ms = inspection_t0.elapsed().as_millis();
+
+    let mut patched_value: Option<serde_json::Value> = serde_json::from_str(&original_content).ok();
+    let mut patched_content = original_content.clone();
+    let mut deterministic_diff: Option<HealDiff> = None;
+    let mut deterministic_applied = 0usize;
+
+    // Run the deterministic pass UNCONDITIONALLY when the JSON parses.
+    // When the inspection is empty (non-NeoHaskell workspace), compute_diff
+    // skips its node-materialisation + orphan-detection sections but still
+    // produces position fixes and layout entries — that's the "just clean
+    // up positions on a hand-authored file" path.
+    if let Some(value) = patched_value.as_mut() {
+        let diff_t0 = Instant::now();
+        let diff = compute_diff(value, &inspection);
+        let applied = if diff.applied_count() > 0 {
+            apply_diff(value, &diff)
+        } else {
+            0
+        };
+        let diff_ms = diff_t0.elapsed().as_millis();
+        tracing::info!(
+            domains = inspection.domains.len(),
+            inspection_ms = inspection_ms,
+            diff_ms = diff_ms,
+            summary = %diff.summary(),
+            applied = applied,
+            "heal: deterministic pre-pass complete",
+        );
+        if applied > 0 {
+            patched_content = serde_json::to_string_pretty(value).map_err(|e| {
+                NeoError::HealingFailed {
+                    reason: format!(
+                        "could not re-serialise model after deterministic patch: {e}"
+                    ),
+                    stderr_tail: String::new(),
+                }
+            })?;
         }
-        ValidationOutcome::Invalid { errors } => {
-            tracing::info!(
-                error_count = errors.len(),
-                first_pointer = %errors.first().map(|e| e.pointer.as_str()).unwrap_or(""),
-                "heal: schema/referential errors detected",
+        deterministic_applied = applied;
+        deterministic_diff = Some(diff);
+    }
+
+    // Surface what the deterministic pass did to the frontend overlay so
+    // the user sees the free wins before any LLM cost.
+    if let Some(ref diff) = deterministic_diff {
+        if deterministic_applied > 0 || !diff.residuals.is_empty() {
+            session.notify(
+                "$/progress",
+                serde_json::json!({
+                    "token": "healEventModel",
+                    "value": {
+                        "kind": "autoRepair",
+                        "appliedCount": deterministic_applied,
+                        "residualCount": diff.residuals.len(),
+                        "summary": diff.summary(),
+                    }
+                }),
             );
-            errors
         }
+    }
+
+    // Re-validate AFTER patching.
+    let validation_after = validate::validate_event_model(&patched_content);
+
+    // ───── Phase 2: decide whether the LLM is needed ───────────────────
+    //
+    // Two short-circuit paths skip claude entirely:
+    //   * Validate mode + file now valid + no residuals → done.
+    //   * Improve mode + file now valid + no residuals → done.
+    //   (Validate mode + invalid + residuals → still spawn, because
+    //    the diff couldn't fix everything.)
+    let residual_count = deterministic_diff
+        .as_ref()
+        .map(|d| d.residuals.len())
+        .unwrap_or(0);
+
+    let needs_llm = match (&validation_after, residual_count, mode) {
+        (ValidationOutcome::Valid, 0, _) => false,
+        (ValidationOutcome::Valid, _, HealMode::Validate) => {
+            // Validate mode is non-invasive: if the file passes validation
+            // we don't ask the LLM to add inferred nodes even if residuals
+            // exist. The user has to flip to Improve to opt in.
+            false
+        }
+        _ => true,
+    };
+
+    if !needs_llm {
+        if patched_content != original_content {
+            atomic_write(&path, &patched_content)?;
+            tracing::info!(
+                applied = deterministic_applied,
+                "heal: deterministic pass alone fixed the file — no LLM round-trip needed",
+            );
+        } else {
+            tracing::info!(
+                "heal: file already valid AND inspection matches — no-op",
+            );
+        }
+        session.notify(
+            "$/progress",
+            serde_json::json!({
+                "token": "healEventModel",
+                "value": { "kind": "end" }
+            }),
+        );
+        return Ok(HealEventModelResult {
+            outcome: HealOutcome::Healed,
+        });
+    }
+
+    // ───── Phase 3: shrink the prompt and spawn claude ────────────────
+    let initial_errors = match validation_after {
+        ValidationOutcome::Valid => Vec::new(),
+        ValidationOutcome::Invalid { errors } => errors,
         ValidationOutcome::MalformedJson { parse_error } => {
-            tracing::info!(parse_error = %parse_error, "heal: file is malformed JSON");
             vec![ValidationError {
                 pointer: String::new(),
                 message: format!(
@@ -140,7 +256,6 @@ pub(crate) async fn handle_with_config(
             }]
         }
         ValidationOutcome::NotFound => {
-            // Unreachable: `read_to_string` above would have returned NotFound.
             return Err(NeoError::io_at(
                 "reading `event-model.json` to start healing",
                 path,
@@ -149,25 +264,49 @@ pub(crate) async fn handle_with_config(
         }
     };
 
-    let workspace_root = session.workspace.root.clone();
-
-    // Pre-compute the NeoHaskell domain summary so the agent doesn't burn
-    // tool calls (and opus tokens) re-discovering it. When the summary is
-    // present we can demote to sonnet because the prompt is now a
-    // fill-in-the-blanks exercise, not an open-ended audit.
+    // Pick a model that fits the residual load. Tiny residuals → haiku
+    // (faster + cheaper). Bigger residuals on a NeoHaskell project →
+    // sonnet. No inspection at all → opus (open-ended audit).
     let project_summary = crate::commands::inspect::project_summary_for_prompt(&workspace_root);
-    let model_arg = if project_summary.is_some() {
-        "sonnet"
-    } else {
-        "opus"
-    };
+    let model_arg = pick_model(residual_count, initial_errors.len(), project_summary.is_some());
     tracing::info!(
         has_neo_summary = project_summary.is_some(),
+        residual_count = residual_count,
+        validation_errors = initial_errors.len(),
         model = model_arg,
-        "heal: composing prompt",
+        "heal: composing prompt for LLM pass",
     );
 
-    let prompt = build_prompt(&path, &workspace_root, project_summary.as_deref(), &initial_errors);
+    let prompt = build_prompt(
+        &path,
+        &workspace_root,
+        project_summary.as_deref(),
+        deterministic_diff.as_ref(),
+        deterministic_applied,
+        mode,
+        &patched_content,
+        &initial_errors,
+    );
+
+    // Structured-output wrapper. The agent's final message must be a
+    // JSON object whose `eventModel` field is the healed model. We
+    // validate that field ourselves with the embedded schema and write
+    // it to disk — the agent never touches the filesystem, so we can
+    // drop Edit/Write entirely.
+    let output_schema = serde_json::json!({
+        "type": "object",
+        "required": ["eventModel"],
+        "additionalProperties": false,
+        "properties": {
+            "eventModel": { "type": "object" },
+            "summary": { "type": "string" },
+            "changesMade": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        }
+    });
+    let output_schema_str = output_schema.to_string();
 
     // Flag list. `--max-turns` is NOT a valid claude flag (caused immediate
     // exit-1 in earlier iterations); use `--verbose` to make claude chatty
@@ -176,8 +315,14 @@ pub(crate) async fn handle_with_config(
         "-p".to_string(),
         "--add-dir".to_string(),
         workspace_root.display().to_string(),
+        // Read only — no Edit/Write/Bash. The agent should NOT need any
+        // tools (we inject everything in the prompt) but Read remains as
+        // an escape hatch for verifying NeoHaskell .hs files in edge
+        // cases the inspector summary didn't cover.
         "--allowed-tools".to_string(),
-        "Read,Edit,Write".to_string(),
+        "Read".to_string(),
+        "--json-schema".to_string(),
+        output_schema_str,
         "--model".to_string(),
         model_arg.to_string(),
         "--verbose".to_string(),
@@ -269,13 +414,34 @@ pub(crate) async fn handle_with_config(
         tokio::spawn(stream_lines(stderr, "stderr", buf, session))
     };
 
+    // Install the cancellation token in the session AFTER the subprocess
+    // is up. `cancelHealEventModel` reads `session.heal_cancel` and calls
+    // `notify_one()` — we race that signal against `child.wait()` and the
+    // timeout below. The guard clears the session slot on drop so the
+    // next heal doesn't see a stale notify.
+    let (cancel_notify, _cancel_guard) = session.install_heal_cancel();
+
     let start = Instant::now();
-    let status_result = tokio::time::timeout(config.timeout, child.wait()).await;
+    let timeout_fut = tokio::time::sleep(config.timeout);
+    let cancel_fut = cancel_notify.notified();
+    tokio::pin!(timeout_fut, cancel_fut);
+
+    enum RaceOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        TimedOut,
+        Cancelled,
+    }
+
+    let race = tokio::select! {
+        res = child.wait() => RaceOutcome::Exited(res),
+        _ = &mut timeout_fut => RaceOutcome::TimedOut,
+        _ = &mut cancel_fut => RaceOutcome::Cancelled,
+    };
     let elapsed = start.elapsed();
 
-    let status = match status_result {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
+    let status = match race {
+        RaceOutcome::Exited(Ok(s)) => s,
+        RaceOutcome::Exited(Err(e)) => {
             tracing::error!(error = %e, "heal: wait error on claude subprocess");
             // Best-effort drain so we don't leak the tasks.
             let _ = stdout_task.await;
@@ -285,7 +451,31 @@ pub(crate) async fn handle_with_config(
                 stderr_tail: String::new(),
             });
         }
-        Err(_) => {
+        RaceOutcome::Cancelled => {
+            tracing::info!("heal: user cancelled; killing claude subprocess");
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+
+            // Persist the deterministic pre-pass's patches so the user
+            // keeps the free wins on cancel. If nothing was patched, the
+            // file on disk is untouched.
+            if patched_content != original_content {
+                atomic_write(&path, &patched_content)?;
+            }
+            session.notify(
+                "$/progress",
+                serde_json::json!({
+                    "token": "healEventModel",
+                    "value": { "kind": "end" }
+                }),
+            );
+            return Ok(HealEventModelResult {
+                outcome: HealOutcome::Cancelled { deterministic_applied },
+            });
+        }
+        RaceOutcome::TimedOut => {
             tracing::warn!(
                 timeout_secs = config.timeout.as_secs(),
                 "heal: claude timed out, killing",
@@ -316,8 +506,21 @@ pub(crate) async fn handle_with_config(
                 },
             );
             let tail = collect_tail(&stderr_buf, 20);
+            let retry_count = count_api_retries(&stdout_buf);
+            let retry_hint = if retry_count > 0 {
+                format!(
+                    " (saw {retry_count} Anthropic API retry events during this run — \
+                     the API was returning HTTP 429/529; some of the budget was spent \
+                     on backoff. Try again, or check https://status.anthropic.com)"
+                )
+            } else {
+                String::new()
+            };
             return Err(NeoError::HealingFailed {
-                reason: format!("timed out after {} seconds", config.timeout.as_secs()),
+                reason: format!(
+                    "timed out after {} seconds{retry_hint}",
+                    config.timeout.as_secs()
+                ),
                 stderr_tail: tail,
             });
         }
@@ -379,45 +582,74 @@ pub(crate) async fn handle_with_config(
         });
     }
 
-    let new_content = std::fs::read_to_string(&path).map_err(|e| {
-        NeoError::io_at(
-            "re-reading `event-model.json` after healing",
-            path.clone(),
-            e,
-        )
-    })?;
+    // The agent's final assistant message (via `--json-schema`) is the
+    // healed model wrapped in a small envelope. We scan stdout for the
+    // stream-json `result` event, parse its `result` field, and write
+    // the embedded `eventModel` ourselves. This makes the agent purely
+    // a transformation function — no filesystem mutation.
+    let stdout_lines = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+    let healed_payload = match extract_structured_output(&stdout_lines) {
+        Ok(p) => p,
+        Err(reason) => {
+            tracing::error!(
+                error = %reason,
+                "heal: could not extract structured output from claude",
+            );
+            return Err(NeoError::HealingFailed {
+                reason: format!("agent returned no usable structured output: {reason}"),
+                stderr_tail: collect_tail(&stderr_buf, 20),
+            });
+        }
+    };
+    tracing::info!(
+        summary_chars = healed_payload.summary.as_ref().map(|s| s.len()).unwrap_or(0),
+        change_count = healed_payload.changes_made.as_ref().map(|v| v.len()).unwrap_or(0),
+        "heal: agent returned structured output",
+    );
+    if let Some(ref summary) = healed_payload.summary {
+        tracing::info!(summary = %summary, "heal: agent summary");
+    }
+    for change in healed_payload.changes_made.as_deref().unwrap_or(&[]) {
+        tracing::info!(change = %change, "heal: agent change");
+    }
+
+    let new_content =
+        serde_json::to_string_pretty(&healed_payload.event_model).map_err(|e| {
+            NeoError::HealingFailed {
+                reason: format!("could not serialise agent's eventModel to JSON: {e}"),
+                stderr_tail: String::new(),
+            }
+        })?;
 
     let outcome = match validate::validate_event_model(&new_content) {
         ValidationOutcome::Valid => {
-            tracing::info!("heal: file is now valid — healed");
+            atomic_write(&path, &new_content)?;
+            tracing::info!("heal: file is now valid — healed and saved");
             HealOutcome::Healed
         }
         ValidationOutcome::Invalid { errors } => {
             tracing::warn!(
                 remaining_errors = errors.len(),
-                "heal: file still has validation errors after claude exit",
+                "heal: agent's output still has validation errors — file NOT written",
             );
             HealOutcome::StillInvalid { errors }
         }
         ValidationOutcome::MalformedJson { parse_error } => {
-            tracing::warn!(parse_error = %parse_error, "heal: file still malformed JSON after claude exit");
+            tracing::warn!(
+                parse_error = %parse_error,
+                "heal: agent's output isn't valid JSON — file NOT written",
+            );
             HealOutcome::StillInvalid {
                 errors: vec![ValidationError {
                     pointer: String::new(),
                     message: format!(
-                        "file is still not valid JSON after healing: {parse_error}. The agent left a malformed document on disk — open it and inspect manually, or click Heal again."
+                        "the agent returned a JSON object whose `eventModel` field isn't valid JSON: {parse_error}. The file on disk is untouched."
                     ),
                     kind: ErrorKind::Schema,
                 }],
             }
         }
-        ValidationOutcome::NotFound => {
-            return Err(NeoError::io_at(
-                "re-reading `event-model.json` after healing",
-                path,
-                std::io::Error::from(std::io::ErrorKind::NotFound),
-            ));
-        }
+        ValidationOutcome::NotFound => unreachable!("validate never returns NotFound for in-memory content"),
     };
 
     session.notify(
@@ -481,6 +713,123 @@ async fn stream_lines<R>(
     }
 }
 
+/// Decoded structured-output envelope from the agent's final assistant
+/// message. The actual `event-model.json` content is `event_model`; the
+/// other fields are for surfacing in the heal log + future UI.
+struct HealedPayload {
+    event_model: serde_json::Value,
+    summary: Option<String>,
+    changes_made: Option<Vec<String>>,
+}
+
+/// Walk claude's streamed stdout lines looking for the `result` event
+/// (`{"type":"result","subtype":"success", ...}`). Under `--json-schema`,
+/// claude-code emits the schema-validated payload on a top-level
+/// `structured_output` field of that event — `result.result` continues
+/// to hold the human-readable closing assistant message, not the JSON.
+///
+/// We prefer `structured_output`. If absent (e.g. a future call without
+/// `--json-schema`, or older claude-code), we fall back to parsing
+/// `result.result` as a JSON string. If neither yields a usable payload,
+/// we return a reason naming both attempted paths.
+fn extract_structured_output(stdout_lines: &[String]) -> Result<HealedPayload, String> {
+    let mut last_result: Option<serde_json::Value> = None;
+    for line in stdout_lines {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("result") {
+            last_result = Some(value);
+        }
+    }
+    let result = last_result.ok_or_else(|| {
+        "no `{type:\"result\"}` event found in claude stdout".to_string()
+    })?;
+
+    let subtype = result
+        .get("subtype")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if subtype != "success" {
+        let reason = result
+            .get("result")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no detail)")
+            .chars()
+            .take(400)
+            .collect::<String>();
+        return Err(format!("claude reported result.subtype={subtype}: {reason}"));
+    }
+
+    // Prefer the top-level `structured_output` field: under `--json-schema`,
+    // claude-code emits the schema-validated payload there directly as an
+    // object (not as a stringified JSON). `result.result` holds the
+    // human-readable closing message in that case, not the JSON.
+    let payload: serde_json::Value = if let Some(so) = result.get("structured_output") {
+        if so.is_object() {
+            so.clone()
+        } else if let Some(s) = so.as_str() {
+            serde_json::from_str(s).map_err(|e| {
+                format!(
+                    "agent's `structured_output` field is a string but not valid JSON: {e}"
+                )
+            })?
+        } else {
+            return Err(format!(
+                "agent's `structured_output` field is neither an object nor a string: {so}"
+            ));
+        }
+    } else {
+        // Fallback: parse `result.result` as a JSON string. This is the
+        // shape claude-code produces without `--json-schema`.
+        let payload_str = result
+            .get("result")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                "result event has neither a top-level `structured_output` field \
+                 nor a `result` string to fall back on"
+                    .to_string()
+            })?;
+        serde_json::from_str(payload_str).map_err(|e| {
+            format!(
+                "agent's `result.result` is not valid JSON (no `structured_output` \
+                 field to fall back on either): {e}"
+            )
+        })?
+    };
+
+    let event_model = payload
+        .get("eventModel")
+        .cloned()
+        .ok_or_else(|| {
+            "agent's structured output is missing the required `eventModel` field".to_string()
+        })?;
+
+    let summary = payload
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let changes_made = payload
+        .get("changesMade")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+        });
+
+    Ok(HealedPayload {
+        event_model,
+        summary,
+        changes_made,
+    })
+}
+
 fn collect_tail(buf: &Arc<Mutex<Vec<String>>>, n: usize) -> String {
     let Ok(guard) = buf.lock() else {
         return String::new();
@@ -496,17 +845,45 @@ fn collect_all(buf: &Arc<Mutex<Vec<String>>>) -> String {
     guard.join("\n")
 }
 
+/// Count `{"type":"system","subtype":"api_retry",...}` events in a captured
+/// stdout buffer. Used in the timeout error to tell the user how much of
+/// the budget was eaten by Anthropic capacity backoffs.
+fn count_api_retries(buf: &Arc<Mutex<Vec<String>>>) -> usize {
+    let Ok(guard) = buf.lock() else {
+        return 0;
+    };
+    guard
+        .iter()
+        .filter(|line| {
+            // Cheap substring check first; fall back to JSON only on a hit.
+            line.contains("\"api_retry\"")
+                && serde_json::from_str::<serde_json::Value>(line.trim_start())
+                    .ok()
+                    .as_ref()
+                    .and_then(|v| v.get("subtype"))
+                    .and_then(|v| v.as_str())
+                    == Some("api_retry")
+        })
+        .count()
+}
+
+/// Build the LLM-pass prompt. The deterministic phase already handled
+/// the mechanical edge/kind/position work; this prompt only asks claude
+/// to resolve the residuals (missing nodes, orphans, schema violations
+/// the diff couldn't fix). Mode controls how aggressive the LLM should
+/// be about adding new nodes.
 fn build_prompt(
     path: &Path,
     workspace_root: &Path,
     project_summary: Option<&str>,
+    deterministic_diff: Option<&HealDiff>,
+    deterministic_applied: usize,
+    mode: HealMode,
+    current_file_content: &str,
     errors: &[ValidationError],
 ) -> String {
-    let errors_text = if errors.is_empty() {
-        "  (no schema or referential errors — the file already validates. \
-         Your job is to IMPROVE it: add missing edges between nodes whose \
-         names suggest a connection, and refine layout positions per the \
-         conventions below. Do not invent new nodes.)".to_string()
+    let validation_block = if errors.is_empty() {
+        "  (no schema or referential errors remain — the file currently validates.)".to_string()
     } else {
         errors
             .iter()
@@ -522,144 +899,173 @@ fn build_prompt(
             .join("\n")
     };
 
-    // When `neo inspect` ran successfully we paste a pre-computed,
-    // authoritative project summary into the prompt. The summary already
-    // lists every command/event/query/integration with their wiring, so
-    // the agent's job becomes a deterministic transcription — no greps,
-    // no `decide`-body parsing, no `handleEvent`-case scanning. We can
-    // also demote from opus to sonnet because the heavy lifting is done.
-    let neo_inspect_section = match project_summary {
+    // What did the deterministic pass already do? Showing this stops the
+    // LLM from second-guessing edges/kinds/positions that are already correct.
+    let auto_block = match deterministic_diff {
+        Some(diff) if deterministic_applied > 0 => format!(
+            "A deterministic Rust pre-pass already applied {applied} mechanical \
+             fixes against this file (compared the JSON to the NeoHaskell code's \
+             commands/events/queries/integrations). Specifically: {summary}. \
+             These are DONE — the model below already reflects them. Do not re-do \
+             this work; focus only on the residuals below.",
+            applied = deterministic_applied,
+            summary = diff.summary(),
+        ),
+        Some(_) | None => "No deterministic pre-pass changes were applied.".to_string(),
+    };
+
+    // The residuals are what's LEFT for the LLM — the fuzzy stuff the
+    // Rust pass intentionally punted on.
+    let residual_block = match deterministic_diff {
+        Some(diff) if !diff.residuals.is_empty() => {
+            let mut buf = String::from(
+                "The deterministic pre-pass identified residual issues it could \
+                 not fix without judgment. Resolve each one in your output:\n",
+            );
+            for r in &diff.residuals {
+                buf.push_str("  - ");
+                buf.push_str(&residual_to_human(r));
+                buf.push('\n');
+            }
+            buf
+        }
+        _ => "  (no residuals — the deterministic pass found no fuzzy issues.)".to_string(),
+    };
+
+    // ONE policy per mode. The Rust deterministic pre-pass now materialises
+    // every code-side symbol (commands / events / queries / integrations)
+    // and wires their edges; nothing in the residual list ever asks the LLM
+    // to "add a missing node". Whatever's left is fuzzy: orphaned model
+    // nodes that the code doesn't back, residual schema breakage that the
+    // diff couldn't fix, or in Improve mode polish work (chapter grouping,
+    // better slice/entity naming).
+    let mode_directive = match mode {
+        HealMode::Validate => {
+            "MODE = VALIDATE. Your job is the minimum repair needed for the file \
+             to satisfy the schema. Fix the listed validation errors. The \
+             deterministic pre-pass already created every node, slice, entity, \
+             and edge implied by the NeoHaskell code — do NOT add more. Touch \
+             only what's necessary to make validation pass and to resolve \
+             orphan-node residuals (rename a clear typo, otherwise leave alone)."
+        }
+        HealMode::Improve => {
+            "MODE = IMPROVE. The deterministic pre-pass already materialised \
+             every command / event / query / integration the NeoHaskell code \
+             declares and wired their edges. Your job is polish, not \
+             construction: rename auto-generated slice / entity names (e.g. \
+             from raw dir names like \"Orders\" to a cleaner form, or from a \
+             command name to a verb-phrase like \"Place Order\"), group slices \
+             into chapters when there's a clear narrative, and resolve orphan \
+             residuals. Do NOT add new commands / events / queries / \
+             integrations — if you think one is needed, leave a comment in \
+             `changesMade` instead."
+        }
+    };
+
+    let neo_summary_block = match project_summary {
         Some(summary) => format!(
-            "== Pre-computed NeoHaskell project summary ==\n\
-\n\
-The `neo inspect` tool has ALREADY discovered every domain/command/event/query/integration in this workspace and resolved their wiring. The block below is GROUND TRUTH — treat it as authoritative and DO NOT re-run discovery. Use it to drive every edit in step 2:\n  \
-  - Each entry under `domains[].commands[]` lists the events that command produces (extracted from its `decide` body).\n  \
-  - Each entry under `domains[].integrations[]` lists the events its `handleEvent` matches AND the commands it emits via `Command.Emit`. `kind = \"reactive\"` means it bridges domains (event in → command out). `kind = \"outbound\"` means it has external side effects only.\n  \
-  - Each entry under `domains[].queries[]` lists the event constructors referenced in the query file (best-guess subscriber set).\n  \
-  - The `wiring[]` block at the bottom is the inverted index: per event, who produces it, which queries feed off it, and which integrations listen for it.\n  \
-  - Node names in the summary are unqualified Haskell types (`OrderPlaced`, not `Order::OrderPlaced`); when matching them to the event model JSON's `name` field, compare unqualified.\n  \
-  - You SHOULD only need to Read a `.hs` file when the summary is ambiguous or when you need to verify a wiring edge case. Default: trust the summary and edit the JSON.\n\
-\n\
-```json\n\
-{summary}\n\
-```\n\
-\n",
+            "Pre-computed NeoHaskell domain summary (authoritative — driven by `neo inspect`):\n\n```json\n{summary}\n```\n",
             summary = summary,
         ),
         None => String::from(
-            "== Pre-computed NeoHaskell project summary ==\n\
-\n\
-(The `neo inspect` tool found no NeoHaskell domains in the workspace — fall back to live discovery via the conventions below.)\n\
-\n",
+            "(`neo inspect` found no NeoHaskell domains — work from the JSON below.)\n",
         ),
     };
 
     format!(
-        "You are healing a NeoHaskell event-model file used by the `neo ide` visual editor.\n\
+        "You are repairing residual issues in a NeoHaskell event-model JSON file.\n\
 \n\
 File: {file_path}\n\
-Workspace root: {workspace}\n\
+Workspace: {workspace}\n\
 \n\
-{neo_inspect}\
-== Step 0: read the NeoHaskell backend code before touching the model ==\n\
+{mode_directive}\n\
 \n\
-The workspace root above is a NeoHaskell project — event-sourced + CQRS Haskell. Commands, events, queries, and integrations all live as Haskell modules; the event model is a VISUAL SUMMARY of what's already implemented in code, not the spec for new behaviour. The code is GROUND TRUTH; this JSON file is a (potentially stale) projection of it. UI placeholders are a diagram-only convenience with NO backend counterpart — they may be removed in the future, so do NOT try to find them in the code.\n\
+== What the deterministic pre-pass already did ==\n\
+{auto_block}\n\
 \n\
-Conventions you can rely on in any NeoHaskell project (mirrors the testbed layout at `~/repos/NeoHaskell/testbed/src/Testbed/`):\n  \
-  - Each domain lives under `src/<App>/<Domain>/` (or `src/<Domain>/` for single-domain repos).\n  \
-  - `<Domain>/Core.hs` declares the entity record (`data <Domain>Entity = …`) and the event sum (`data <Domain>Event = EventA {{…}} | EventB {{…}} | …`). One constructor per event in the model.\n  \
-  - `<Domain>/Commands/<CommandName>.hs` — one file per command. Look for `data <CommandName> = …` and the `decide` function. The body of `decide` returns `Decider.acceptExisting [EventConstructor {{…}}]` (or `acceptNew`/`reject`) — every event constructor named in the returned list is what this command PRODUCES. That gives you the `commandProducesEvent` edges directly.\n  \
-  - `<Domain>/Queries/<QueryName>.hs` — read models. End with `deriveQuery` TH splice. The data the query exposes tells you which events it must subscribe to: any event whose payload contributes to a query field is an `eventFeedsQuery` source.\n  \
-  - `<Domain>/Integrations/<IntegrationName>.hs` — outbound integrations. Has `handleEvent :: Entity -> <Domain>Event -> Integration.Outbound` that pattern-matches on event constructors. Every constructor the `case` handles (anything other than `_ -> Integration.none`) is an `eventTriggersIntegration` source. The body of each arm reveals downstream commands emitted via `Integration.outbound Command.Emit {{ command = OtherCommand {{…}} }}` — those give you `integrationTriggersCommand` edges into other domains.\n  \
-  - Inbound integrations (web/HTTP transports) are wired by `type instance TransportsOf <Command> = '[WebTransport, …]` in the command file. An inbound HTTP call effectively triggers that command.\n  \
+== Residuals (your job to resolve) ==\n\
+{residual_block}\n\
 \n\
-What to do, concretely:\n  \
-  - Start with `cabal.project`, `*.cabal`, `AGENTS.md`, `README.md`, `CLAUDE.md` for orientation.\n  \
-  - List `src/` (or the appropriate package's source dir) to discover the domain directories.\n  \
-  - For each event-model node whose `type` is `command`/`event`/`query`/`integration`, find its module:\n     \
-     * command `PlaceOrder` → `src/.../Commands/PlaceOrder.hs`. Read the `decide` body to see which event constructors it produces.\n     \
-     * event `OrderPlaced` → look for the constructor in `src/.../Core.hs`'s event sum.\n     \
-     * query `OrderSummary` → `src/.../Queries/OrderSummary.hs`.\n     \
-     * integration `SendConfirmation` → `src/.../Integrations/SendConfirmation.hs`. Read `handleEvent` to see which events trigger it and which downstream commands it emits.\n  \
-  - Treat the Haskell code as authoritative. If the model has `commandX → eventY` but `decide` in the command file returns `eventZ`, the MODEL is wrong — repair it. If the code clearly implements a chain (`handleEvent` matches `PaymentApproved` and emits `SendEmail`) but the model has no edge for it, ADD the edges.\n  \
-  - CRITICAL — INVERSE WIRING. The code is ground truth in BOTH directions: a node missing from the model that exists in the code is just as much a defect as a stale edge. After mapping every model node to its module, run the REVERSE map: list every `*.hs` file under `src/.../Commands/`, `src/.../Integrations/`, `src/.../Queries/`, and every constructor in `src/.../Core.hs`'s event sum. For each one that has NO corresponding node in the model JSON, ADD THE NODE to the model file, then wire it per the rules in step 2 below. The previous policy of \"report and move on\" produces a sparse, semantically wrong diagram (events with no producing command, integrations dangling); we are explicitly overturning it. The user wants a faithful projection of the code, not a museum of what the model happened to contain on day one.\n  \
-  - Placement rules for newly-added nodes:\n     \
-     * Commands: place in the slice whose `name` matches the command name (e.g. command `ConfirmPaymentApproved` → slice `ConfirmPaymentApproved`). If no exact-name slice exists, place in the slice whose name is the closest case-insensitive substring match; if still none, add a new slice with the same name as the command, appended to the appropriate chapter (infer chapter from a sibling command in the same code directory or from `Service.hs`'s grouping).\n     \
-     * Outbound (effectful) integrations: place in the SAME slice as the event that triggers them. The trigger event is the one matched in `handleEvent`'s `case`.\n     \
-     * Inbound integrations (HTTP transports): place in the SAME slice as the command they trigger.\n     \
-     * Reactive integrations (the ones whose `handleEvent` emits a `Command.Emit` — they listen to an event in domain A and trigger a command in domain B): represent as an integration node in the slice of the COMMAND being emitted, NOT the source event. They are the bridge that makes events from one slice cause commands in the next.\n     \
-     * Events: place in the slice where the producing command lives (the slice whose `decide` body returns this event constructor). Always attach the event to the entity whose `EventOf` instance binds the event sum (one entity per domain — read `Core.hs`).\n     \
-     * Queries: place in a slice named after the query (or add one). Queries are typically standalone at the end of a chapter.\n  \
-  - Newly-added integration `kind`: set `kind = \"outbound\"` if `handleEvent` returns `Integration.outbound` calls to an external system / HTTP API. Set `kind = \"inbound\"` if the integration corresponds to a `TransportsOf <Command> = '[WebTransport, ...]` declaration in a command file. Reactive integrations that bridge domains use `kind = \"inbound\"` because they receive an event and raise a command (analogous to an external trigger from the consuming domain's perspective).\n  \
-  - When an event already in the model has no producing command in the model, FIRST look for the producing command in code. If you find it: add the command node (per placement rules above), add the `commandProducesEvent` edge, and add the upstream wiring (reactive integration → command, or UI → command, depending on what the code shows).\n  \
-  - DO NOT delete nodes you can't find in the code — they may be UI placeholders, planned features, or simplifications. Mention them in the final summary instead.\n  \
-  - UI placeholders are visual stubs — they have no `*.hs` file. Don't grep for them in the code. Just keep them connected to the commands / queries they sit next to in the same slice.\n  \
-  - Keep exploration tight: skim file listings, grep for constructor names, only Read full files when you need detail. Aim for a working mental model in 8–15 tool calls — the inverse-wiring pass adds real work compared to a pure audit. The goal is a model that faithfully projects the code, not an exhaustive audit.\n\
+== Remaining schema/referential validation errors ==\n\
+{validation_block}\n\
 \n\
-== JSON Schema (draft 2020-12) — the file MUST satisfy this exactly ==\n\
+== Reference: NeoHaskell domain summary ==\n\
+{neo_summary}\n\
+\n\
+== Current event-model.json (already post-deterministic-patch) ==\n\
+\n\
+```json\n\
+{current_file}\n\
+```\n\
+\n\
+== Schema (file MUST validate against this exactly) ==\n\
 {schema}\n\
 \n\
-== Validation errors to address (each one needs a concrete fix) ==\n\
-{errors}\n\
+== Output format (REQUIRED) ==\n\
 \n\
-== Event-modeling primer (use this to decide how to fix the file) ==\n\
+Return the FULL corrected event-model in the `eventModel` field of the structured output. Preserve every existing id (chapters, entities, slices, nodes, edges) wherever you don't have a hard reason to change it. Use `edge-<short-random>` for any new edge ids. Do not wrap the output in markdown fences.\n\
 \n\
-An event model is a chronological diagram of a system. Five node kinds:\n  \
-  - command  — user intent, present-tense verb (e.g. \"PlaceOrder\").\n  \
-  - event    — a fact that happened, past tense (e.g. \"OrderPlaced\").\n  \
-  - query    — a read model (noun-phrase, e.g. \"OrderSummary\").\n  \
-  - integration — connection to another system; kind=inbound means we receive a call, kind=outbound means we send one.\n  \
-  - uiPlaceholder — a screen/form a user interacts with (e.g. \"CheckoutForm\").\n\
-\n\
-Two structural groupings:\n  \
-  - chapters — large arcs across many slices (e.g. \"Ordering\", \"Fulfilment\").\n  \
-  - slices   — one user-visible feature/use-case (e.g. \"Place Order\"). Slices belong to chapters.\n  \
-  - entities — domain aggregates owning events (e.g. \"Order\", \"Inventory\"). Each event lives in exactly one entity's swim lane.\n\
-\n\
-The six allowed edge types form a directed graph between specific node kinds:\n  \
-  - commandProducesEvent       (command   → event)         — command succeeded; event is the consequence\n  \
-  - eventFeedsQuery            (event     → query)         — event updates a read model\n  \
-  - eventTriggersIntegration   (event     → integration)   — outbound: tell another system\n  \
-  - integrationTriggersCommand (integration → command)     — inbound: external trigger raises a command\n  \
-  - commandFromUI              (uiPlaceholder → command)   — user submits a form\n  \
-  - queryToUI                  (query     → uiPlaceholder) — UI reads from a query\n\
-\n\
-Idiomatic chains within a slice:\n  \
-  UI → command → event → query → UI       (typical user-driven flow)\n  \
-  event → outbound integration            (notify external system)\n  \
-  inbound integration → command → event   (external trigger)\n\
-\n\
-== Repair guidance — DO ==\n  \
-  1. Fix every schema error listed above. The file MUST validate against the schema.\n  \
-  2. WIRE EVERY NODE. Walk the node list and add the missing edges the model needs to make sense. These rules are MANDATORY, not optional — a node missing the connection below is a bug to repair, not a stylistic preference:\n     \
-     2a. EVERY command MUST have at least one outgoing `commandProducesEvent` edge to an event. Find the event from the `decide` function's `Decider.acceptExisting [EventConstructor {{…}}]` body in `Commands/<CommandName>.hs`. The constructors in that list are the events to wire — add a `commandProducesEvent` edge from the command to each one. If the named event has no node in the model yet, ADD the event node first (per the placement + entity rules in step 0), then add the edge. The model should match the code's emitted events exactly.\n     \
-     2b. EVERY event that materially updates a read model MUST have an outgoing `eventFeedsQuery` edge to the relevant query. Walk the queries: for each query, identify every event whose semantics affect what the query returns (e.g. a `PaymentApproved` event updates an `AwaitingConfirmationStatus` query, and so does `PaymentDeclined`, `PaymentExpired`, etc.). Add a `eventFeedsQuery` edge from EACH such event to the query. A query with no incoming `eventFeedsQuery` edges is broken — pick the events that semantically feed it.\n     \
-     2c. EVERY inbound integration MUST have at least one outgoing `integrationTriggersCommand` edge to the command it triggers. An inbound integration is named after what it receives (e.g. `BankReturnRedirect`, `StripeWebhook`); the command it triggers is what the system DOES with that input (e.g. `RegisterPayerReturn`, `ApplyPayment`). Add the `integrationTriggersCommand` edge from the inbound integration to that command.\n     \
-     2d. EVERY outbound integration MUST have at least one incoming `eventTriggersIntegration` edge from the event that causes it. An outbound integration is named after what it calls (e.g. `BankPaymentStatusAPI`, `EmailService`); the event that triggers it is the fact that made the call necessary (e.g. `PaymentApproved` → `EmailService`, `PaymentRequested` → `BankPaymentFormAPI`). Add the `eventTriggersIntegration` edge from that event to the outbound integration.\n     \
-     2e. EVERY uiPlaceholder paired with a command in the same slice MUST have an outgoing `commandFromUI` edge to that command. EVERY uiPlaceholder paired with a query in the same slice MUST have an incoming `queryToUI` edge from that query. UI placeholders without these edges are orphaned and break the flow.\n  \
-  3. Use `crypto.randomUUID()`-shape ids for any new edges (e.g. `edge-<short-random>`), and pick a `type` from the six allowed edge types — never invent a new type. Set `sourceHandle` and `targetHandle` on every new edge: use `\"bottom\"`/`\"top\"` for vertical connections (UI↔command, command↔event, query↔UI), and `\"right\"`/`\"left\"` for horizontal connections (event↔integration, integration↔command across slices).\n  \
-  4. Fill in missing layout positions in `layout.nodePositions`. Each node needs `{{ x: number, y: number }}`. Suggested coordinates if you have to invent them (slice index N = 0, 1, 2…; entity index M = 0, 1, 2…):\n     \
-     - slice column x base = N * 400 + 40\n     \
-     - uiPlaceholder              y = -60         (above the slice header)\n     \
-     - command, query, integration y = 120        (SAME band — above events, below UI)\n     \
-     - event                       y = 340 + M * 200 + 60   (inside its entity swim lane)\n     \
-     If multiple nodes of the same kind land in the same slice, stack them by adding 80 to y for each.\n  \
-  5. CORRECT EXISTING BAD POSITIONS. Integrations are NOT below events — they sit at the command/query level (y around 120-280). If you see an integration positioned at y > 300 (inside or below the entity lane), MOVE IT to y ≈ 120 so it visually sits with the commands and queries it logically pairs with. Same for UI placeholders dropped into the events band: lift them up to y ≈ -60.\n\
-\n\
-== Repair guidance — DO NOT ==\n  \
-  - Do NOT rename or renumber existing ids unless the schema forces it (breaks links).\n  \
-  - Do NOT delete entities, slices, chapters, or nodes the user clearly intended (only drop entries that are unfixable garbage).\n  \
-  - Do NOT add edges between node kinds the schema forbids (the six edge types above are exhaustive).\n  \
-  - Do NOT add fields the schema doesn't define — `additionalProperties: false` rejects unknown keys at every level.\n  \
-  - Do NOT create new files; edit the file at the path above in place.\n\
-\n\
-When done, the file at the path above must (a) parse as JSON, (b) satisfy the schema, (c) have every node connected via the edge patterns above unless it's genuinely standalone. Exit when finished.",
+```json\n\
+{{\n  \"eventModel\": <healed model>,\n  \"summary\": \"<one paragraph>\",\n  \"changesMade\": [\"<bullet>\", ...]\n}}\n\
+```",
         file_path = path.display(),
         workspace = workspace_root.display(),
-        neo_inspect = neo_inspect_section,
+        mode_directive = mode_directive,
+        auto_block = auto_block,
+        residual_block = residual_block,
+        validation_block = validation_block,
+        neo_summary = neo_summary_block,
+        current_file = current_file_content,
         schema = SCHEMA_JSON,
-        errors = errors_text,
     )
+}
+
+/// Pick a claude model based on the residual workload. Cheap heuristic —
+/// the deterministic pass already removed the bulk of the work, so the
+/// remaining LLM pass is usually small and well-defined.
+fn pick_model(residual_count: usize, validation_error_count: usize, has_neo_summary: bool) -> &'static str {
+    if !has_neo_summary {
+        // No inspection — open-ended audit, opus does best.
+        return "opus";
+    }
+    let total_load = residual_count + validation_error_count;
+    if total_load <= 3 {
+        // Tiny load → haiku is fast AND cheap. The prompt is short enough
+        // and the decisions are well-scoped enough that haiku handles them.
+        "haiku"
+    } else {
+        // Larger residual → sonnet. Opus is overkill when the diff has
+        // already mapped the work.
+        "sonnet"
+    }
+}
+
+/// Atomic write via `tmp + rename`. A botched mid-write leaves the
+/// original `event-model.json` untouched.
+fn atomic_write(path: &Path, content: &str) -> Result<(), NeoError> {
+    let tmp = path.with_extension("json.heal-tmp");
+    std::fs::write(&tmp, content.as_bytes()).map_err(|e| {
+        NeoError::io_at("writing healed event-model.json (tmp)", tmp.clone(), e)
+    })?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        NeoError::io_at(
+            "renaming healed event-model.json into place",
+            path.to_path_buf(),
+            e,
+        )
+    })?;
+    Ok(())
+}
+
+/// One-line human description of a `Residual` for inclusion in the LLM prompt.
+fn residual_to_human(r: &crate::ide::heal::diff::Residual) -> String {
+    use crate::ide::heal::diff::Residual;
+    match r {
+        Residual::OrphanModelNode { node_name, node_type, node_id } => format!(
+            "orphanModelNode `{node_name}` (type={node_type}, id={node_id}) — exists in the model but not in the code; if it's a typo for a code symbol rename it, otherwise leave it (may be a planned feature)"
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -713,6 +1119,59 @@ mod tests {
         }
     }
 
+    /// Build a stream-json `result` event whose top-level
+    /// `structured_output` field carries the schema-validated wrapper
+    /// payload (`{ eventModel, summary, changesMade }`). This mirrors
+    /// what claude-code emits when invoked with `--json-schema` — the
+    /// human-readable assistant closing message lands on `result`, and
+    /// the JSON payload lands on `structured_output`.
+    fn stream_json_result_line(event_model_json: &str) -> String {
+        let inner = serde_json::json!({
+            "eventModel": serde_json::from_str::<serde_json::Value>(event_model_json)
+                .expect("event_model_json fixture must be valid JSON"),
+            "summary": "stub test",
+            "changesMade": ["stub change"],
+        });
+        let outer = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": "stub closing message",
+            "structured_output": inner,
+        });
+        outer.to_string()
+    }
+
+    /// Legacy-shape `result` event: payload stringified into
+    /// `result.result`, no top-level `structured_output` field. Tests use
+    /// this to lock in the extractor's fallback path for the case where
+    /// claude-code is invoked without `--json-schema`.
+    fn stream_json_result_line_legacy(event_model_json: &str) -> String {
+        let inner = serde_json::json!({
+            "eventModel": serde_json::from_str::<serde_json::Value>(event_model_json)
+                .expect("event_model_json fixture must be valid JSON"),
+            "summary": "stub test (legacy)",
+            "changesMade": ["stub change"],
+        });
+        let outer = serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "is_error": false,
+            "result": inner.to_string(),
+        });
+        outer.to_string()
+    }
+
+    /// Generate a stub-claude shell-script body that emits the given
+    /// stream-json `result` line on stdout. Bash here-doc keeps the
+    /// nested JSON quoting sane.
+    fn stub_emitting_result(result_line: &str) -> String {
+        // Use `printf %s` instead of echo so embedded backslashes /
+        // quotes survive untouched. The line is single-quoted so the
+        // shell does no expansion at all.
+        format!("printf '%s\\n' '{}'\nexit 0", result_line.replace('\'', r"'\''"))
+    }
+
     #[tokio::test]
     async fn heal_returns_healed_when_stub_fixes_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -722,15 +1181,10 @@ mod tests {
 
         let stub_dir = tempfile::tempdir().unwrap();
         let stub_path = stub_dir.path().join("claude");
-        // Stub overwrites the file with a valid model.
-        write_stub(
-            &stub_path,
-            &format!(
-                "cat > '{}' <<'EOF'\n{}\nEOF\nexit 0",
-                model_path.display(),
-                VALID_MODEL
-            ),
-        );
+        // Stub emits a structured-output `result` event carrying a
+        // valid model. The heal flow parses + validates + writes.
+        let result_line = stream_json_result_line(VALID_MODEL);
+        write_stub(&stub_path, &stub_emitting_result(&result_line));
 
         let session = fixture_session(workspace);
         let result = handle_with_config(session, HealMode::Validate, quick_config(stub_path, 10_000))
@@ -739,7 +1193,8 @@ mod tests {
         assert_eq!(result.outcome, HealOutcome::Healed);
         // File on disk should now be valid.
         let after = std::fs::read_to_string(&model_path).unwrap();
-        assert!(after.contains("\"id\": \"m1\""));
+        assert!(after.contains("\"id\""));
+        assert!(after.contains("m1"));
     }
 
     #[tokio::test]
@@ -750,8 +1205,10 @@ mod tests {
 
         let stub_dir = tempfile::tempdir().unwrap();
         let stub_path = stub_dir.path().join("claude");
-        // Stub does nothing — file remains invalid.
-        write_stub(&stub_path, "exit 0");
+        // Stub echoes BACK the still-invalid model (no `id` field). The
+        // heal flow parses + validates → StillInvalid; file untouched.
+        let result_line = stream_json_result_line(INVALID_MODEL);
+        write_stub(&stub_path, &stub_emitting_result(&result_line));
 
         let session = fixture_session(workspace);
         let result = handle_with_config(session, HealMode::Validate, quick_config(stub_path, 10_000))
@@ -849,6 +1306,14 @@ mod tests {
         workspace: &std::path::Path,
         capture: &std::path::Path,
     ) -> Result<HealEventModelResult, NeoError> {
+        run_with_argv_capture_in_mode(workspace, capture, HealMode::Validate).await
+    }
+
+    async fn run_with_argv_capture_in_mode(
+        workspace: &std::path::Path,
+        capture: &std::path::Path,
+        mode: HealMode,
+    ) -> Result<HealEventModelResult, NeoError> {
         let stub_dir = tempfile::tempdir().unwrap();
         let stub_path = stub_dir.path().join("claude");
         // Write argv (one per line) + pwd to the capture file, then exit 0.
@@ -869,7 +1334,7 @@ mod tests {
         let mut perms = std::fs::metadata(&owned_stub).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&owned_stub, perms).unwrap();
-        handle_with_config(session, HealMode::Validate, quick_config(owned_stub, 10_000)).await
+        handle_with_config(session, mode, quick_config(owned_stub, 10_000)).await
     }
 
     #[tokio::test]
@@ -880,11 +1345,12 @@ mod tests {
         let capture = workspace.join("argv.log");
         let _ = run_with_argv_capture(workspace, &capture).await;
         let logged = std::fs::read_to_string(&capture).unwrap();
-        // The prompt is the last positional arg. It should contain the literal
-        // string "id" (from the validation error about the missing required field).
+        // New prompt contract: the "Remaining ... validation errors" section
+        // appears, and the offending field id from the schema error is
+        // included in the listed error.
         assert!(
-            logged.contains("Validation errors"),
-            "argv should include the prompt header, got: {logged}"
+            logged.to_lowercase().contains("validation errors"),
+            "argv should include the validation errors header (case-insensitive), got: {logged}"
         );
         assert!(logged.contains("id"), "prompt should name the missing `id` field");
     }
@@ -919,11 +1385,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heal_prompt_teaches_event_modeling_semantics() {
-        // The prompt must include enough guidance that claude can ADD
-        // missing edges and FILL missing layout positions, not just
-        // patch schema violations. Asserts on substrings of the primer
-        // + DO/DON'T sections.
+    async fn heal_prompt_states_mode_and_includes_schema_plus_model() {
+        // The new prompt contract (post-deterministic-pass): much shorter
+        // than the original. Asserts the load-bearing pieces remain:
+        //   * mode header (Validate or Improve)
+        //   * the schema embedded verbatim
+        //   * the current model embedded
+        //   * the file path
+        //   * structured-output format reminder (`eventModel` wrapper)
+        // The detailed wiring-policy teaching is no longer needed — the
+        // Rust deterministic pre-pass handled that work.
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path();
         std::fs::write(workspace.join("event-model.json"), INVALID_MODEL).unwrap();
@@ -931,136 +1402,20 @@ mod tests {
         let _ = run_with_argv_capture(workspace, &capture).await;
         let logged = std::fs::read_to_string(&capture).unwrap();
 
-        // All six edge type names must appear so claude knows which links
-        // it can add.
-        for edge_type in &[
-            "commandProducesEvent",
-            "eventFeedsQuery",
-            "eventTriggersIntegration",
-            "integrationTriggersCommand",
-            "commandFromUI",
-            "queryToUI",
-        ] {
-            assert!(
-                logged.contains(edge_type),
-                "prompt should mention edge type `{edge_type}`",
-            );
-        }
-
-        // Layout guidance must include both coordinate hints and the
-        // `layout.nodePositions` target.
+        assert!(logged.contains("MODE = VALIDATE"), "prompt should name the mode");
+        assert!(logged.contains("$schema"), "prompt should embed the schema");
         assert!(
-            logged.contains("layout.nodePositions"),
-            "prompt should mention layout.nodePositions",
+            logged.contains("event-model.json"),
+            "prompt should include the file path"
         );
         assert!(
-            logged.contains("slice index"),
-            "prompt should mention slice index for x-coordinate calculation",
-        );
-
-        // DO instruction to add missing edges.
-        assert!(
-            logged.to_lowercase().contains("add the missing edge")
-                || logged.to_lowercase().contains("add the edge"),
-            "prompt should explicitly instruct claude to add missing edges",
-        );
-
-        // Mandatory wiring rules — each must appear, keyed on the edge-type
-        // it requires. Regression-guards the user-reported request:
-        // commands must reach events, events must feed queries, integrations
-        // must be wired to commands.
-        // NeoHaskell awareness — the Step 0 section must teach claude
-        // where the conventions live so it grounds its repair decisions
-        // in the real Haskell code, not its imagination.
-        for needle in &[
-            "NeoHaskell",
-            "Core.hs",
-            "Commands/",
-            "Queries/",
-            "Integrations/",
-            "decide",        // the function name in command files
-            "handleEvent",   // the function name in integration files
-            "deriveQuery",   // the TH splice in query files
-            "TransportsOf",  // marker for inbound HTTP wiring
-        ] {
-            assert!(
-                logged.contains(needle),
-                "prompt should mention `{needle}` so claude can ground wiring in NeoHaskell code",
-            );
-        }
-        // UI placeholders are diagram-only — must be flagged so claude
-        // doesn't waste tool calls grepping for them in the .hs files.
-        assert!(
-            logged.contains("UI placeholders are")
-                && logged.to_lowercase().contains("no backend counterpart"),
-            "prompt should flag UI placeholders as having no backend equivalent",
-        );
-
-        // Inverse wiring — the policy fix after the CIOS payments file
-        // came back with 8 slices missing their producing commands. The
-        // prompt MUST tell claude to ADD missing nodes that exist in
-        // code, not just report them. Regression-guard the wording.
-        let logged_lower = logged.to_lowercase();
-        assert!(
-            logged_lower.contains("inverse wiring")
-                || logged_lower.contains("inverse-wiring")
-                || logged_lower.contains("reverse map"),
-            "prompt must instruct claude to walk code → model (add missing nodes), \
-             not just model → code (audit). The CIOS payments file regressed when \
-             this was absent."
+            logged.contains("\"eventModel\""),
+            "prompt should reference the structured-output `eventModel` wrapper"
         );
         assert!(
-            logged.contains("ADD THE NODE"),
-            "prompt must EXPLICITLY tell claude to ADD missing nodes from the code",
+            logged.contains("Output format"),
+            "prompt should include an output format section"
         );
-        assert!(
-            logged_lower.contains("reactive integration"),
-            "prompt must cover reactive integrations — the cross-domain bridges \
-             that listen to an event and emit a command. These are the most \
-             commonly-missing nodes (the CIOS payments file is missing 3).",
-        );
-        // The DO section's `2a` rule used to say "do NOT fabricate" missing
-        // events, which directly contradicted the inverse-wiring rule. Make
-        // sure that contradiction can't sneak back in.
-        assert!(
-            !logged.contains("DO NOT fabricate"),
-            "prompt must NOT tell claude to skip adding missing events — \
-             that contradicts the inverse-wiring policy.",
-        );
-
-        let wiring_rules = [
-            (
-                "command → event wiring",
-                "every command",
-                "commandProducesEvent",
-            ),
-            (
-                "event → query wiring",
-                "every event",
-                "eventFeedsQuery",
-            ),
-            (
-                "inbound integration → command wiring",
-                "every inbound integration",
-                "integrationTriggersCommand",
-            ),
-            (
-                "event → outbound integration wiring",
-                "every outbound integration",
-                "eventTriggersIntegration",
-            ),
-        ];
-        let logged_lower = logged.to_lowercase();
-        for (label, must_phrase, edge_type) in wiring_rules {
-            assert!(
-                logged_lower.contains(must_phrase),
-                "prompt missing the `{must_phrase}` MUST clause for {label}",
-            );
-            assert!(
-                logged.contains(edge_type),
-                "prompt missing edge type `{edge_type}` referenced in {label} rule",
-            );
-        }
     }
 
     #[tokio::test]
@@ -1091,9 +1446,24 @@ mod tests {
             logged.contains("--allowed-tools"),
             "argv should include --allowed-tools, got: {logged}"
         );
+        // Read-only — the agent must NOT have Edit/Write/Bash because
+        // we write the healed file ourselves.
         assert!(
-            logged.contains("Read,Edit,Write"),
-            "argv should pass `Read,Edit,Write` as the allowed-tools value, got: {logged}"
+            logged.contains("\nRead\n") || logged.contains(" Read "),
+            "argv should pass `Read` (and only Read) as the allowed-tools value, got: {logged}"
+        );
+        assert!(
+            !logged.contains("Read,Edit,Write"),
+            "argv must NOT grant Edit or Write; agent writes nothing — we do",
+        );
+        // And the structured-output schema MUST be set.
+        assert!(
+            logged.contains("--json-schema"),
+            "argv should include --json-schema, got: {logged}"
+        );
+        assert!(
+            logged.contains("eventModel"),
+            "json-schema arg should mention `eventModel`, got: {logged}",
         );
     }
 
@@ -1116,10 +1486,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heal_demotes_to_sonnet_when_neo_inspect_finds_domains() {
+    async fn heal_uses_haiku_when_neo_inspect_finds_a_small_residual() {
         // Drop a minimal NeoHaskell domain into the workspace so
-        // `neo inspect` returns a non-empty summary. The heal prompt
-        // should switch to sonnet AND splice the summary in.
+        // `neo inspect` returns a non-empty summary. With a small total
+        // load (residuals + validation errors ≤ 3) the heal flow should
+        // pick haiku — cheap and fast for the trivially-scoped LLM pass.
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path();
         std::fs::write(workspace.join("event-model.json"), INVALID_MODEL).unwrap();
@@ -1128,7 +1499,7 @@ mod tests {
         std::fs::write(
             &core,
             "module App.Cart.Core where\n\
-             data CartEvent = ItemAdded {} | CartCreated {} deriving (Generic)\n",
+             data CartEvent = ItemAdded {} deriving (Generic)\n",
         )
         .unwrap();
         let cmd = workspace.join("src/App/Cart/Commands/AddItem.hs");
@@ -1146,18 +1517,71 @@ mod tests {
         let logged = std::fs::read_to_string(&capture).unwrap();
         assert!(logged.contains("--model"), "argv should include --model");
         assert!(
-            logged.contains("\nsonnet\n") || logged.contains(" sonnet ") || logged.contains("\nsonnet"),
-            "with a pre-computed NeoHaskell summary, model should be sonnet; got first 500 chars: {}",
+            logged.contains("\nhaiku\n") || logged.contains(" haiku ") || logged.contains("\nhaiku"),
+            "small NeoHaskell residual (1 command + 1 event + 1 validation error) should route to haiku; got first 500 chars: {}",
             &logged.chars().take(500).collect::<String>()
         );
-        // The summary must be embedded in the prompt.
-        assert!(
-            logged.contains("Pre-computed NeoHaskell project summary"),
-            "prompt should embed the project-summary section header"
-        );
+        // The summary block embeds the discovered command + event.
         assert!(
             logged.contains("ItemAdded") && logged.contains("AddItem"),
             "prompt should contain the discovered command + event"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_uses_sonnet_when_orphan_residual_is_large() {
+        // After the materialisation pre-pass, the only LLM-residual class
+        // is orphan model nodes (model has them, code doesn't). Plant 5
+        // orphan command nodes in a passing-schema model with a tiny
+        // NeoHaskell project, then run in Improve mode to force the LLM
+        // pass. Five residuals → total_load > 3 → sonnet.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let core = workspace.join("src/App/Cart/Core.hs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(
+            &core,
+            "module App.Cart.Core where\n\
+             data CartEvent = ItemAdded {} deriving (Generic)\n",
+        )
+        .unwrap();
+        let cmd = workspace.join("src/App/Cart/Commands/AddItem.hs");
+        std::fs::create_dir_all(cmd.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cmd,
+            "module App.Cart.Commands.AddItem where\n\
+             decide :: AddItem -> Maybe CartEntity -> RequestContext -> Decision CartEvent\n\
+             decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+        )
+        .unwrap();
+        let model = serde_json::json!({
+            "id": "m1", "name": "demo",
+            "chapters": [{ "id": "ch1", "name": "Main", "order": 0 }],
+            "entities": [{ "id": "ent1", "name": "Cart", "order": 0 }],
+            "slices": [{ "id": "sl1", "name": "Stale", "chapterId": "ch1", "order": 0 }],
+            "nodes": [
+                { "id": "orphan1", "type": "command", "name": "OrphanOne",   "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "orphan2", "type": "command", "name": "OrphanTwo",   "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "orphan3", "type": "command", "name": "OrphanThree", "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "orphan4", "type": "command", "name": "OrphanFour",  "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "orphan5", "type": "command", "name": "OrphanFive",  "sliceId": "sl1", "entityId": "ent1" }
+            ],
+            "edges": [],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        std::fs::write(
+            workspace.join("event-model.json"),
+            serde_json::to_string_pretty(&model).unwrap(),
+        )
+        .unwrap();
+
+        let capture = workspace.join("argv.log");
+        let _ = run_with_argv_capture_in_mode(workspace, &capture, HealMode::Improve).await;
+        let logged = std::fs::read_to_string(&capture).unwrap();
+        assert!(
+            logged.contains("\nsonnet\n") || logged.contains(" sonnet ") || logged.contains("\nsonnet"),
+            "large orphan residual should route to sonnet; got first 500 chars: {}",
+            &logged.chars().take(500).collect::<String>()
         );
     }
 
@@ -1184,34 +1608,507 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heal_improve_mode_runs_subprocess_even_on_valid_file() {
-        // The "Heal with AI" manual button uses mode=Improve, which must
-        // invoke claude even when the file already validates — that's how
-        // the user asks the agent to refine layout / add inferred edges.
+    async fn heal_improve_mode_materialises_missing_nodes_without_llm() {
+        // Pre-change: missing commands / events showed up as residuals and
+        // claude was spawned to add them. With the deterministic pre-pass
+        // doing the materialisation in Rust, the LLM is no longer needed
+        // here — the stub MUST NOT run.
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path();
         let model_path = workspace.join("event-model.json");
         std::fs::write(&model_path, VALID_MODEL).unwrap();
 
+        let core = workspace.join("src/App/Cart/Core.hs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(
+            &core,
+            "module App.Cart.Core where\n\
+             data CartEvent = ItemAdded {} deriving (Generic)\n",
+        )
+        .unwrap();
+        let cmd = workspace.join("src/App/Cart/Commands/AddItem.hs");
+        std::fs::create_dir_all(cmd.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cmd,
+            "module App.Cart.Commands.AddItem where\n\
+             decide :: AddItem -> Maybe CartEntity -> RequestContext -> Decision CartEvent\n\
+             decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+        )
+        .unwrap();
+
+        // Bogus claude path: if the fast-path regresses and spawns it, we
+        // fail with a clear error instead of a silent stub run.
+        let bogus = std::path::PathBuf::from("/nonexistent/heal-stub");
+
+        let session = fixture_session(workspace);
+        let result = handle_with_config(session, HealMode::Improve, quick_config(bogus, 10_000))
+            .await
+            .expect("deterministic materialisation should heal without claude");
+        assert_eq!(result.outcome, HealOutcome::Healed);
+
+        // The file on disk now contains a command + event materialised by
+        // the deterministic pass.
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+        let nodes = patched["nodes"].as_array().unwrap();
+        assert!(
+            nodes.iter().any(|n| n["type"] == "command" && n["name"] == "AddItem"),
+            "deterministic pass should materialise AddItem command; got nodes: {nodes:?}"
+        );
+        assert!(
+            nodes.iter().any(|n| n["type"] == "event" && n["name"] == "ItemAdded"),
+            "deterministic pass should materialise ItemAdded event; got nodes: {nodes:?}"
+        );
+        // And the edge between them.
+        let edges = patched["edges"].as_array().unwrap();
+        assert!(
+            edges.iter().any(|e| e["type"] == "commandProducesEvent"),
+            "deterministic pass should wire commandProducesEvent edge; got edges: {edges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_fixes_positions_when_no_neohaskell_inspection() {
+        // No NeoHaskell project: just a hand-authored event-model.json
+        // whose integration sits at y=500 (event band, wrong). The
+        // deterministic pass MUST still snap it back to the
+        // command/query/integration band — the heal flow is the right
+        // place to fix layout regardless of whether the workspace is
+        // backed by code.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model_path = workspace.join("event-model.json");
+        let base_model = serde_json::json!({
+            "id": "m1",
+            "name": "demo",
+            "chapters": [],
+            "entities": [{ "id": "ent1", "name": "Stuff", "order": 0 }],
+            "slices": [
+                { "id": "sl1", "name": "OnlySlice", "chapterId": null, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "intg1", "type": "integration", "name": "Misplaced",
+                  "sliceId": "sl1", "kind": "outbound" }
+            ],
+            "edges": [],
+            "layout": {
+                "nodePositions": {
+                    "intg1": { "x": 200, "y": 500 }
+                },
+                "viewport": { "x": 0, "y": 0, "zoom": 1 }
+            }
+        });
+        std::fs::write(
+            &model_path,
+            serde_json::to_string_pretty(&base_model).unwrap(),
+        )
+        .unwrap();
+
+        // No src/ directory → inspection returns empty domains. Claude
+        // must not be spawned for a position-only repair.
+        let bogus = std::path::PathBuf::from("/nonexistent/heal-stub");
+        let session = fixture_session(workspace);
+        let result = handle_with_config(session, HealMode::Validate, quick_config(bogus, 10_000))
+            .await
+            .expect("deterministic pass should run without inspection");
+        assert_eq!(result.outcome, HealOutcome::Healed);
+
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+        let y = patched["layout"]["nodePositions"]["intg1"]["y"].as_f64().unwrap();
+        assert!(
+            (y - 120.0).abs() < f64::EPSILON,
+            "integration y should snap from 500 to canonical 120; got {y}",
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_cancel_kills_subprocess_and_returns_cancelled() {
+        // Stub that sleeps long enough to be cancellable but exits 0 if
+        // not interrupted. We fire the heal in a tokio task, wait briefly
+        // for it to spawn the subprocess (install heal_cancel), then call
+        // session.cancel_heal() on the cloned session. The heal must
+        // return Cancelled with the deterministic_applied count from the
+        // pre-pass.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        // INVALID_MODEL forces needs_llm = true (validation fails on
+        // missing `id`). No NeoHaskell project → deterministic_applied
+        // stays at 0, which is what the assertion expects.
+        std::fs::write(workspace.join("event-model.json"), INVALID_MODEL).unwrap();
+
         let stub_dir = tempfile::tempdir().unwrap();
         let stub_path = stub_dir.path().join("claude");
-        let marker = workspace.join("STUB_RAN");
-        // Touch a marker file so the test can prove the stub ran.
-        write_stub(
-            &stub_path,
-            &format!("touch '{}'\nexit 0", marker.display()),
+        // Sleep 30 seconds — far longer than the test will wait. If the
+        // kill path doesn't fire, the test times out (15s here).
+        write_stub(&stub_path, "sleep 30\nexit 0");
+
+        let session = fixture_session(workspace);
+        let session_clone = session.clone();
+        let heal_task = tokio::spawn(async move {
+            handle_with_config(session_clone, HealMode::Validate, quick_config(stub_path, 15_000)).await
+        });
+
+        // Poll for the heal_cancel slot to be installed — heal_event_model
+        // installs it AFTER spawning the subprocess.
+        let mut tries = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tries += 1;
+            if session.cancel_heal() {
+                break;
+            }
+            assert!(tries < 60, "heal_cancel slot never appeared — heal didn't reach the subprocess phase");
+        }
+
+        let result = heal_task.await.unwrap().expect("heal should resolve with Ok on cancel");
+        match result.outcome {
+            HealOutcome::Cancelled { deterministic_applied } => {
+                assert_eq!(
+                    deterministic_applied, 0,
+                    "no NeoHaskell + no positions to fix → 0 deterministic applied; got {deterministic_applied}",
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn heal_cancel_persists_deterministic_patches_to_disk() {
+        // Cancel during the LLM stage MUST still write the pre-pass's
+        // patches (otherwise the user loses the free wins). Plant a
+        // valid-with-bad-position model so the deterministic pass has
+        // real work to apply, then cancel while the stub is sleeping.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model_path = workspace.join("event-model.json");
+        // Valid JSON + valid schema, but integration at y=500 needs fix.
+        let model = serde_json::json!({
+            "id": "m1", "name": "demo",
+            "chapters": [],
+            "entities": [{ "id": "ent1", "name": "Stuff", "order": 0 }],
+            "slices": [{ "id": "sl1", "name": "Only", "chapterId": null, "order": 0 }],
+            "nodes": [
+                { "id": "intg1", "type": "integration", "name": "Misplaced",
+                  "sliceId": "sl1", "kind": "outbound" }
+            ],
+            "edges": [],
+            "layout": {
+                "nodePositions": { "intg1": { "x": 200, "y": 500 } },
+                "viewport": { "x": 0, "y": 0, "zoom": 1 }
+            }
+        });
+        std::fs::write(&model_path, serde_json::to_string_pretty(&model).unwrap()).unwrap();
+        // Plant a Cart domain with a command + event the model doesn't
+        // have — that forces residual_count > 0 and (with Improve mode)
+        // makes needs_llm = true so the LLM stage is reached.
+        let core = workspace.join("src/App/Cart/Core.hs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(&core, "module App.Cart.Core where\ndata CartEvent = ItemAdded {} deriving (Generic)\n").unwrap();
+        let cmd = workspace.join("src/App/Cart/Commands/AddItem.hs");
+        std::fs::create_dir_all(cmd.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cmd,
+            "module App.Cart.Commands.AddItem where\n\
+             decide :: AddItem -> Maybe CartEntity -> RequestContext -> Decision CartEvent\n\
+             decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+        )
+        .unwrap();
+        // Wait — actually, Improve mode short-circuits when residuals=0
+        // and the file's valid. With the materialiser pass, the inspection
+        // creates the missing nodes deterministically → applied > 0,
+        // residuals == 0 → still no LLM. To force the LLM we'd need
+        // genuine residuals (orphans) or an invalid file. Switch to an
+        // orphan in the model.
+        let model = serde_json::json!({
+            "id": "m1", "name": "demo",
+            "chapters": [],
+            "entities": [{ "id": "ent1", "name": "Cart", "order": 0 }],
+            "slices": [{ "id": "sl1", "name": "Only", "chapterId": null, "order": 0 }],
+            "nodes": [
+                { "id": "intg1", "type": "integration", "name": "Misplaced",
+                  "sliceId": "sl1", "kind": "outbound" },
+                { "id": "orphan", "type": "command", "name": "OrphanNotInCode",
+                  "sliceId": "sl1", "entityId": "ent1" }
+            ],
+            "edges": [],
+            "layout": {
+                "nodePositions": {
+                    "intg1": { "x": 200, "y": 500 },
+                    "orphan": { "x": 200, "y": 120 }
+                },
+                "viewport": { "x": 0, "y": 0, "zoom": 1 }
+            }
+        });
+        std::fs::write(&model_path, serde_json::to_string_pretty(&model).unwrap()).unwrap();
+
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub_dir.path().join("claude");
+        write_stub(&stub_path, "sleep 30\nexit 0");
+
+        let session = fixture_session(workspace);
+        let session_clone = session.clone();
+        let heal_task = tokio::spawn(async move {
+            handle_with_config(session_clone, HealMode::Improve, quick_config(stub_path, 15_000)).await
+        });
+
+        let mut tries = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tries += 1;
+            if session.cancel_heal() {
+                break;
+            }
+            assert!(tries < 60, "heal_cancel slot never appeared");
+        }
+
+        let result = heal_task.await.unwrap().expect("heal should resolve on cancel");
+        match result.outcome {
+            HealOutcome::Cancelled { deterministic_applied } => {
+                assert!(
+                    deterministic_applied > 0,
+                    "pre-pass should have applied at least the position fix; got {deterministic_applied}",
+                );
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+
+        // The position fix MUST be on disk.
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+        let y = patched["layout"]["nodePositions"]["intg1"]["y"].as_f64().unwrap();
+        assert!(
+            (y - 120.0).abs() < f64::EPSILON,
+            "cancel must persist deterministic patches — integration y should be 120, got {y}",
         );
+    }
+
+    #[tokio::test]
+    async fn heal_deterministic_pass_alone_repairs_missing_edge_without_llm() {
+        // The fast-path's load-bearing scenario: a valid file with an
+        // incomplete wiring (event not yet feeding its query), backed by
+        // NeoHaskell code that says the edge SHOULD exist. The Rust
+        // deterministic pass identifies the missing edge, patches the
+        // file, re-validates, and writes — claude is never spawned.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model_path = workspace.join("event-model.json");
+        // Hand-build a small valid model where ItemAdded already exists
+        // but the eventFeedsQuery edge to CartSummary is missing.
+        let base_model = serde_json::json!({
+            "id": "m1",
+            "name": "demo",
+            "chapters": [{ "id": "ch1", "name": "Main", "order": 0 }],
+            "entities": [{ "id": "ent1", "name": "Cart", "order": 0 }],
+            "slices": [
+                { "id": "sl1", "name": "AddItem",     "chapterId": "ch1", "order": 0 },
+                { "id": "sl2", "name": "CartSummary", "chapterId": "ch1", "order": 1 }
+            ],
+            "nodes": [
+                { "id": "cmd1", "type": "command", "name": "AddItem",     "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "ev1",  "type": "event",   "name": "ItemAdded",   "sliceId": "sl1", "entityId": "ent1" },
+                { "id": "qy1",  "type": "query",   "name": "CartSummary", "sliceId": "sl2" }
+            ],
+            "edges": [
+                // commandProducesEvent IS already there.
+                { "id": "e1", "type": "commandProducesEvent", "sourceId": "cmd1", "targetId": "ev1" }
+                // eventFeedsQuery to qy1 is MISSING — diff must add it.
+            ],
+            "layout": {
+                "nodePositions": {
+                    "cmd1": { "x": 40,  "y": 120 },
+                    "ev1":  { "x": 40,  "y": 400 },
+                    "qy1":  { "x": 440, "y": 170 }
+                },
+                "viewport": { "x": 0, "y": 0, "zoom": 1 }
+            }
+        });
+        std::fs::write(
+            &model_path,
+            serde_json::to_string_pretty(&base_model).unwrap(),
+        )
+        .unwrap();
+
+        // NeoHaskell backing.
+        let core = workspace.join("src/App/Cart/Core.hs");
+        std::fs::create_dir_all(core.parent().unwrap()).unwrap();
+        std::fs::write(
+            &core,
+            "module App.Cart.Core where\n\
+             data CartEvent = ItemAdded {} deriving (Generic)\n",
+        )
+        .unwrap();
+        let cmd = workspace.join("src/App/Cart/Commands/AddItem.hs");
+        std::fs::create_dir_all(cmd.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cmd,
+            "module App.Cart.Commands.AddItem where\n\
+             decide :: AddItem -> Maybe CartEntity -> RequestContext -> Decision CartEvent\n\
+             decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+        )
+        .unwrap();
+        let qry = workspace.join("src/App/Cart/Queries/CartSummary.hs");
+        std::fs::create_dir_all(qry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &qry,
+            "module App.Cart.Queries.CartSummary where\n\
+             -- subscribes to ItemAdded for the count\n",
+        )
+        .unwrap();
+
+        // The stub MUST NOT run — point at a non-existent binary so this
+        // test fails loudly if the fast-path regresses and tries to spawn.
+        let bogus = std::path::PathBuf::from("/nonexistent/heal-stub");
+
+        let session = fixture_session(workspace);
+        let result = handle_with_config(session, HealMode::Improve, quick_config(bogus, 10_000))
+            .await
+            .expect("deterministic pass should fix the file without claude");
+        assert_eq!(result.outcome, HealOutcome::Healed);
+
+        // The eventFeedsQuery edge is now in the on-disk file.
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+        let edges = patched["edges"].as_array().unwrap();
+        assert!(
+            edges.iter().any(|e| {
+                e["type"] == "eventFeedsQuery"
+                    && e["sourceId"] == "ev1"
+                    && e["targetId"] == "qy1"
+            }),
+            "deterministic pass should have added the eventFeedsQuery edge; got: {:?}",
+            edges,
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_improve_mode_skips_subprocess_when_no_residuals() {
+        // Improve mode on a valid file with NO NeoHaskell context (so the
+        // deterministic pass finds zero residuals) MUST short-circuit. The
+        // old behavior always spawned claude here; the new architecture
+        // saves the API tokens.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::write(workspace.join("event-model.json"), VALID_MODEL).unwrap();
+
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub_dir.path().join("claude");
+        write_stub(&stub_path, "echo 'STUB RAN — should not have been invoked'\nexit 1");
 
         let session = fixture_session(workspace);
         let result = handle_with_config(session, HealMode::Improve, quick_config(stub_path, 10_000))
             .await
-            .expect("improve mode should succeed");
-        // Outcome is Healed because the file is still valid after the no-op stub.
+            .expect("improve mode on a clean valid file should short-circuit");
         assert_eq!(result.outcome, HealOutcome::Healed);
-        // And the stub WAS invoked.
+    }
+
+    #[tokio::test]
+    async fn heal_returns_healed_writes_agent_payload_to_disk_atomically() {
+        // The heal flow's contract: the agent's `eventModel` field is
+        // what lands on disk — not whatever was previously there. Use a
+        // healed payload whose `id` is unique so the assertion can't
+        // false-pass against the INVALID_MODEL we wrote first.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model_path = workspace.join("event-model.json");
+        std::fs::write(&model_path, INVALID_MODEL).unwrap();
+
+        let healed_sentinel = r#"{
+  "id": "HEALED_FROM_AGENT",
+  "name": "agent-output",
+  "chapters": [],
+  "entities": [],
+  "slices": [],
+  "nodes": [],
+  "edges": [],
+  "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}"#;
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub_dir.path().join("claude");
+        let result_line = stream_json_result_line(healed_sentinel);
+        write_stub(&stub_path, &stub_emitting_result(&result_line));
+
+        let session = fixture_session(workspace);
+        let result = handle_with_config(session, HealMode::Validate, quick_config(stub_path, 10_000))
+            .await
+            .expect("heal should succeed");
+        assert_eq!(result.outcome, HealOutcome::Healed);
+
+        let on_disk = std::fs::read_to_string(&model_path).unwrap();
         assert!(
-            marker.exists(),
-            "improve mode must invoke claude even on a valid file (marker missing)",
+            on_disk.contains("HEALED_FROM_AGENT"),
+            "file must contain the agent's healed payload, got: {on_disk}",
         );
+        // The tmp file should be gone.
+        let tmp = model_path.with_extension("json.heal-tmp");
+        assert!(!tmp.exists(), "temp file should have been renamed away");
+    }
+
+    #[tokio::test]
+    async fn heal_extracts_structured_output_from_legacy_result_string() {
+        // Regression test for the fallback path: when the `result` event
+        // has no top-level `structured_output` field (i.e. claude-code was
+        // invoked WITHOUT `--json-schema`, or an older version), the
+        // extractor must fall back to parsing `result.result` as a JSON
+        // string. This is the path the original code took before we
+        // wired `--json-schema`, and it should keep working.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model_path = workspace.join("event-model.json");
+        std::fs::write(&model_path, INVALID_MODEL).unwrap();
+
+        let healed_sentinel = r#"{
+  "id": "HEALED_FROM_LEGACY",
+  "name": "legacy-output",
+  "chapters": [],
+  "entities": [],
+  "slices": [],
+  "nodes": [],
+  "edges": [],
+  "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}"#;
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub_dir.path().join("claude");
+        let result_line = stream_json_result_line_legacy(healed_sentinel);
+        write_stub(&stub_path, &stub_emitting_result(&result_line));
+
+        let session = fixture_session(workspace);
+        let result = handle_with_config(session, HealMode::Validate, quick_config(stub_path, 10_000))
+            .await
+            .expect("heal should succeed via legacy result.result path");
+        assert_eq!(result.outcome, HealOutcome::Healed);
+
+        let on_disk = std::fs::read_to_string(&model_path).unwrap();
+        assert!(
+            on_disk.contains("HEALED_FROM_LEGACY"),
+            "file must contain the legacy-path healed payload, got: {on_disk}",
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_returns_failed_when_agent_emits_no_result_event() {
+        // If the stub exits 0 without emitting any `result` event,
+        // the parser has nothing to write. Surface as HealingFailed
+        // (not StillInvalid) — the agent fundamentally didn't respond.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        std::fs::write(workspace.join("event-model.json"), INVALID_MODEL).unwrap();
+
+        let stub_dir = tempfile::tempdir().unwrap();
+        let stub_path = stub_dir.path().join("claude");
+        write_stub(&stub_path, "echo 'no structured output here'\nexit 0");
+
+        let session = fixture_session(workspace);
+        let result = handle_with_config(session, HealMode::Validate, quick_config(stub_path, 10_000))
+            .await;
+        match result {
+            Err(NeoError::HealingFailed { reason, .. }) => {
+                assert!(
+                    reason.contains("no usable structured output") || reason.contains("result"),
+                    "reason should explain the missing result event: {reason}",
+                );
+            }
+            other => panic!("expected HealingFailed, got {other:?}"),
+        }
     }
 }

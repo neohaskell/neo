@@ -22,6 +22,22 @@ export type HealEvent =
   | { id: string; kind: 'tool_use'; name: string; input: string }
   | { id: string; kind: 'tool_result'; preview: string; truncated: boolean }
   | { id: string; kind: 'status'; label: string }
+  | {
+      id: string
+      kind: 'api_retry'
+      attempt: number
+      maxRetries: number
+      delayMs: number
+      errorStatus: number
+      error: string
+    }
+  | {
+      id: string
+      kind: 'auto_repair'
+      appliedCount: number
+      residualCount: number
+      summary: string
+    }
   | { id: string; kind: 'raw'; text: string; stream: 'stdout' | 'stderr' }
 
 const TOOL_RESULT_PREVIEW_CHARS = 400
@@ -64,10 +80,50 @@ export function reduceHealLine(
       if (last?.kind === 'status' && last.label === obj.status) return events
       return [...events, { id: nextId(), kind: 'status', label: obj.status }]
     }
+    if (obj.subtype === 'api_retry') {
+      // claude-code retries on HTTP 429/529. Render as a single card that
+      // updates in place across attempts so the user sees a climbing
+      // counter, not a wall of duplicate warnings.
+      const attempt = numOr(obj.attempt, 0)
+      const maxRetries = numOr(obj.max_retries, 0)
+      const delayMs = numOr(obj.retry_delay_ms, 0)
+      const errorStatus = numOr(obj.error_status, 0)
+      const error = typeof obj.error === 'string' ? obj.error : 'unknown'
+      const card: HealEvent = {
+        id: nextId(),
+        kind: 'api_retry',
+        attempt,
+        maxRetries,
+        delayMs,
+        errorStatus,
+        error,
+      }
+      const last = events[events.length - 1]
+      if (last?.kind === 'api_retry') {
+        return [...events.slice(0, -1), { ...card, id: last.id }]
+      }
+      return [...events, card]
+    }
     return events
   }
 
   if (obj.type === 'rate_limit_event') return events // not interesting to humans
+
+  if (obj.type === 'neo_auto_repair') {
+    // Synthetic event minted by App.tsx when the backend sends the
+    // `autoRepair` $/progress notification. Always one card per event —
+    // the backend emits it at most once per heal run.
+    return [
+      ...events,
+      {
+        id: nextId(),
+        kind: 'auto_repair',
+        appliedCount: numOr(obj.appliedCount, 0),
+        residualCount: numOr(obj.residualCount, 0),
+        summary: typeof obj.summary === 'string' ? obj.summary : '',
+      },
+    ]
+  }
 
   if (obj.type === 'user') {
     // Tool results come back as user messages with `content: [{type: "tool_result", ...}]`
@@ -153,6 +209,10 @@ export function reduceHealLine(
 
   // Unknown structured event — fall back to raw so nothing gets silently lost.
   return [...events, { id: nextId(), kind: 'raw', text: log.line, stream: log.stream }]
+}
+
+function numOr(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
 function appendOrCreate(

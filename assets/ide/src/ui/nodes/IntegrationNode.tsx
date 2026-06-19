@@ -1,5 +1,5 @@
-import { Handle, Position } from '@xyflow/react'
 import { EditableLabel } from './EditableLabel'
+import { NodeHandles } from './NodeHandles'
 import { MAX_NODE_WIDTH, MIN_NODE_WIDTH } from './nodeDimensions'
 
 interface Props {
@@ -14,14 +14,13 @@ export function IntegrationNodeComponent({ data, selected }: Props) {
       style={{ minWidth: MIN_NODE_WIDTH, maxWidth: MAX_NODE_WIDTH }}
     >
       {selected && <div className="absolute inset-0 bg-blue-500/30 rounded pointer-events-none" />}
-      <Handle id="left" type="source" position={Position.Left} />
+      <NodeHandles />
       <span>{'\u2699'}</span>{' '}
       {data.onRename ? (
         <EditableLabel label={data.label} onRename={data.onRename} />
       ) : (
         data.label
       )}
-      <Handle id="right" type="source" position={Position.Right} />
     </div>
   )
 }

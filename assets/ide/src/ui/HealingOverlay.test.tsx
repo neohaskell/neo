@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { describe, it, expect, vi } from 'vitest'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { HealingOverlay } from './HealingOverlay'
 
 describe('HealingOverlay', () => {
@@ -185,6 +185,73 @@ describe('HealingOverlay', () => {
     )
     const raw = screen.getByTestId('heal-event-raw')
     expect(raw.textContent).toContain('plain text from the subprocess')
+  })
+
+  it('renders an auto_repair card showing applied count and residuals', () => {
+    render(
+      <HealingOverlay
+        log={[
+          {
+            stream: 'stdout',
+            line: JSON.stringify({
+              type: 'neo_auto_repair',
+              appliedCount: 7,
+              residualCount: 3,
+              summary: '5 edges, 1 kind fix, 0 position fixes, 1 layout entry, 3 residuals',
+            }),
+          },
+        ]}
+      />,
+    )
+    const card = screen.getByTestId('heal-event-auto-repair')
+    expect(card.textContent).toContain('Auto-repaired 7 items')
+    expect(card.textContent).toContain('3 residuals')
+  })
+
+  it('renders an api_retry card with the overloaded reason, attempt count, and delay', () => {
+    render(
+      <HealingOverlay
+        log={[
+          {
+            stream: 'stdout',
+            line: JSON.stringify({
+              type: 'system',
+              subtype: 'api_retry',
+              attempt: 2,
+              max_retries: 10,
+              retry_delay_ms: 1193,
+              error_status: 529,
+              error: 'rate_limit',
+            }),
+          },
+        ]}
+      />,
+    )
+    const card = screen.getByTestId('heal-event-api-retry')
+    expect(card.textContent).toMatch(/overloaded/i)
+    expect(card.textContent).toContain('attempt 2/10')
+    expect(card.textContent).toContain('1.2s')
+  })
+
+  it('renders a Cancel button only when onCancel is supplied', () => {
+    const { rerender } = render(<HealingOverlay />)
+    expect(screen.queryByTestId('heal-cancel')).not.toBeInTheDocument()
+    rerender(<HealingOverlay onCancel={() => {}} />)
+    expect(screen.getByTestId('heal-cancel')).toBeInTheDocument()
+  })
+
+  it('fires onCancel when the user clicks Cancel', () => {
+    const onCancel = vi.fn()
+    render(<HealingOverlay onCancel={onCancel} />)
+    fireEvent.click(screen.getByTestId('heal-cancel'))
+    expect(onCancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('disables Cancel and shows "Cancelling…" while cancelling is true', () => {
+    render(<HealingOverlay onCancel={() => {}} cancelling />)
+    const btn = screen.getByTestId('heal-cancel') as HTMLButtonElement
+    expect(btn.disabled).toBe(true)
+    expect(btn.textContent).toMatch(/cancelling/i)
   })
 
   it('updates the step counter from "waiting" to the timeline length', () => {

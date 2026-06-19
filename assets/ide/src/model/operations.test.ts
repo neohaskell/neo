@@ -18,6 +18,10 @@ import {
   removeSlice,
   reorderEventsInEntity,
   updateNodeName,
+  addSubmodel,
+  renameSubmodel,
+  removeSubmodel,
+  assignChapterToSubmodel,
 } from './operations'
 import type {
   EventModel,
@@ -612,5 +616,61 @@ describe('updateNodeName', () => {
     const model = modelWithEvent()
     const result = updateNodeName(model, 'nonexistent', 'X')
     expect(result).toBe(model)
+  })
+})
+
+// ── Submodels ───────────────────────────────────────────────
+
+describe('submodels', () => {
+  it('createEventModel starts with an empty submodels array', () => {
+    expect(createEventModel('T').submodels).toEqual([])
+  })
+
+  it('addSubmodel appends with incrementing order', () => {
+    let model = createEventModel('T')
+    model = addSubmodel(model, { name: 'Checkout' })
+    model = addSubmodel(model, { name: 'Fulfilment' })
+    expect(model.submodels.map((s) => [s.name, s.order])).toEqual([
+      ['Checkout', 0],
+      ['Fulfilment', 1],
+    ])
+  })
+
+  it('renameSubmodel changes only the named submodel', () => {
+    let model = addSubmodel(createEventModel('T'), { name: 'Old' })
+    const id = model.submodels[0].id
+    model = renameSubmodel(model, id, 'New')
+    expect(model.submodels[0].name).toBe('New')
+  })
+
+  it('assignChapterToSubmodel sets and clears submodelId', () => {
+    let model = addChapter(createEventModel('T'), { name: 'Cart' })
+    model = addSubmodel(model, { name: 'Checkout' })
+    const chapterId = model.chapters[0].id
+    const submodelId = model.submodels[0].id
+    model = assignChapterToSubmodel(model, chapterId, submodelId)
+    expect(model.chapters[0].submodelId).toBe(submodelId)
+    model = assignChapterToSubmodel(model, chapterId, null)
+    expect(model.chapters[0].submodelId).toBeNull()
+  })
+
+  it('assignChapterToSubmodel is a no-op for unknown chapter or submodel', () => {
+    let model = addChapter(createEventModel('T'), { name: 'Cart' })
+    model = addSubmodel(model, { name: 'Checkout' })
+    const chapterId = model.chapters[0].id
+    expect(assignChapterToSubmodel(model, 'ghost', model.submodels[0].id)).toBe(model)
+    expect(assignChapterToSubmodel(model, chapterId, 'ghost')).toBe(model)
+  })
+
+  it('removeSubmodel drops the submodel and detaches (not deletes) its chapters', () => {
+    let model = addChapter(createEventModel('T'), { name: 'Cart' })
+    model = addSubmodel(model, { name: 'Checkout' })
+    const chapterId = model.chapters[0].id
+    const submodelId = model.submodels[0].id
+    model = assignChapterToSubmodel(model, chapterId, submodelId)
+    model = removeSubmodel(model, submodelId)
+    expect(model.submodels).toEqual([])
+    expect(model.chapters).toHaveLength(1)
+    expect(model.chapters[0].submodelId).toBeNull()
   })
 })

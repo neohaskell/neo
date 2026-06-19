@@ -216,6 +216,36 @@ fn referential_integrity_errors(value: &Value) -> Vec<ValidationError> {
         }
     }
 
+    // `submodels` is an OPTIONAL top-level grouping (a submodel = a feature
+    // that owns one or more chapters, stacked vertically). Older files predate
+    // it, so treat a missing array as empty. Every `chapter.submodelId` that is
+    // a string must reference an existing submodel.
+    let submodel_ids: HashSet<&str> = obj
+        .get("submodels")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| s.get("id").and_then(Value::as_str))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for (i, chapter) in chapters.iter().enumerate() {
+        let chapter_id = chapter.get("id").and_then(Value::as_str).unwrap_or("?");
+        if let Some(sid_value) = chapter.get("submodelId")
+            && let Some(sid) = sid_value.as_str()
+            && !submodel_ids.contains(sid)
+        {
+            errors.push(ValidationError {
+                pointer: format!("/chapters/{i}/submodelId"),
+                message: format!(
+                    "Chapter `{chapter_id}`: `submodelId` references submodel `{sid}`, which is not in the `submodels` array. Fix: add a submodel with `id` = `{sid}` to `submodels`, OR change `submodelId` to an existing submodel id, OR set `submodelId` to null."
+                ),
+                kind: ErrorKind::ReferentialIntegrity,
+            });
+        }
+    }
+
     errors
 }
 
@@ -289,6 +319,49 @@ mod tests {
             }
         });
         let raw = serde_json::to_string(&model).unwrap();
+        assert_eq!(validate_event_model(&raw), ValidationOutcome::Valid);
+    }
+
+    #[test]
+    fn valid_model_with_submodel_and_chapter_membership_passes() {
+        let mut m = minimal_valid();
+        m["submodels"] = json!([{"id": "sm1", "name": "Checkout", "order": 0}]);
+        m["chapters"] = json!([{"id": "c1", "name": "C", "order": 0, "submodelId": "sm1"}]);
+        let raw = serde_json::to_string(&m).unwrap();
+        assert_eq!(validate_event_model(&raw), ValidationOutcome::Valid);
+    }
+
+    #[test]
+    fn model_without_submodels_array_is_valid_backcompat() {
+        // Files authored before submodels existed have no `submodels` key and
+        // no `submodelId` on chapters — they must keep validating.
+        let mut m = minimal_valid();
+        m["chapters"] = json!([{"id": "c1", "name": "C", "order": 0}]);
+        let raw = serde_json::to_string(&m).unwrap();
+        assert_eq!(validate_event_model(&raw), ValidationOutcome::Valid);
+    }
+
+    #[test]
+    fn referential_chapter_unknown_submodel_fails() {
+        let mut m = minimal_valid();
+        m["submodels"] = json!([{"id": "sm1", "name": "Checkout", "order": 0}]);
+        m["chapters"] = json!([{"id": "c1", "name": "C", "order": 0, "submodelId": "ghost"}]);
+        let raw = serde_json::to_string(&m).unwrap();
+        let errs = invalid_errors(validate_event_model(&raw));
+        assert!(
+            errs.iter().any(|e| e.kind == ErrorKind::ReferentialIntegrity
+                && e.pointer == "/chapters/0/submodelId"
+                && e.message.contains("ghost")),
+            "expected a referential error for the dangling submodelId, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn referential_chapter_null_submodel_ok() {
+        let mut m = minimal_valid();
+        m["submodels"] = json!([]);
+        m["chapters"] = json!([{"id": "c1", "name": "C", "order": 0, "submodelId": null}]);
+        let raw = serde_json::to_string(&m).unwrap();
         assert_eq!(validate_event_model(&raw), ValidationOutcome::Valid);
     }
 

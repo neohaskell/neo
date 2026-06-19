@@ -196,6 +196,8 @@ export function buildGridNodes(
   onChapterSelect?: (chapterId: string) => void,
   onChapterEndDrag?: (chapterId: string, flowX: number) => void,
   onChapterEndDrop?: (chapterId: string, flowX: number) => void,
+  submodels?: readonly { id: string; name: string }[],
+  onAssignChapterToSubmodel?: (chapterId: string, submodelId: string | null) => void,
 ): GridNodes {
   const sortedEntities = [...model.entities].sort((a, b) => a.order - b.order)
   const sliceLayouts = computeSliceLayouts(model)
@@ -265,6 +267,7 @@ export function buildGridNodes(
   // Build chapter arrow nodes
   const sortedChapters = [...model.chapters].sort((a, b) => a.order - b.order)
 
+  const submodelList = submodels ?? model.submodels
   let unassignedIdx = 0
   const chapterArrowNodes: Node[] = sortedChapters.map((chapter) => {
     const chapterSliceIds = model.slices
@@ -315,6 +318,12 @@ export function buildGridNodes(
           : undefined,
         onEndHandleDrop: onChapterEndDrop
           ? (flowX: number) => onChapterEndDrop(chapter.id, flowX)
+          : undefined,
+        submodels: submodelList,
+        currentSubmodelId: chapter.submodelId ?? null,
+        onAssignSubmodel: onAssignChapterToSubmodel
+          ? (submodelId: string | null) =>
+              onAssignChapterToSubmodel(chapter.id, submodelId)
           : undefined,
       },
       draggable: true,

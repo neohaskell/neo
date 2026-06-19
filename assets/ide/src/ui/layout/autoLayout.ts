@@ -24,6 +24,7 @@
 // untouched; only out-of-band y values are snapped.
 
 import type { EventModel, NodeType } from '../../model/types'
+import { buildNodeSubmodelMap } from './submodels'
 
 /** Default per-slice column width when we have to invent positions. */
 const SLICE_AUTO_WIDTH = 400
@@ -63,6 +64,12 @@ export function autoLayoutMissingPositions(model: EventModel): EventModel {
   // Per-(slice, type, entity) bucket counter for stacking siblings.
   const stackCounter = new Map<string, number>()
 
+  // The absolute y-band convention only holds for the single ungrouped
+  // timeline. Nodes that belong to a submodel live in that submodel's own
+  // vertical band (a command there can legitimately sit at y = 1020), so we
+  // must NOT snap their y — only fill a genuinely missing position.
+  const nodeSubmodel = buildNodeSubmodelMap(model)
+
   const updated = { ...model.layout.nodePositions }
   let touched = false
 
@@ -70,10 +77,11 @@ export function autoLayoutMissingPositions(model: EventModel): EventModel {
     const existing = updated[node.id]
     const hasRealPosition =
       existing && (existing.x !== 0 || existing.y !== 0)
+    const inSubmodel = (nodeSubmodel.get(node.id) ?? null) !== null
     const yInCorrectBand =
       hasRealPosition && isYInCorrectBand(node.type, existing.y)
 
-    if (hasRealPosition && yInCorrectBand) continue
+    if (hasRealPosition && (yInCorrectBand || inSubmodel)) continue
 
     const sIdx =
       node.sliceId !== null ? sliceIndex.get(node.sliceId) ?? 0 : 0

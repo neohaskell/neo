@@ -11,6 +11,9 @@ interface Props {
     onRename?: (name: string) => void
     onEndHandleDrag?: (flowX: number) => void
     onEndHandleDrop?: (flowX: number) => void
+    submodels?: readonly { id: string; name: string }[]
+    currentSubmodelId?: string | null
+    onAssignSubmodel?: (submodelId: string | null) => void
   }
 }
 
@@ -95,7 +98,7 @@ export function ChapterArrowNodeComponent({ data }: Props) {
           onPointerUp={handleEndPointerUp}
         />
         {/* Label */}
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-auto">
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-auto flex flex-col items-center gap-0.5">
           <span className="bg-white px-3 py-0.5 text-blue-600 font-semibold text-sm whitespace-nowrap">
             {data.onRename ? (
               <EditableLabel label={data.label} onRename={data.onRename} />
@@ -103,6 +106,26 @@ export function ChapterArrowNodeComponent({ data }: Props) {
               data.label
             )}
           </span>
+          {data.submodels && data.submodels.length > 0 && data.onAssignSubmodel && (
+            <select
+              className="bg-white border border-indigo-200 rounded text-[10px] text-indigo-600 px-1 py-px nodrag"
+              value={data.currentSubmodelId ?? ''}
+              onClick={(e) => e.stopPropagation()}
+              onMouseDown={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                e.stopPropagation()
+                data.onAssignSubmodel?.(e.target.value === '' ? null : e.target.value)
+              }}
+              title="Group this chapter under a submodel"
+            >
+              <option value="">— no submodel —</option>
+              {data.submodels.map((sm) => (
+                <option key={sm.id} value={sm.id}>
+                  {sm.name}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
       </div>
     </div>

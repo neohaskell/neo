@@ -5,11 +5,12 @@
 //! task-local globals or a separate `Ctx` argument to find the workspace
 //! they're operating on.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
 
 use crate::ide::workspace::Workspace;
 
@@ -62,6 +63,13 @@ pub struct Session {
     /// minted outside a real connection (most unit tests). When `None`,
     /// `notify` silently drops — handlers can call it unconditionally.
     outbound_tx: Option<OutboundSender>,
+    /// Cancellation signal for the in-flight `workspace/healEventModel`
+    /// request. The heal handler installs a `Notify` here while a heal is
+    /// running, then clears it on exit. `workspace/cancelHealEventModel`
+    /// reads this slot and calls `notify_one()` so the heal's `tokio::select!`
+    /// can race the cancel against `child.wait()`. `Arc<Mutex<…>>` so all
+    /// `Session` clones (one per RPC dispatch) see the same slot.
+    heal_cancel: Arc<Mutex<Option<Arc<Notify>>>>,
 }
 
 impl Session {
@@ -70,6 +78,7 @@ impl Session {
             id: SessionId::mint(),
             workspace,
             outbound_tx: None,
+            heal_cancel: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -94,6 +103,51 @@ impl Session {
         let _ = tx.send(OutboundMessage::Notification(notif));
     }
 
+    /// Install a cancellation `Notify` for the in-flight heal. The
+    /// returned guard clears the slot on drop so even a panicking heal
+    /// handler doesn't leave a stale `Notify` behind that the next
+    /// `cancelHealEventModel` call would mis-fire on.
+    pub fn install_heal_cancel(&self) -> (Arc<Notify>, HealCancelGuard) {
+        let notify = Arc::new(Notify::new());
+        if let Ok(mut guard) = self.heal_cancel.lock() {
+            *guard = Some(notify.clone());
+        }
+        let cleanup = HealCancelGuard {
+            slot: Arc::clone(&self.heal_cancel),
+        };
+        (notify, cleanup)
+    }
+
+    /// Signal the in-flight heal (if any) to cancel. Returns `true` when
+    /// a `Notify` was registered (a heal was actually running), `false`
+    /// when nothing was in flight.
+    pub fn cancel_heal(&self) -> bool {
+        let notify = match self.heal_cancel.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        match notify {
+            Some(n) => {
+                n.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// RAII guard for the heal-cancel slot. Clears the session's
+/// `heal_cancel` on drop so the next heal doesn't see a stale token.
+pub struct HealCancelGuard {
+    slot: Arc<Mutex<Option<Arc<Notify>>>>,
+}
+
+impl Drop for HealCancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
+        }
+    }
 }
 
 #[cfg(test)]

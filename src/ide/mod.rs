@@ -8,6 +8,7 @@
 //! Public surface is `AppState` (the axum router state) and the `methods` /
 //! `server` entry points wired in by `commands/ide.rs`.
 
+pub mod heal;
 pub mod methods;
 pub mod registry;
 pub mod rpc;

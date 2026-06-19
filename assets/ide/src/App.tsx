@@ -12,6 +12,7 @@ import { saveToStorage, loadFromStorage } from './io/persistence'
 import { getEdgeTypeForConnection } from './ui/connectionRules'
 import { computeNodeAlignments } from './ui/layout/grid'
 import { autoLayoutMissingPositions } from './ui/layout/autoLayout'
+import { stackSubmodels } from './ui/layout/submodels'
 import type { EdgeType } from './model/types'
 import { IdeClient, type ConnectionState, type RpcResult } from './ipc/client'
 import { initialize, type InitializeResult } from './ipc/initialize'
@@ -19,6 +20,8 @@ import {
   readEventModel,
   writeEventModel,
   healEventModel,
+  cancelHealEventModel,
+  relayoutEventModel,
   type ReadEventModelResult,
   type ValidationError,
 } from './ipc/eventModel'
@@ -59,6 +62,8 @@ function App() {
     preamble?: string
   } | null>(null)
   const [healing, setHealing] = useState(false)
+  const [cancellingHeal, setCancellingHeal] = useState(false)
+  const [relayouting, setRelayouting] = useState(false)
   const [healLog, setHealLog] = useState<HealLogLine[]>([])
   const clientRef = useRef<IdeClient | null>(null)
 
@@ -72,12 +77,47 @@ function App() {
     if (!client) return
     setHealLog([])
     const unsubscribe = client.onNotification('$/progress', (params: unknown) => {
-      const p = params as { token?: string; value?: { kind?: string; stream?: 'stdout' | 'stderr'; line?: string } } | undefined
+      const p = params as
+        | {
+            token?: string
+            value?: {
+              kind?: string
+              stream?: 'stdout' | 'stderr'
+              line?: string
+              appliedCount?: number
+              residualCount?: number
+              summary?: string
+            }
+          }
+        | undefined
       if (!p || p.token !== 'healEventModel') return
       const value = p.value
-      if (!value || value.kind !== 'log') return
-      if (typeof value.line !== 'string' || (value.stream !== 'stdout' && value.stream !== 'stderr')) return
-      setHealLog((prev) => [...prev, { stream: value.stream!, line: value.line! }])
+      if (!value) return
+      if (
+        value.kind === 'log' &&
+        typeof value.line === 'string' &&
+        (value.stream === 'stdout' || value.stream === 'stderr')
+      ) {
+        setHealLog((prev) => [...prev, { stream: value.stream!, line: value.line! }])
+        return
+      }
+      if (value.kind === 'autoRepair') {
+        // The deterministic Rust pre-pass announces what it just patched.
+        // Surface it as a synthetic stdout line so the existing reducer
+        // can turn it into a structured `auto_repair` event card.
+        setHealLog((prev) => [
+          ...prev,
+          {
+            stream: 'stdout',
+            line: JSON.stringify({
+              type: 'neo_auto_repair',
+              appliedCount: value.appliedCount ?? 0,
+              residualCount: value.residualCount ?? 0,
+              summary: value.summary ?? '',
+            }),
+          },
+        ])
+      }
     })
     return unsubscribe
   }, [healing])
@@ -160,6 +200,7 @@ function App() {
     if (!healRes.ok) {
       setToastMessage(`Healing failed: ${healRes.error.message}`)
       setHealing(false)
+      setCancellingHeal(false)
       setPendingInvalid(null)
       return
     }
@@ -170,11 +211,28 @@ function App() {
           'Healing ran but the file is still invalid. Click Heal to try again, or Cancel to keep your local copy.',
       })
       setHealing(false)
+      setCancellingHeal(false)
+      return
+    }
+    if (healRes.result.outcome.status === 'cancelled') {
+      const applied = healRes.result.outcome.deterministicApplied
+      setToastMessage(
+        applied > 0
+          ? `Heal cancelled — kept ${applied} deterministic fix${applied === 1 ? '' : 'es'}.`
+          : 'Heal cancelled.',
+      )
+      setHealing(false)
+      setCancellingHeal(false)
+      setPendingInvalid(null)
+      // The deterministic patches are on disk — pull them in so the canvas reflects them.
+      const reload = await readEventModel(client)
+      applyReadResult(reload)
       return
     }
     // Healed — reload from disk.
     const reload = await readEventModel(client)
     setHealing(false)
+    setCancellingHeal(false)
     setPendingInvalid(null)
     applyReadResult(reload)
   }, [applyReadResult])
@@ -182,6 +240,25 @@ function App() {
   const handleHealCancel = useCallback(() => {
     setPendingInvalid(null)
   }, [])
+
+  // Cancel button on the in-flight HealingOverlay. Fires the
+  // `workspace/cancelHealEventModel` RPC; the in-flight heal promise
+  // resolves with `outcome.status === 'cancelled'` and the handlers
+  // above transition the UI back out of the healing state.
+  const handleAbortHeal = useCallback(async () => {
+    const client = clientRef.current
+    if (!client || cancellingHeal) return
+    setCancellingHeal(true)
+    const res = await cancelHealEventModel(client)
+    if (!res.ok) {
+      setToastMessage(`Could not cancel heal: ${res.error.message}`)
+      setCancellingHeal(false)
+    }
+    // On success we deliberately leave `cancellingHeal=true` until the
+    // in-flight `healEventModel` promise resolves with the cancelled
+    // outcome (or with the agent's already-completed result if cancel
+    // raced the LLM exit). That handler resets the state.
+  }, [cancellingHeal])
 
   // Manual "Heal with AI" button on the FileMenu. Always invokes claude
   // (mode='improve'), even when validation is passing — that's how the
@@ -203,6 +280,7 @@ function App() {
     if (!healRes.ok) {
       setToastMessage(`Healing failed: ${healRes.error.message}`)
       setHealing(false)
+      setCancellingHeal(false)
       return
     }
     if (healRes.result.outcome.status === 'stillInvalid') {
@@ -212,11 +290,60 @@ function App() {
           'The AI improved the file but it now has validation errors. Cancel to keep the agent’s changes on disk, or Heal to ask the agent to fix them.',
       })
       setHealing(false)
+      setCancellingHeal(false)
+      return
+    }
+    if (healRes.result.outcome.status === 'cancelled') {
+      const applied = healRes.result.outcome.deterministicApplied
+      setToastMessage(
+        applied > 0
+          ? `Heal cancelled — kept ${applied} deterministic fix${applied === 1 ? '' : 'es'}.`
+          : 'Heal cancelled.',
+      )
+      setHealing(false)
+      setCancellingHeal(false)
+      const reload = await readEventModel(client)
+      applyReadResult(reload)
       return
     }
     // Reload from disk.
     const reload = await readEventModel(client)
     setHealing(false)
+    setCancellingHeal(false)
+    applyReadResult(reload)
+  }, [applyReadResult, dirty])
+
+  // Quick "Re-layout" button (FileMenu). Runs the deterministic layout
+  // pass server-side — no LLM, no model structural changes — and reloads
+  // the file. Disabled when a heal is in flight (mutual exclusion).
+  const handleRelayout = useCallback(async () => {
+    const client = clientRef.current
+    if (!client) {
+      setToastMessage('not connected to neo — cannot re-layout')
+      return
+    }
+    if (dirty) {
+      const confirmed = window.confirm(
+        'You have unsaved changes. Re-layout will overwrite the file on disk; your unsaved work will be discarded on reload. Continue?',
+      )
+      if (!confirmed) return
+    }
+    setRelayouting(true)
+    const res = await relayoutEventModel(client)
+    if (!res.ok) {
+      setToastMessage(`Re-layout failed: ${res.error.message}`)
+      setRelayouting(false)
+      return
+    }
+    if (res.result.applied === 0) {
+      setToastMessage('Layout already canonical — no changes.')
+    } else {
+      setToastMessage(
+        `Re-layout applied ${res.result.applied} fix${res.result.applied === 1 ? '' : 'es'}.`,
+      )
+    }
+    const reload = await readEventModel(client)
+    setRelayouting(false)
     applyReadResult(reload)
   }, [applyReadResult, dirty])
 
@@ -410,6 +537,54 @@ function App() {
     [markDirty],
   )
 
+  const handleAddSubmodel = useCallback(() => {
+    dispatch({ type: 'addSubmodel', name: 'New Submodel' })
+    markDirty()
+  }, [markDirty])
+
+  const handleRenameSubmodel = useCallback(
+    (submodelId: string, name: string) => {
+      dispatch({ type: 'renameSubmodel', submodelId, name })
+      markDirty()
+    },
+    [markDirty],
+  )
+
+  const handleRemoveSubmodel = useCallback(
+    (submodelId: string) => {
+      // Detach the submodel's chapters, then re-stack so the freed nodes
+      // settle back out of the (now gone) band.
+      const afterRemove = reducer(modelRef.current, { type: 'removeSubmodel', submodelId })
+      const adjustments = stackSubmodels(afterRemove)
+      dispatch({ type: 'removeSubmodel', submodelId })
+      if (adjustments.length > 0) {
+        dispatch({ type: 'batchUpdatePositions', changes: adjustments })
+      }
+      markDirty()
+    },
+    [markDirty],
+  )
+
+  const handleAssignChapterToSubmodel = useCallback(
+    (chapterId: string, submodelId: string | null) => {
+      // Assign, then reflow the whole canvas so each submodel's nodes drop
+      // into their own vertical band (computed forward from the post-assign
+      // model, mirroring handleAssignNodeToSlice).
+      const afterAssign = reducer(modelRef.current, {
+        type: 'assignChapterToSubmodel',
+        chapterId,
+        submodelId,
+      })
+      const adjustments = stackSubmodels(afterAssign)
+      dispatch({ type: 'assignChapterToSubmodel', chapterId, submodelId })
+      if (adjustments.length > 0) {
+        dispatch({ type: 'batchUpdatePositions', changes: adjustments })
+      }
+      markDirty()
+    },
+    [markDirty],
+  )
+
   const handleSliceRename = useCallback(
     (sliceId: string, name: string) => {
       dispatch({ type: 'renameSlice', sliceId, name })
@@ -474,8 +649,10 @@ function App() {
             onOpen={handleOpen}
             onSave={handleSave}
             onHeal={handleManualHeal}
+            onRelayout={handleRelayout}
             dirty={dirty}
             healing={healing}
+            relayouting={relayouting}
           />
           <Toolbar
             onAddEvent={handleAddEvent}
@@ -486,6 +663,7 @@ function App() {
             onAddEntity={handleAddEntity}
             onAddSlice={handleAddSlice}
             onAddChapter={handleAddChapter}
+            onAddSubmodel={handleAddSubmodel}
           />
           <div className="flex flex-1 min-h-0">
             <div className="flex-1">
@@ -505,6 +683,9 @@ function App() {
                 onChapterRename={handleRenameChapter}
                 onChapterSliceRange={handleChapterSliceRange}
                 onChapterDelete={handleRemoveChapter}
+                onSubmodelRename={handleRenameSubmodel}
+                onSubmodelDelete={handleRemoveSubmodel}
+                onAssignChapterToSubmodel={handleAssignChapterToSubmodel}
                 flashingSliceId={flashingSliceId}
                 flashingEntityId={flashingEntityId}
               />
@@ -522,7 +703,13 @@ function App() {
           onCancel={handleHealCancel}
         />
       )}
-      {healing && <HealingOverlay log={healLog} />}
+      {healing && (
+        <HealingOverlay
+          log={healLog}
+          onCancel={handleAbortHeal}
+          cancelling={cancellingHeal}
+        />
+      )}
     </ModelContext.Provider>
   )
 }

@@ -23,6 +23,10 @@ import {
   assignEventToEntity,
   renameChapter,
   updateNodeName,
+  addSubmodel,
+  renameSubmodel,
+  removeSubmodel,
+  assignChapterToSubmodel,
 } from '../model/operations'
 import { applyPositionChanges } from '../ui/adapter'
 
@@ -42,6 +46,10 @@ export type Action =
   | { type: 'addChapter'; name: string }
   | { type: 'removeChapter'; chapterId: string }
   | { type: 'renameChapter'; chapterId: string; name: string }
+  | { type: 'addSubmodel'; name: string }
+  | { type: 'removeSubmodel'; submodelId: string }
+  | { type: 'renameSubmodel'; submodelId: string; name: string }
+  | { type: 'assignChapterToSubmodel'; chapterId: string; submodelId: string | null }
   | { type: 'assignSliceToChapter'; sliceId: string; chapterId: string | null }
   | { type: 'setChapterSliceRange'; chapterId: string; startSliceId: string; endSliceId: string }
   | { type: 'addSlice'; name: string; chapterId?: string }
@@ -97,6 +105,14 @@ export function reducer(model: EventModel, action: Action): EventModel {
       return removeChapter(model, action.chapterId)
     case 'renameChapter':
       return renameChapter(model, action.chapterId, action.name)
+    case 'addSubmodel':
+      return addSubmodel(model, { name: action.name })
+    case 'removeSubmodel':
+      return removeSubmodel(model, action.submodelId)
+    case 'renameSubmodel':
+      return renameSubmodel(model, action.submodelId, action.name)
+    case 'assignChapterToSubmodel':
+      return assignChapterToSubmodel(model, action.chapterId, action.submodelId)
     case 'assignSliceToChapter':
       return assignSliceToChapter(model, action.sliceId, action.chapterId)
     case 'setChapterSliceRange':

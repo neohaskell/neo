@@ -206,6 +206,106 @@ describe('reduceHealLog', () => {
     expect(events).toEqual([])
   })
 
+  it('surfaces a neo_auto_repair line as an auto_repair card', () => {
+    const events = reduceHealLog([
+      stdout({
+        type: 'neo_auto_repair',
+        appliedCount: 5,
+        residualCount: 2,
+        summary: '3 edges, 1 kind fix, 0 position fixes, 1 layout entry, 2 residuals',
+      }),
+    ])
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      kind: 'auto_repair',
+      appliedCount: 5,
+      residualCount: 2,
+    })
+  })
+
+  it('surfaces api_retry events with attempt count and delay', () => {
+    const events = reduceHealLog([
+      stdout({
+        type: 'system',
+        subtype: 'api_retry',
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 617.0886764108919,
+        error_status: 529,
+        error: 'rate_limit',
+      }),
+    ])
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      kind: 'api_retry',
+      attempt: 1,
+      maxRetries: 10,
+      delayMs: 617.0886764108919,
+      errorStatus: 529,
+      error: 'rate_limit',
+    })
+  })
+
+  it('collapses successive api_retry events into a single updating card', () => {
+    const events = reduceHealLog([
+      stdout({
+        type: 'system',
+        subtype: 'api_retry',
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 617,
+        error_status: 529,
+        error: 'rate_limit',
+      }),
+      stdout({
+        type: 'system',
+        subtype: 'api_retry',
+        attempt: 2,
+        max_retries: 10,
+        retry_delay_ms: 1193,
+        error_status: 529,
+        error: 'rate_limit',
+      }),
+      stdout({
+        type: 'system',
+        subtype: 'api_retry',
+        attempt: 3,
+        max_retries: 10,
+        retry_delay_ms: 2438,
+        error_status: 529,
+        error: 'rate_limit',
+      }),
+    ])
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      kind: 'api_retry',
+      attempt: 3,
+      delayMs: 2438,
+    })
+  })
+
+  it('keeps a prior api_retry card when subsequent normal events arrive', () => {
+    const events = reduceHealLog([
+      stdout({
+        type: 'system',
+        subtype: 'api_retry',
+        attempt: 1,
+        max_retries: 10,
+        retry_delay_ms: 617,
+        error_status: 529,
+        error: 'rate_limit',
+      }),
+      stdout({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: 'recovered.' },
+        },
+      }),
+    ])
+    expect(events.map((e) => e.kind)).toEqual(['api_retry', 'text'])
+  })
+
   it('handles a realistic Read → result sequence in order', () => {
     const events = reduceHealLog([
       stdout({

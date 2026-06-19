@@ -113,16 +113,52 @@ pub enum IntegrationKind {
 /// Discover and parse every domain under `<root>/src/`. Returns a
 /// `ProjectInspection` even when nothing is found (empty domains) so
 /// callers can render a stable shape.
+///
+/// Two phases:
+///   1. Collect events per domain (local set per domain).
+///   2. Build a GLOBAL event-name set across all domains and pass it to
+///      the query + integration parsers. That way an integration whose
+///      `handleEvent` references a cross-domain event constructor still
+///      reports it as handled — without this, every cross-domain
+///      reactive integration loses its incoming edge.
+///
+/// Commands stay strict (same-domain events only). Their `decide` body
+/// is well-scoped and scanning the whole file risks false positives from
+/// imports.
 pub fn inspect_project(root: &Path) -> ProjectInspection {
     let src = root.join("src");
-    let domains = if src.is_dir() {
-        discover_domains(&src)
-            .into_iter()
-            .map(|d| inspect_domain(&d))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    if !src.is_dir() {
+        return ProjectInspection {
+            root: root.to_path_buf(),
+            domains: Vec::new(),
+        };
+    }
+
+    let dirs = discover_domains(&src);
+    // Phase 1: events per domain.
+    let with_events: Vec<(PathBuf, Vec<EventInfo>)> = dirs
+        .into_iter()
+        .map(|d| {
+            let events = parse::events_in_domain(&d);
+            (d, events)
+        })
+        .collect();
+
+    // Phase 2: build a deduplicated global event name set.
+    let mut global_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut global_event_names: Vec<String> = Vec::new();
+    for (_, events) in &with_events {
+        for e in events {
+            if global_seen.insert(e.name.clone()) {
+                global_event_names.push(e.name.clone());
+            }
+        }
+    }
+
+    let domains = with_events
+        .into_iter()
+        .map(|(dir, events)| inspect_domain(dir, events, &global_event_names))
+        .collect();
     ProjectInspection {
         root: root.to_path_buf(),
         domains,
@@ -154,21 +190,44 @@ fn discover_domains(src: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn inspect_domain(dir: &Path) -> DomainInspection {
+fn inspect_domain(
+    dir: PathBuf,
+    events: Vec<EventInfo>,
+    global_event_names: &[String],
+) -> DomainInspection {
     let name = dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("?")
         .to_string();
 
-    // Events first — the parser uses the resulting set to cross-reference
-    // command-produces and integration-handles.
-    let events = parse::events_in_domain(dir);
-    let event_names: Vec<String> = events.iter().map(|e| e.name.clone()).collect();
+    let local_event_names: Vec<String> = events.iter().map(|e| e.name.clone()).collect();
 
-    let mut commands = parse::commands_in_domain(dir, &event_names);
-    let mut queries = parse::queries_in_domain(dir, &event_names);
-    let mut integrations = parse::integrations_in_domain(dir, &event_names);
+    // Commands stay strict (decide body, local events).
+    let mut commands = parse::commands_in_domain(&dir, &local_event_names);
+    // Queries + integrations get the GLOBAL event set so they catch
+    // cross-domain wiring.
+    let mut queries = parse::queries_in_domain(&dir, global_event_names);
+    let mut integrations = parse::integrations_in_domain(&dir, global_event_names);
+
+    // Infer subscriptions for orphan queries. A query lives in
+    // `<Domain>/Queries/`, so the entity whose read-model projection it
+    // builds is THIS domain's entity (e.g. `EvaluatedProposal` reads
+    // `ProposalEntity`). Such queries name no event constructor in source
+    // — they read entity-projection fields — so the token scan above comes
+    // back empty and the query renders as an orphan (no incoming edge). An
+    // entity's projection is updated by ALL of that entity's events, so
+    // when the scan found nothing we default the subscriber set to the
+    // domain's own local event constructors. A query that DID name a
+    // specific cross-domain (or local) event keeps exactly that scan
+    // result — we only fill the gap, never overwrite a real hit.
+    if !local_event_names.is_empty() {
+        for q in &mut queries {
+            if q.subscribes_to.is_empty() {
+                q.subscribes_to = local_event_names.clone();
+            }
+        }
+    }
 
     commands.sort_by(|a, b| a.name.cmp(&b.name));
     queries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -176,7 +235,7 @@ fn inspect_domain(dir: &Path) -> DomainInspection {
 
     DomainInspection {
         name,
-        path: dir.to_path_buf(),
+        path: dir,
         events,
         commands,
         queries,
@@ -236,6 +295,200 @@ mod tests {
     }
 
     #[test]
+    fn inspect_catches_dispatcher_routed_integration() {
+        // CIOS Proposal/ProposalMetricEvaluation pattern: the domain has
+        // an `Integrations.hs` dispatcher module that routes events to
+        // handler functions imported from `Integrations/<Name>.hs`. The
+        // handler files (e.g. EvaluateMetric.hs) themselves don't have
+        // `handleEvent` — they have custom-named functions. The dispatcher
+        // is the only place that maps events to integrations.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Metric/Core.hs", METRIC_CORE_HS);
+        write(
+            dir.path(),
+            "src/App/Metric/Events/Started.hs",
+            METRIC_STARTED_HS,
+        );
+        write(
+            dir.path(),
+            "src/App/Metric/Integrations/EvaluateMetric.hs",
+            INTEGRATION_CUSTOM_FN,
+        );
+        write(
+            dir.path(),
+            "src/App/Metric/Integrations.hs",
+            METRIC_DISPATCHER,
+        );
+        let out = inspect_project(dir.path());
+        assert_eq!(out.domains.len(), 1);
+        let dom = &out.domains[0];
+        let intg = dom
+            .integrations
+            .iter()
+            .find(|i| i.name == "EvaluateMetric")
+            .expect("EvaluateMetric integration should be parsed");
+        assert!(
+            intg.handles_events.contains(&"MetricStarted".to_string()),
+            "dispatcher arm `MetricStarted e -> evaluateMetric ...` should record \
+             EvaluateMetric as handling MetricStarted; got: {:?}",
+            intg.handles_events,
+        );
+    }
+
+    #[test]
+    fn inspect_passes_global_event_set_to_query_parser() {
+        // Domain A has event AEvent. Domain B's query mentions AEvent
+        // by name. Cross-domain subscription was previously invisible
+        // (the query parser saw only B's events); now the GLOBAL event
+        // set covers it.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/App/A/Core.hs",
+            "module App.A.Core where\ndata AEvent = AHappened {} deriving (Generic)\n",
+        );
+        write(
+            dir.path(),
+            "src/App/A/Commands/DoA.hs",
+            "module App.A.Commands.DoA where\ndecide _ _ _ = Decider.acceptExisting [AHappened {}]\n",
+        );
+        write(
+            dir.path(),
+            "src/App/B/Core.hs",
+            "module App.B.Core where\ndata BEvent = BDone {} deriving (Generic)\n",
+        );
+        write(
+            dir.path(),
+            "src/App/B/Queries/CrossView.hs",
+            "module App.B.Queries.CrossView where\n-- references AHappened from another domain\nview = AHappened\n",
+        );
+        let out = inspect_project(dir.path());
+        let b_query = out
+            .domains
+            .iter()
+            .find(|d| d.name == "B")
+            .and_then(|d| d.queries.iter().find(|q| q.name == "CrossView"))
+            .expect("CrossView query should be parsed");
+        assert!(
+            b_query.subscribes_to.contains(&"AHappened".to_string()),
+            "cross-domain event must be in subscribes_to; got: {:?}",
+            b_query.subscribes_to,
+        );
+    }
+
+    #[test]
+    fn inspect_defaults_orphan_query_subscriptions_to_local_events() {
+        // A query that reads an entity projection (CIOS EvaluatedProposal
+        // pattern) names no event constructor in source. Its `subscribes_to`
+        // would be empty after the token scan — rendering it as an orphan.
+        // We default it to the domain's own local event constructors so the
+        // differ can wire `eventFeedsQuery` edges automatically.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        write(
+            dir.path(),
+            "src/App/Cart/Queries/CartView.hs",
+            // Reads entity-projection fields, names no event.
+            "module App.Cart.Queries.CartView where\nview entity = entity.itemCount\n",
+        );
+        let out = inspect_project(dir.path());
+        let cart = &out.domains[0];
+        let q = cart
+            .queries
+            .iter()
+            .find(|q| q.name == "CartView")
+            .expect("CartView query should be parsed");
+        assert_eq!(
+            q.subscribes_to,
+            vec!["CartCreated".to_string(), "ItemAdded".to_string()],
+            "orphan query must default to the domain's local events; got {:?}",
+            q.subscribes_to,
+        );
+    }
+
+    #[test]
+    fn inspect_keeps_specific_event_subscription_over_local_default() {
+        // A query that DOES name a specific event keeps only that one —
+        // the local-event default must NOT clobber a real token-scan hit.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        write(
+            dir.path(),
+            "src/App/Cart/Queries/AddedItems.hs",
+            // Names exactly one of the two events.
+            "module App.Cart.Queries.AddedItems where\n-- driven by ItemAdded\nview = ItemAdded\n",
+        );
+        let out = inspect_project(dir.path());
+        let cart = &out.domains[0];
+        let q = cart
+            .queries
+            .iter()
+            .find(|q| q.name == "AddedItems")
+            .expect("AddedItems query should be parsed");
+        assert_eq!(
+            q.subscribes_to,
+            vec!["ItemAdded".to_string()],
+            "a query that names a specific event must keep only that one; got {:?}",
+            q.subscribes_to,
+        );
+    }
+
+    #[test]
+    fn inspect_drops_plumbing_only_integration() {
+        // An integration that handles no event and emits no command is a
+        // pure helper module (HTTP client, codec) — not an event-model
+        // integration. The healer must not emit a node for it.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        write(
+            dir.path(),
+            "src/App/Cart/Integrations/HttpHelper.hs",
+            INTEGRATION_PLUMBING_ONLY,
+        );
+        // A real reactive integration alongside it, to prove we drop only
+        // the plumbing module and keep the genuine one.
+        write(
+            dir.path(),
+            "src/App/Cart/Integrations/ReserveStock.hs",
+            INTEGRATION_REACTIVE,
+        );
+        let out = inspect_project(dir.path());
+        let cart = &out.domains[0];
+        let names: Vec<&str> = cart.integrations.iter().map(|i| i.name.as_str()).collect();
+        assert!(
+            !names.contains(&"HttpHelper"),
+            "plumbing-only integration must be dropped; got {names:?}",
+        );
+        assert!(
+            names.contains(&"ReserveStock"),
+            "genuine reactive integration must be kept; got {names:?}",
+        );
+    }
+
+    #[test]
+    fn inspect_keeps_event_handling_integration_that_emits_no_command() {
+        // An outbound integration that HANDLES an event but emits no command
+        // (e.g. a Brevo email call triggered by an event) has non-empty
+        // handles_events and MUST be kept — only BOTH-empty plumbing drops.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        write(
+            dir.path(),
+            "src/App/Cart/Integrations/EmailCart.hs",
+            INTEGRATION_OUTBOUND,
+        );
+        let out = inspect_project(dir.path());
+        let cart = &out.domains[0];
+        let intg = cart
+            .integrations
+            .iter()
+            .find(|i| i.name == "EmailCart")
+            .expect("event-handling outbound integration must be kept");
+        assert!(intg.emits_commands.is_empty());
+        assert_eq!(intg.handles_events, vec!["ItemAdded".to_string()]);
+    }
+
+    #[test]
     fn inspect_classifies_outbound_integration_when_no_command_emit() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
@@ -290,11 +543,55 @@ handleEvent cart event = case event of
 outboundIntegration ''ReserveStock
 "#;
 
+    const METRIC_CORE_HS: &str = r#"
+module App.Metric.Core where
+data MetricEvent
+  = MetricStarted Started.Event
+  | MetricCompleted Completed.Event
+  deriving (Generic)
+"#;
+
+    const METRIC_STARTED_HS: &str = r#"
+module App.Metric.Events.Started (Event (..)) where
+data Event = Event { entityId :: Uuid } deriving (Generic)
+"#;
+
+    const INTEGRATION_CUSTOM_FN: &str = r#"
+module App.Metric.Integrations.EvaluateMetric (evaluateMetric) where
+import App.Metric.Events.Started qualified as Started
+
+evaluateMetric :: MetricEntity -> Started.Event -> Integration.Outbound
+evaluateMetric _entity event =
+  Integration.send (httpPost "/eval" event)
+"#;
+
+    const METRIC_DISPATCHER: &str = r#"
+module App.Metric.Integrations where
+import App.Metric.Integrations.EvaluateMetric (evaluateMetric)
+
+metricIntegrations :: MetricEntity -> MetricEvent -> Integration.Outbound
+metricIntegrations entity event = case event of
+  MetricStarted e ->
+    evaluateMetric entity e
+  MetricCompleted _ ->
+    Integration.none
+"#;
+
     const INTEGRATION_OUTBOUND: &str = r#"
 module App.Cart.Integrations.EmailCart where
 handleEvent :: CartEntity -> CartEvent -> Integration.Outbound
 handleEvent _cart event = case event of
   ItemAdded { stockId } -> Integration.send (postJson "/email" stockId)
   _ -> Integration.none
+"#;
+
+    // Pure HTTP-helper module: no `handleEvent`, no `Command.Emit`, no
+    // `Integration.emitCommand`. Mirrors CIOS Payment's `BankHttp`/`EvocaBank`.
+    const INTEGRATION_PLUMBING_ONLY: &str = r#"
+module App.Cart.Integrations.HttpHelper (postForm) where
+import Network.HTTP.Client qualified as HttpClient
+
+postForm :: Text -> Array (Text, Text) -> Task err Response
+postForm url pairs = Task.fromIO (runRequest url pairs)
 "#;
 }

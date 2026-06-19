@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # scripts/build.sh — full pipeline: frontend (TS/Vite) then backend (Rust/cargo).
 #
-# Run from anywhere; the script chdirs to the repo root.
-# Must be inside `nix develop` (provides cargo, rustc, node, npm).
+# Run from anywhere, in or out of `nix develop`: when invoked outside the
+# dev shell, the script re-execs itself via `nix develop --command` so the
+# nix-pinned toolchain (with macOS `-liconv` / `-lSystem` paths set up
+# correctly) is always the one that compiles.
 #
 # Idempotent:
 #   - `npm install` runs only when `assets/ide/node_modules` is absent.
@@ -17,10 +19,26 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# If we're outside `nix develop`, re-exec ourselves inside it. The dev
+# shell sets `IN_NIX_SHELL` ("impure" or "pure"); presence (not value) is
+# what we key on. Without this guard, a host `cargo` shadows the nix one
+# and the link step fails with `ld: library not found for -liconv` on
+# macOS (Homebrew clang can't find the iconv that nix's `darwin.libiconv`
+# would have provided).
+if [ -z "${IN_NIX_SHELL:-}" ]; then
+    if ! command -v nix >/dev/null 2>&1; then
+        echo "[error] not inside \`nix develop\` and \`nix\` is not on PATH" >&2
+        echo "[info]  install Nix (https://nixos.org/download) then re-run this script" >&2
+        exit 1
+    fi
+    echo "[info] not inside \`nix develop\` — re-executing inside the dev shell"
+    exec nix develop --command "$0" "$@"
+fi
+
 for tool in cargo npm node; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "[error] required tool \`$tool\` not found on PATH" >&2
-        echo "[info]  run this script from inside \`nix develop\` — the dev shell provides everything" >&2
+        echo "[info]  re-run this script from outside \`nix develop\` so it can re-enter the dev shell, or fix the dev shell to provide \`$tool\`" >&2
         exit 1
     fi
 done
