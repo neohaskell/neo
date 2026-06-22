@@ -1284,12 +1284,22 @@ fn wave_slice_columns(model: &Value, diff: &HealDiff) -> BTreeMap<String, f64> {
         }
     }
 
+    // Slices queued for removal this pass must NOT reserve a column — they
+    // are about to vanish from the model. Counting them would leave a gap in
+    // the dense left-anchored grid, so the next relayout (with the slices now
+    // gone) would re-tighten every column and the layout would need a second
+    // pass to settle. Excluding them makes a single relayout a fixed point.
+    let removed: BTreeSet<&str> = diff.remove_slices.iter().map(|s| s.as_str()).collect();
+
     let mut all_slices: Vec<(String, f64)> = Vec::new();
     if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
         for s in arr {
             let Some(id) = s.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
+            if removed.contains(id) {
+                continue;
+            }
             let order = order_override
                 .get(id)
                 .copied()

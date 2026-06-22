@@ -304,16 +304,22 @@ mod tests {
         assert!(slice_ids.contains(&"slice-heal-real"), "node-bearing slice must survive");
         assert!(slice_ids.contains(&"slice-user-empty"), "user-authored empty slice must survive");
 
-        // The structural cleanup is a fixed point — a second relayout proposes
-        // no further slice/chapter removals.
+        // Pruning must converge in a SINGLE pass: a second relayout is a true
+        // fixed point (applied == 0, file byte-identical). This guards the
+        // wave_slice_columns fix — if a removed slice still reserved a column,
+        // the first pass would leave a gap and the second would re-tighten
+        // every column.
         let after_first = std::fs::read_to_string(&model_path).unwrap();
         let session2 = fixture_session(workspace);
         let result2 = handle(session2, RelayoutEventModelParams {}).await.unwrap();
-        let patched2: serde_json::Value = serde_json::from_str(&after_first).unwrap();
         assert_eq!(
-            patched2["slices"].as_array().unwrap().len(),
-            patched["slices"].as_array().unwrap().len(),
-            "second relayout must not change slice count; summary={}", result2.summary,
+            result2.applied, 0,
+            "second relayout must be a fixed point; summary={}", result2.summary,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&model_path).unwrap(),
+            after_first,
+            "second relayout must leave the file byte-identical",
         );
     }
 
