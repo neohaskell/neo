@@ -599,10 +599,13 @@ function App() {
     [markDirty],
   )
 
-  const handleAddChapter = useCallback(() => {
-    dispatch({ type: 'addChapter', name: 'New Chapter' })
-    markDirty()
-  }, [markDirty])
+  const handleAddChapter = useCallback(
+    (submodelId?: string | null) => {
+      dispatch({ type: 'addChapter', name: 'New Chapter', submodelId })
+      markDirty()
+    },
+    [markDirty],
+  )
 
   const handleRemoveChapter = useCallback(
     (chapterId: string) => {
@@ -924,6 +927,9 @@ function App() {
                       onAddFeature={handleAddFeature}
                       onRenameFeature={handleRenameSubmodel}
                       onDeleteFeature={handleDeleteFeature}
+                      onAddChapter={handleAddChapter}
+                      onDeleteChapter={handleRemoveChapter}
+                      onRenameChapter={handleRenameChapter}
                     />
                     <Box flex={1} mih={0}>
                       <Canvas

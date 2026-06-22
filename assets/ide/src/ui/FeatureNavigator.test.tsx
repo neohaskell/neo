@@ -43,6 +43,9 @@ function setup(overrides: Partial<React.ComponentProps<typeof FeatureNavigator>>
     onAddFeature: vi.fn(),
     onRenameFeature: vi.fn(),
     onDeleteFeature: vi.fn(),
+    onAddChapter: vi.fn(),
+    onDeleteChapter: vi.fn(),
+    onRenameChapter: vi.fn(),
     ...overrides,
   }
   render(<FeatureNavigator {...props} />)
@@ -157,5 +160,32 @@ describe('FeatureNavigator', () => {
   it('shows an empty state when there are no features', () => {
     setup({ submodels: [], chapters: [], hasUngrouped: false })
     expect(screen.getByText(/No features yet/i)).toBeInTheDocument()
+  })
+
+  it('adds a chapter to the active feature (submodel id passed through)', () => {
+    const props = setup({ activeFeatureId: 'smA' })
+    fireEvent.click(screen.getByTestId('add-chapter-smA'))
+    expect(props.onAddChapter).toHaveBeenCalledWith('smA')
+  })
+
+  it('adds a chapter to the Ungrouped feature with a null submodel id', () => {
+    const props = setup({ activeFeatureId: UNGROUPED_FEATURE })
+    fireEvent.click(screen.getByTestId(`add-chapter-${UNGROUPED_FEATURE}`))
+    expect(props.onAddChapter).toHaveBeenCalledWith(null)
+  })
+
+  it('deletes a chapter without also selecting it (stopPropagation)', () => {
+    const props = setup({ activeFeatureId: 'smA' })
+    fireEvent.click(screen.getByTestId('delete-chapter-c1'))
+    expect(props.onDeleteChapter).toHaveBeenCalledWith('c1')
+    // Must not toggle selection, so the New Feature action bar stays hidden.
+    expect(screen.queryByTestId('new-feature-from-selection')).not.toBeInTheDocument()
+  })
+
+  it('does not delete a chapter while busy', () => {
+    const props = setup({ busy: true })
+    expect(screen.getByTestId('delete-chapter-c1')).toBeDisabled()
+    fireEvent.click(screen.getByTestId('delete-chapter-c1'))
+    expect(props.onDeleteChapter).not.toHaveBeenCalled()
   })
 })

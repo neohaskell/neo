@@ -91,6 +91,31 @@
   gap: 4px;
 }
 
+/* "Add new chapter" affordance at the bottom of a feature's chapter list —
+   ghost/dashed like the feature add-row, but sized to sit among chapter rows. */
+.addChapterRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 1px dashed var(--mantine-color-default-border);
+  border-radius: var(--mantine-radius-sm);
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--mantine-color-dimmed);
+  background: transparent;
+  cursor: pointer;
+}
+.addChapterRow:hover {
+  border-color: var(--em-feature);
+  color: var(--em-feature);
+  background: color-mix(in srgb, var(--em-feature) 8%, transparent);
+}
+.addChapterRow:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Chapter row (draggable, selectable) */
 .chapterRow {
   display: flex;

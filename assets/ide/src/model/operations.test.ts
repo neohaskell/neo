@@ -485,6 +485,26 @@ describe('addChapter', () => {
     expect(model.chapters[0].order).toBe(0)
     expect(model.chapters[1].order).toBe(1)
   })
+
+  it('defaults to ungrouped (null submodel) when none is given', () => {
+    let model = createEventModel('T')
+    model = addChapter(model, { name: 'A' })
+    expect(model.chapters[0].submodelId).toBeNull()
+  })
+
+  it('assigns the chapter to a given submodel', () => {
+    let model = createEventModel('T')
+    model = addSubmodel(model, { name: 'Checkout' })
+    const smId = model.submodels[0].id
+    model = addChapter(model, { name: 'Cart', submodelId: smId })
+    expect(model.chapters[0].submodelId).toBe(smId)
+  })
+
+  it('falls back to ungrouped for an unknown submodel id', () => {
+    let model = createEventModel('T')
+    model = addChapter(model, { name: 'A', submodelId: 'nope' })
+    expect(model.chapters[0].submodelId).toBeNull()
+  })
 })
 
 // ── removeChapter ───────────────────────────────────────────

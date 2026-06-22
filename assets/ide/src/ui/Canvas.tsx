@@ -14,6 +14,7 @@ import {
   applyNodeChanges,
   applyEdgeChanges,
   useReactFlow,
+  useStore,
 } from '@xyflow/react'
 import { useComputedColorScheme, Menu } from '@mantine/core'
 import '@xyflow/react/dist/style.css'
@@ -270,23 +271,15 @@ export function Canvas({
 }: CanvasProps) {
   const reactFlow = useReactFlow()
   const colorScheme = useComputedColorScheme('dark')
-
-  // Re-fit the viewport whenever `fitSignal` changes (a server reload moved
-  // the nodes, or the user switched feature). React Flow's `fitView` prop only
-  // runs on mount, so without this an off-origin layout would leave the canvas
-  // looking empty until the user manually zoomed to fit.
-  useEffect(() => {
-    if (fitSignal === undefined) return
-    const id = setTimeout(() => {
-      const contentNodes = reactFlow
-        .getNodes()
-        .filter((n) => !BACKGROUND_NODE_TYPES.has(n.type ?? ''))
-      if (contentNodes.length > 0) {
-        reactFlow.fitView({ nodes: contentNodes, padding: 0.2, duration: 300 })
-      }
-    }, 0)
-    return () => clearTimeout(id)
-  }, [fitSignal, reactFlow])
+  // Rendered pane dimensions — needed to compute a height-fit zoom for feature
+  // mode (fitView only fits a node set, it can't fit one axis). Kept in refs so
+  // the fit effect can read the latest size without re-firing on every resize.
+  const paneWidth = useStore((s) => s.width)
+  const paneHeight = useStore((s) => s.height)
+  const paneWidthRef = useRef(paneWidth)
+  paneWidthRef.current = paneWidth
+  const paneHeightRef = useRef(paneHeight)
+  paneHeightRef.current = paneHeight
   const [highlightedSliceId, setHighlightedSliceId] = useState<string | null>(null)
   const [highlightedEntityId, setHighlightedEntityId] = useState<string | null>(null)
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null)
@@ -331,6 +324,44 @@ export function Canvas({
   featureModeRef.current = featureMode
   const activeFeatureRef = useRef(activeFeature)
   activeFeatureRef.current = activeFeature
+
+  // Re-fit the viewport whenever `fitSignal` changes (a server reload moved the
+  // nodes, or the user switched feature). React Flow's `fitView` prop only runs
+  // on mount, so without this an off-origin layout would leave the canvas
+  // looking empty until the user manually zoomed to fit.
+  //
+  // In feature ("page") mode we do NOT fit the whole bounding box. A feature
+  // reads top-to-bottom across entity lanes and left-to-right along the causal
+  // flow, so the initial camera fits the frame's HEIGHT and anchors to its LEFT
+  // edge — the entry point of the flow is always on screen, and a wide flow
+  // simply scrolls to the right instead of being zoomed away to nothing.
+  useEffect(() => {
+    if (fitSignal === undefined) return
+    const id = setTimeout(() => {
+      const grid = featureGridRef.current
+      const w = paneWidthRef.current
+      const h = paneHeightRef.current
+      if (featureModeRef.current && grid && w > 0 && h > 0) {
+        const PAD_Y = 32 // px breathing room above & below the frame
+        const PAD_X = 24 // px gutter to the left of the frame's leftmost edge
+        const rawZoom = (h - PAD_Y * 2) / grid.rect.height
+        const zoom = Math.max(0.2, Math.min(1.5, rawZoom))
+        // React Flow viewport maps flowX → screenX = flowX * zoom + x. Pin the
+        // frame's left edge at PAD_X and vertically center the height-fit frame.
+        const x = PAD_X - grid.rect.xStart * zoom
+        const y = (h - grid.rect.height * zoom) / 2 - grid.rect.yStart * zoom
+        reactFlow.setViewport({ x, y, zoom }, { duration: 300 })
+        return
+      }
+      const contentNodes = reactFlow
+        .getNodes()
+        .filter((n) => !BACKGROUND_NODE_TYPES.has(n.type ?? ''))
+      if (contentNodes.length > 0) {
+        reactFlow.fitView({ nodes: contentNodes, padding: 0.2, duration: 300 })
+      }
+    }, 0)
+    return () => clearTimeout(id)
+  }, [fitSignal, reactFlow])
 
   const featureMemberIds = useMemo(() => {
     if (!featureMode) return null

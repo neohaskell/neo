@@ -27,6 +27,11 @@ interface FeatureNavigatorProps {
   onAddFeature: () => void
   onRenameFeature: (submodelId: string, name: string) => void
   onDeleteFeature: (submodelId: string) => void
+  /** Create a new chapter inside `submodelId` (null = the Ungrouped feature). */
+  onAddChapter: (submodelId: string | null) => void
+  /** Delete a chapter. Its slices are detached (moved to Ungrouped), not removed. */
+  onDeleteChapter: (chapterId: string) => void
+  onRenameChapter: (chapterId: string, name: string) => void
 }
 
 const CHAPTER_MIME = 'application/x-neo-chapter'
@@ -54,6 +59,9 @@ export function FeatureNavigator({
   onAddFeature,
   onRenameFeature,
   onDeleteFeature,
+  onAddChapter,
+  onDeleteChapter,
+  onRenameChapter,
 }: FeatureNavigatorProps) {
   const [dragId, setDragId] = useState<string | null>(null)
   const [overId, setOverId] = useState<string | null>(null)
@@ -223,8 +231,25 @@ export function FeatureNavigator({
         className={cls}
       >
         <IconGripVertical size={12} className={classes.grip} />
-        <Text component="span" size="sm" className={classes.rowLabel}>{c.name}</Text>
+        <Text component="span" size="sm" className={classes.rowLabel} inherit>
+          <EditableLabel label={c.name} onRename={(name) => onRenameChapter(c.id, name)} />
+        </Text>
         {isSelected && <IconCheck size={14} color="var(--em-feature)" />}
+        <ActionIcon
+          size="xs"
+          variant="subtle"
+          color="red"
+          data-testid={`delete-chapter-${c.id}`}
+          disabled={busy}
+          onClick={(e) => {
+            e.stopPropagation()
+            onDeleteChapter(c.id)
+          }}
+          title="Delete chapter (keeps its slices, moves them to Ungrouped)"
+          aria-label="Delete chapter"
+        >
+          <IconX size={12} />
+        </ActionIcon>
       </div>
     )
   }
@@ -311,6 +336,16 @@ export function FeatureNavigator({
                         )
                       })
                     )}
+                    <button
+                      type="button"
+                      data-testid={`add-chapter-${f.id}`}
+                      className={classes.addChapterRow}
+                      disabled={busy}
+                      onClick={() => onAddChapter(f.id === UNGROUPED_FEATURE ? null : f.id)}
+                    >
+                      <IconPlus size={12} />
+                      <span>New chapter</span>
+                    </button>
                   </div>
                 )}
               </div>

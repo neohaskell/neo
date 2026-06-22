@@ -48,7 +48,7 @@ export type Action =
   | { type: 'addEntity'; name: string }
   | { type: 'removeEntity'; entityId: string }
   | { type: 'renameEntity'; entityId: string; name: string }
-  | { type: 'addChapter'; name: string }
+  | { type: 'addChapter'; name: string; submodelId?: string | null }
   | { type: 'removeChapter'; chapterId: string }
   | { type: 'renameChapter'; chapterId: string; name: string }
   | { type: 'reorderChapters'; orderedChapterIds: string[] }
@@ -110,7 +110,7 @@ export function reducer(model: EventModel, action: Action): EventModel {
     case 'renameEntity':
       return renameEntity(model, action.entityId, action.name)
     case 'addChapter':
-      return addChapter(model, { name: action.name })
+      return addChapter(model, { name: action.name, submodelId: action.submodelId })
     case 'removeChapter':
       return removeChapter(model, action.chapterId)
     case 'renameChapter':

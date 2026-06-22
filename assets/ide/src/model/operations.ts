@@ -260,12 +260,20 @@ export function assignEventToEntity(
 
 export function addChapter(
   model: EventModel,
-  params: { name: string },
+  params: { name: string; submodelId?: string | null },
 ): EventModel {
+  // A chapter created from a feature's sidebar lands IN that feature; an unknown
+  // submodel id (or null/undefined) falls back to ungrouped so the chapter is
+  // never orphaned to a band that doesn't exist.
+  const submodelId =
+    params.submodelId != null && model.submodels.some((s) => s.id === params.submodelId)
+      ? params.submodelId
+      : null
   const chapter: Chapter = {
     id: uid(),
     name: params.name,
     order: model.chapters.length,
+    submodelId,
   }
   return { ...model, chapters: [...model.chapters, chapter] }
 }
