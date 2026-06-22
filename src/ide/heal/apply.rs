@@ -16,6 +16,7 @@ pub fn apply_diff(model: &mut Value, diff: &HealDiff) -> usize {
     applied += apply_add_chapters(model, diff);
     applied += apply_remove_chapters(model, diff);
     applied += apply_add_entities(model, diff);
+    applied += apply_remove_slices(model, diff);
     applied += apply_add_slices(model, diff);
     applied += apply_add_nodes(model, diff);
     applied += apply_slice_updates(model, diff);
@@ -71,6 +72,33 @@ fn apply_remove_chapters(model: &mut Value, diff: &HealDiff) -> usize {
             .unwrap_or(true)
     });
     before - chapters.len()
+}
+
+/// Remove slices named in `diff.remove_slices`. Double-gated: a slice is
+/// dropped only when its id starts with `slice-heal-`, so a user-authored
+/// slice is never removed even if the diff asked for it. Mirrors
+/// `apply_remove_chapters`.
+fn apply_remove_slices(model: &mut Value, diff: &HealDiff) -> usize {
+    if diff.remove_slices.is_empty() {
+        return 0;
+    }
+    let Some(slices) = model.get_mut("slices").and_then(|v| v.as_array_mut()) else {
+        return 0;
+    };
+    let to_remove: std::collections::BTreeSet<&str> = diff
+        .remove_slices
+        .iter()
+        .filter(|id| id.starts_with("slice-heal-"))
+        .map(|s| s.as_str())
+        .collect();
+    let before = slices.len();
+    slices.retain(|s| {
+        s.get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| !to_remove.contains(id))
+            .unwrap_or(true)
+    });
+    before - slices.len()
 }
 
 fn apply_slice_updates(model: &mut Value, diff: &HealDiff) -> usize {

@@ -74,6 +74,15 @@ pub struct HealDiff {
     /// minted. `apply_remove_edges` double-gates on the `edge-heal-` prefix
     /// so a user-drawn edge is never removed even if field-overlap disagrees.
     pub remove_edges: Vec<EdgeRef>,
+    /// Heal-created slices (`slice-heal-` prefix) to remove because no node
+    /// references them any more. A prior heal can leave a named slice behind
+    /// when its node ends up homed in a different slice (e.g. an integration
+    /// materialised into its triggering command's slice) — the orphan slice
+    /// then renders as an empty column and the wave pass mints a dead chapter
+    /// for it. `apply_remove_slices` double-gates on the `slice-heal-` prefix
+    /// so a user-authored slice is never removed even if it is momentarily
+    /// empty.
+    pub remove_slices: Vec<String>,
     /// Existing slices whose `chapterId` / `order` need updating to group
     /// them into their entity's chapter.
     pub update_slices: Vec<SliceUpdate>,
@@ -99,6 +108,7 @@ impl HealDiff {
             + self.add_nodes.len()
             + self.add_edges.len()
             + self.remove_edges.len()
+            + self.remove_slices.len()
             + self.update_slices.len()
             + self.fix_integration_kinds.len()
             + self.fix_positions.len()
@@ -108,11 +118,12 @@ impl HealDiff {
     /// Short, human-readable one-line summary for logs and the heal overlay.
     pub fn summary(&self) -> String {
         format!(
-            "{} chapters, {} chapters removed, {} entities, {} slices, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
+            "{} chapters, {} chapters removed, {} entities, {} slices, {} slices removed, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
             self.add_chapters.len(),
             self.remove_chapters.len(),
             self.add_entities.len(),
             self.add_slices.len(),
+            self.remove_slices.len(),
             self.add_nodes.len(),
             self.add_edges.len(),
             self.remove_edges.len(),
@@ -777,6 +788,22 @@ fn order_slices_by_wave(model: &Value, plan: &MaterializePlan, diff: &mut HealDi
         });
     }
 
+    // Remove heal-created slices that hold no node — orphans a prior heal left
+    // behind when the node ended up homed in a different slice. They are
+    // excluded from `wave.slice_order` above (so they got no order/chapter),
+    // and dropping them lets the chapter cleanup below reclaim their dedicated
+    // chapter. Only `slice-heal-` ids are removed; a user-authored empty slice
+    // is left alone.
+    let slices_with_nodes: BTreeSet<String> = plan
+        .iter_all_nodes()
+        .filter_map(|n| n.slice_id.clone())
+        .collect();
+    for sid in model_slice_chapter.keys() {
+        if sid.starts_with("slice-heal-") && !slices_with_nodes.contains(sid) {
+            diff.remove_slices.push(sid.clone());
+        }
+    }
+
     // Remove heal-created chapters no longer referenced by any slice.
     let mut live: BTreeSet<String> = BTreeSet::new();
     for ch in final_chapter.values().filter_map(|o| o.as_ref()) {
@@ -884,7 +911,17 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
             .entry(s.id.clone())
             .or_insert_with(|| s.name.clone());
     }
-    let all_slices: BTreeSet<String> = slice_name.keys().cloned().collect();
+    // Only rank slices that actually hold a node. A nodeless slice has no
+    // edges, so it would form its own weakly-connected component and the wave
+    // pass would mint a dedicated chapter for an empty column. `order_slices_
+    // by_wave` removes such heal-owned orphans instead; user-authored empty
+    // slices are simply left untouched (no order/chapter churn).
+    let slices_with_nodes: BTreeSet<String> = node_slice.values().cloned().collect();
+    let all_slices: BTreeSet<String> = slice_name
+        .keys()
+        .filter(|s| slices_with_nodes.contains(*s))
+        .cloned()
+        .collect();
 
     // 2. slice-precedence arcs + the integration-triggered command set.
     let mut succ: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -3596,6 +3633,81 @@ mod tests {
             diff.remove_edges.is_empty(),
             "layout-only relayout must never touch edges; got {:?}",
             diff.remove_edges,
+        );
+    }
+
+    /// A model with one real flow (CA→EA→QA) plus two empty slices: a
+    /// heal-owned orphan (`slice-heal-orphan`, its own `chapter-heal-orphan`)
+    /// and a user-authored empty slice (`slice-user-empty`). Mirrors the
+    /// real-world breakage where a prior heal left integration slices behind
+    /// whose nodes homed elsewhere.
+    fn model_with_empty_slices() -> Value {
+        serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [
+                { "id": "chapter-heal-real",   "name": "Aone",   "order": 0 },
+                { "id": "chapter-heal-orphan", "name": "Orphan", "order": 1 }
+            ],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "slice-heal-real",   "name": "Aone",   "chapterId": "chapter-heal-real",   "order": 0 },
+                { "id": "slice-heal-orphan", "name": "Orphan", "chapterId": "chapter-heal-orphan", "order": 1 },
+                { "id": "slice-user-empty",  "name": "UserEmpty", "chapterId": null, "order": 2 }
+            ],
+            "nodes": [
+                { "id": "ca", "type": "command", "name": "CA", "sliceId": "slice-heal-real", "entityId": "e" },
+                { "id": "ea", "type": "event",   "name": "EA", "sliceId": "slice-heal-real", "entityId": "e" },
+                { "id": "qa", "type": "query",   "name": "QA", "sliceId": "slice-heal-real" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent", "sourceId": "ca", "targetId": "ea" },
+                { "id": "x2", "type": "eventFeedsQuery",      "sourceId": "ea", "targetId": "qa" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    #[test]
+    fn relayout_prunes_empty_heal_slices_and_their_chapters() {
+        let mut model = model_with_empty_slices();
+        let diff = compute_diff_with_options(&model, &no_inspection(), ComputeOptions::layout_only());
+        assert!(
+            diff.remove_slices.contains(&"slice-heal-orphan".to_string()),
+            "nodeless heal slice must be queued for removal; got {:?}",
+            diff.remove_slices,
+        );
+        assert!(
+            !diff.remove_slices.contains(&"slice-user-empty".to_string()),
+            "user-authored empty slice must NEVER be removed; got {:?}",
+            diff.remove_slices,
+        );
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let slice_ids: BTreeSet<String> = model["slices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(slice_ids.contains("slice-heal-real"), "node-bearing slice must survive");
+        assert!(slice_ids.contains("slice-user-empty"), "user empty slice must survive");
+        assert!(!slice_ids.contains("slice-heal-orphan"), "empty heal slice must be gone");
+        let chapter_ids: BTreeSet<String> = model["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !chapter_ids.contains("chapter-heal-orphan"),
+            "the orphan slice's dedicated heal chapter must be reclaimed; got {chapter_ids:?}",
+        );
+
+        // Re-running must be a fixed point: nothing left to prune.
+        let diff2 = compute_diff_with_options(&model, &no_inspection(), ComputeOptions::layout_only());
+        assert!(
+            diff2.remove_slices.is_empty(),
+            "second relayout must not re-propose slice removals; got {:?}",
+            diff2.remove_slices,
         );
     }
 

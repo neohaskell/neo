@@ -257,6 +257,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relayout_prunes_orphan_empty_heal_slices() {
+        // Reproduces the real-world breakage: a prior heal left a nodeless
+        // `slice-heal-` slice ("Ghost") behind — its node ended up homed in a
+        // different slice — plus a dedicated `chapter-heal-` for it. Relayout
+        // must drop the empty slice AND reclaim its chapter, while keeping the
+        // real flow's slice/chapter and a user-authored empty slice intact.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [
+                { "id": "chapter-heal-real",  "name": "Init",  "order": 0 },
+                { "id": "chapter-heal-ghost", "name": "Ghost", "order": 1 }
+            ],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "slice-heal-real",  "name": "Init",      "chapterId": "chapter-heal-real",  "order": 0 },
+                { "id": "slice-heal-ghost", "name": "Ghost",     "chapterId": "chapter-heal-ghost", "order": 1 },
+                { "id": "slice-user-empty", "name": "UserEmpty", "chapterId": null,                 "order": 2 }
+            ],
+            "nodes": [
+                { "id": "c0", "type": "command", "name": "Initiate",  "sliceId": "slice-heal-real", "entityId": "e" },
+                { "id": "e0", "type": "event",   "name": "Initiated", "sliceId": "slice-heal-real", "entityId": "e" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent", "sourceId": "c0", "targetId": "e0" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let model_path = workspace.join("event-model.json");
+        std::fs::write(&model_path, serde_json::to_string_pretty(&model).unwrap()).unwrap();
+
+        let session = fixture_session(workspace);
+        let result = handle(session, RelayoutEventModelParams {}).await.unwrap();
+        assert!(result.applied > 0, "relayout should prune the orphan; summary={}", result.summary);
+
+        let patched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&model_path).unwrap()).unwrap();
+        let slice_ids: Vec<&str> = patched["slices"].as_array().unwrap()
+            .iter().map(|s| s["id"].as_str().unwrap()).collect();
+        let chapter_ids: Vec<&str> = patched["chapters"].as_array().unwrap()
+            .iter().map(|c| c["id"].as_str().unwrap()).collect();
+        assert!(!slice_ids.contains(&"slice-heal-ghost"), "empty heal slice must be gone; got {slice_ids:?}");
+        assert!(!chapter_ids.contains(&"chapter-heal-ghost"), "ghost chapter must be reclaimed; got {chapter_ids:?}");
+        assert!(slice_ids.contains(&"slice-heal-real"), "node-bearing slice must survive");
+        assert!(slice_ids.contains(&"slice-user-empty"), "user-authored empty slice must survive");
+
+        // The structural cleanup is a fixed point — a second relayout proposes
+        // no further slice/chapter removals.
+        let after_first = std::fs::read_to_string(&model_path).unwrap();
+        let session2 = fixture_session(workspace);
+        let result2 = handle(session2, RelayoutEventModelParams {}).await.unwrap();
+        let patched2: serde_json::Value = serde_json::from_str(&after_first).unwrap();
+        assert_eq!(
+            patched2["slices"].as_array().unwrap().len(),
+            patched["slices"].as_array().unwrap().len(),
+            "second relayout must not change slice count; summary={}", result2.summary,
+        );
+    }
+
+    #[tokio::test]
     async fn relayout_returns_zero_applied_when_file_already_canonical() {
         // No NeoHaskell project, valid model with positioned nodes in
         // the right bands → relayout has nothing to do.
