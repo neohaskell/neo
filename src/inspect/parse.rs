@@ -107,6 +107,17 @@ pub fn commands_in_domain(dir: &Path, known_events: &[String]) -> Vec<CommandInf
         .collect()
 }
 
+/// Just the command constructor names under `<dir>/Commands/` (recursively,
+/// so `Commands/Internal/Foo.hs` counts). Cheap pre-pass used to build the
+/// GLOBAL command set so the integration parser can recognise emitted
+/// commands by their record construction — including cross-domain ones.
+pub fn command_names_in_domain(dir: &Path) -> Vec<String> {
+    list_dot_hs(dir.join("Commands").as_path())
+        .into_iter()
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect()
+}
+
 pub fn queries_in_domain(dir: &Path, known_events: &[String]) -> Vec<QueryInfo> {
     list_dot_hs(dir.join("Queries").as_path())
         .into_iter()
@@ -114,7 +125,11 @@ pub fn queries_in_domain(dir: &Path, known_events: &[String]) -> Vec<QueryInfo> 
         .collect()
 }
 
-pub fn integrations_in_domain(dir: &Path, known_events: &[String]) -> Vec<IntegrationInfo> {
+pub fn integrations_in_domain(
+    dir: &Path,
+    known_events: &[String],
+    known_commands: &[String],
+) -> Vec<IntegrationInfo> {
     // Two passes; results UNIONed by integration name:
     //
     // PASS A — Per-file `handleEvent`. Each `Integrations/<Name>.hs` file
@@ -133,11 +148,11 @@ pub fn integrations_in_domain(dir: &Path, known_events: &[String]) -> Vec<Integr
     let mut by_name: std::collections::BTreeMap<String, IntegrationInfo> =
         std::collections::BTreeMap::new();
     for path in list_dot_hs(dir.join("Integrations").as_path()) {
-        if let Some(info) = parse_integration_file(&path, known_events) {
+        if let Some(info) = parse_integration_file(&path, known_events, known_commands) {
             by_name.insert(info.name.clone(), info);
         }
     }
-    augment_from_dispatcher(dir, known_events, &mut by_name);
+    augment_from_dispatcher(dir, known_events, known_commands, &mut by_name);
     // Drop plumbing-only modules. An `Integrations/<Name>.hs` that handles
     // NO event AND emits NO command is a pure helper (HTTP client, JSON
     // codec, request builder — e.g. CIOS Payment's `BankHttp`/`EvocaBank`),
@@ -158,6 +173,7 @@ pub fn integrations_in_domain(dir: &Path, known_events: &[String]) -> Vec<Integr
 fn augment_from_dispatcher(
     dir: &Path,
     known_events: &[String],
+    known_commands: &[String],
     by_name: &mut std::collections::BTreeMap<String, IntegrationInfo>,
 ) {
     let dispatcher_path = dir.join("Integrations.hs");
@@ -174,7 +190,7 @@ fn augment_from_dispatcher(
             let file = dir.join(format!("Integrations/{intg_name}.hs"));
             let emits = if file.is_file() {
                 std::fs::read_to_string(&file)
-                    .map(|b| extract_emitted_commands(&b))
+                    .map(|b| extract_emitted_commands(&b, known_commands))
                     .unwrap_or_default()
             } else {
                 Vec::new()
@@ -505,7 +521,11 @@ fn single_ctor_token(rhs: &str) -> Option<String> {
     }
 }
 
-fn parse_integration_file(path: &Path, known_events: &[String]) -> Option<IntegrationInfo> {
+fn parse_integration_file(
+    path: &Path,
+    known_events: &[String],
+    known_commands: &[String],
+) -> Option<IntegrationInfo> {
     let body = std::fs::read_to_string(path).ok()?;
     let name = path.file_stem()?.to_str()?.to_string();
     // STRICT per-file scan: look for a `handleEvent` function and walk
@@ -525,7 +545,7 @@ fn parse_integration_file(path: &Path, known_events: &[String]) -> Option<Integr
     // sibling `ToAction` instance elsewhere in the same file
     // (CIOS-style: `Integration.emitCommand X { … }`). Scan the whole
     // file so the kind classifier finds both.
-    let emits_commands = extract_emitted_commands(&body);
+    let emits_commands = extract_emitted_commands(&body, known_commands);
     let kind = if emits_commands.is_empty() {
         IntegrationKind::Outbound
     } else {
@@ -849,28 +869,52 @@ fn contains_word(haystack: &str, needle: &str) -> bool {
     false
 }
 
-/// Find every emitted command and return the constructor names. Two
-/// idioms in the wild:
-///
-///   * Testbed (`Service.Command.Core`): `Command.Emit { command = X { … } }`
-///   * App-specific helpers (CIOS, etc.): `Integration.emitCommand X { … }`
-///     or `Integration.emitCommand\n  X { … }` (constructor on next line).
-fn extract_emitted_commands(src: &str) -> Vec<String> {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+/// Find every command this integration emits, in source order. Real
+/// NeoHaskell integrations emit commands several ways; relying on the
+/// `emitCommand`/`Command.Emit` keyword alone misses most of them (e.g. the
+/// callback idiom `onSuccess :: … -> CompleteMetricEvaluation` inside
+/// `Integration.batch`, or `Integration.emitCommand inner` where `inner` is a
+/// pre-built command value). The robust, idiom-independent signal is that the
+/// command VALUE is constructed as a record literal `CommandName { … }`
+/// somewhere in the file — verified across every CIOS integration. So we
+/// detect:
+///   * explicit keyword idioms: `Command.Emit { command = X }`,
+///     `Integration.emitCommand X` (constructor adjacent); plus
+///   * any KNOWN command name constructed as a record `X { … }` (the `\s*`
+///     spans the constructor-on-its-own-line layout). `known_commands` (the
+///     GLOBAL command set) gates this so we don't mint config/response records
+///     like `OpenRouter.Request { … }` as commands.
+fn extract_emitted_commands(src: &str, known_commands: &[String]) -> Vec<String> {
+    static KEYWORD_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static RECORD_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let keyword_re = KEYWORD_RE.get_or_init(|| {
         Regex::new(
             r"(?:Command\.Emit\s*\{\s*command\s*=|Integration\.emitCommand)\s*([A-Z]\w*)",
         )
         .unwrap()
     });
+    // `Name {` (constructor optionally on its own line before the brace).
+    let record_re = RECORD_RE.get_or_init(|| Regex::new(r"\b([A-Z]\w*)\s*\{").unwrap());
+    let known: BTreeSet<&str> = known_commands.iter().map(String::as_str).collect();
+
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    for cap in re.captures_iter(src) {
+    // Pass A — explicit emit keywords (catches commands even if their record
+    // is built in another module, e.g. `emitCommand SomeCmd { … }` inline).
+    for cap in keyword_re.captures_iter(src) {
         if let Some(m) = cap.get(1) {
             let s = m.as_str().to_string();
             if seen.insert(s.clone()) {
                 out.push(s);
             }
+        }
+    }
+    // Pass B — known commands constructed as record literals anywhere in the
+    // file (covers the callback-return-type and `emitCommand <var>` idioms).
+    for cap in record_re.captures_iter(src) {
+        let name = cap.get(1).map(|m| m.as_str()).unwrap_or("");
+        if known.contains(name) && seen.insert(name.to_string()) {
+            out.push(name.to_string());
         }
     }
     out
@@ -956,7 +1000,7 @@ do
     Command.Emit { command = NotifyCustomer { id = c } }
 "#;
         assert_eq!(
-            extract_emitted_commands(src),
+            extract_emitted_commands(src, &[]),
             vec!["ReserveStock".to_string(), "NotifyCustomer".to_string()]
         );
     }
@@ -975,9 +1019,39 @@ toAction req = Integration.action \_ctx ->
       }
 "#;
         assert_eq!(
-            extract_emitted_commands(src),
+            extract_emitted_commands(src, &[]),
             vec!["SendThankYouEmail".to_string()]
         );
+    }
+
+    #[test]
+    fn extract_emitted_commands_catches_callback_return_type_record() {
+        // The CIOS callback idiom: the command is built as a record literal in
+        // an `onSuccess`/`onError` handler, NOT via emitCommand/Command.Emit.
+        // Detected by the known-command record-construction scan.
+        let src = r#"
+onSuccess :: Started.Event -> Response -> CompleteMetricEvaluation
+onSuccess event response =
+  CompleteMetricEvaluation
+    { evaluationId = event.entityId
+    , score = 3
+    }
+"#;
+        let known = vec!["CompleteMetricEvaluation".to_string()];
+        assert_eq!(
+            extract_emitted_commands(src, &known),
+            vec!["CompleteMetricEvaluation".to_string()],
+        );
+        // Without the known-command set the keyword scan alone misses it.
+        assert!(extract_emitted_commands(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn extract_emitted_commands_record_scan_ignores_non_command_records() {
+        // A config/response record that is NOT a known command must not be
+        // minted as an emitted command.
+        let src = "x = OpenRouter.Request { model = \"m\" }\n";
+        assert!(extract_emitted_commands(src, &["RequestPayment".to_string()]).is_empty());
     }
 
     #[test]
@@ -986,7 +1060,7 @@ toAction req = Integration.action \_ctx ->
 Command.Emit { command = Foo {} }
 Command.Emit { command = Foo {} }
 "#;
-        assert_eq!(extract_emitted_commands(src), vec!["Foo".to_string()]);
+        assert_eq!(extract_emitted_commands(src, &[]), vec!["Foo".to_string()]);
     }
 
     #[test]

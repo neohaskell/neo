@@ -1,12 +1,12 @@
 import { describe, it, expect, vi } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent } from '../test/render'
 import { HealingOverlay } from './HealingOverlay'
 
 describe('HealingOverlay', () => {
   it('renders the default healing message and a spinner', () => {
-    const { container } = render(<HealingOverlay />)
+    render(<HealingOverlay />)
     expect(screen.getByText(/healing event model/i)).toBeInTheDocument()
-    expect(container.querySelector('.animate-spin')).not.toBeNull()
+    expect(screen.getByTestId('heal-spinner')).toBeInTheDocument()
   })
 
   it('uses a custom message when supplied', () => {

@@ -11,6 +11,7 @@ import type {
   Chapter,
   Slice,
   Submodel,
+  Field,
 } from './types'
 
 let counter = 0
@@ -131,6 +132,19 @@ export function updateNodeName(
   return {
     ...model,
     nodes: model.nodes.map((n) => (n.id === nodeId ? { ...n, name } : n)),
+  }
+}
+
+/** Replace a node's schema `fields` (semantic zoom / Schema lens editor). */
+export function setNodeFields(
+  model: EventModel,
+  nodeId: string,
+  fields: readonly Field[],
+): EventModel {
+  if (!model.nodes.some((n) => n.id === nodeId)) return model
+  return {
+    ...model,
+    nodes: model.nodes.map((n) => (n.id === nodeId ? { ...n, fields } : n)),
   }
 }
 
@@ -339,6 +353,81 @@ export function removeChapter(
   }
 }
 
+/**
+ * Reorders chapters to match `orderedChapterIds` and renormalizes every
+ * chapter's `order` to a contiguous `0..n-1`. Unknown ids are ignored; any
+ * chapter omitted from the list is appended after (by ascending current
+ * order), so a partial list never drops a chapter. Immutable, and changes
+ * ONLY `chapter.order` — `submodelId` and every `slice.chapterId` are left
+ * untouched (reorder resequences the horizontal flow, it does not regroup).
+ * `chapter.order` is the user-authoritative horizontal axis; the Rust wave
+ * pass reads it and never overwrites it.
+ */
+export function reorderChapters(
+  model: EventModel,
+  orderedChapterIds: string[],
+): EventModel {
+  const byId = new Map(model.chapters.map((c) => [c.id, c]))
+  const seen = new Set<string>()
+  const ordered: Chapter[] = []
+  for (const id of orderedChapterIds) {
+    const c = byId.get(id)
+    if (c && !seen.has(id)) {
+      ordered.push(c)
+      seen.add(id)
+    }
+  }
+  for (const c of [...model.chapters].sort((a, b) => a.order - b.order)) {
+    if (!seen.has(c.id)) ordered.push(c)
+  }
+  return {
+    ...model,
+    chapters: ordered.map((c, i) => ({ ...c, order: i })),
+  }
+}
+
+/**
+ * Move a slice into `chapterId` (or detach with `chapterId = null`) AND
+ * resequence ALL slices to `orderedSliceIds`, in one pass. This is the single
+ * slice-mutation the navigator's drag-and-drop emits — it covers reordering
+ * WITHIN a chapter (chapterId unchanged) AND moving a slice ACROSS chapters
+ * (chapterId reassigned). `order` is renormalized to a contiguous `0..n-1`;
+ * unknown ids are ignored and any slice omitted from the list is appended (by
+ * ascending current order), so a partial list never drops a slice. Node
+ * `sliceId`s are untouched — a slice's nodes follow it. NOTE: "Tidy by flow"
+ * later re-derives slice order from the causal wave, overriding a manual one.
+ */
+export function moveSliceToChapter(
+  model: EventModel,
+  sliceId: string,
+  chapterId: string | null,
+  orderedSliceIds: string[],
+): EventModel {
+  if (!model.slices.some((s) => s.id === sliceId)) return model
+  if (chapterId !== null && !model.chapters.some((c) => c.id === chapterId)) return model
+  const byId = new Map(model.slices.map((s) => [s.id, s]))
+  const seen = new Set<string>()
+  const ordered: Slice[] = []
+  for (const id of orderedSliceIds) {
+    const s = byId.get(id)
+    if (s && !seen.has(id)) {
+      ordered.push(s)
+      seen.add(id)
+    }
+  }
+  for (const s of [...model.slices].sort((a, b) => a.order - b.order)) {
+    if (!seen.has(s.id)) ordered.push(s)
+  }
+  return {
+    ...model,
+    slices: ordered.map((s, i) => ({
+      ...s,
+      chapterId: s.id === sliceId ? chapterId : s.chapterId,
+      order: i,
+    })),
+  }
+}
+
 // ── Submodels (vertical feature bands grouping chapters) ────
 
 export function addSubmodel(
@@ -394,6 +483,27 @@ export function assignChapterToSubmodel(
       c.id === chapterId ? { ...c, submodelId } : c,
     ),
   }
+}
+
+// ── Per-feature node position overrides ─────────────────────
+
+/**
+ * Record a node's manually-dragged position WITHIN a feature (page), in that
+ * feature's own origin-based coordinate space. The "Features as pages" canvas
+ * prefers this over the deterministic grid position, so a drag sticks instead
+ * of snapping back. Stored under `layout.bySubmodel[featureId][nodeId]`
+ * (featureId = submodel id or the `__ungrouped__` sentinel). Immutable.
+ */
+export function setFeatureNodePosition(
+  model: EventModel,
+  featureId: string,
+  nodeId: string,
+  x: number,
+  y: number,
+): EventModel {
+  const bySubmodel = { ...(model.layout.bySubmodel ?? {}) }
+  bySubmodel[featureId] = { ...(bySubmodel[featureId] ?? {}), [nodeId]: { x, y } }
+  return { ...model, layout: { ...model.layout, bySubmodel } }
 }
 
 // ── Slices ──────────────────────────────────────────────────

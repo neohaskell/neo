@@ -1,11 +1,22 @@
 // ── Node types ──────────────────────────────────────────────
 
+/**
+ * A schema field on a concept node (command/event/query/…). Optional & additive
+ * — absent on legacy models. Surfaced inline via semantic zoom and (later) the
+ * Schema lens. Backward-compatible in the on-disk schema (not `required`).
+ */
+export interface Field {
+  readonly name: string
+  readonly type: string
+}
+
 export interface EventNode {
   readonly id: string
   readonly type: 'event'
   readonly name: string
   readonly entityId: string | null
   readonly sliceId: string | null
+  readonly fields?: readonly Field[]
 }
 
 export interface CommandNode {
@@ -14,6 +25,7 @@ export interface CommandNode {
   readonly name: string
   readonly entityId: string | null
   readonly sliceId: string | null
+  readonly fields?: readonly Field[]
 }
 
 export interface QueryNode {
@@ -21,6 +33,7 @@ export interface QueryNode {
   readonly type: 'query'
   readonly name: string
   readonly sliceId: string | null
+  readonly fields?: readonly Field[]
 }
 
 export interface IntegrationNode {
@@ -29,6 +42,7 @@ export interface IntegrationNode {
   readonly name: string
   readonly kind: 'inbound' | 'outbound'
   readonly sliceId: string | null
+  readonly fields?: readonly Field[]
 }
 
 export interface UIPlaceholderNode {
@@ -36,6 +50,7 @@ export interface UIPlaceholderNode {
   readonly type: 'uiPlaceholder'
   readonly name: string
   readonly sliceId: string | null
+  readonly fields?: readonly Field[]
 }
 
 export type ModelNode =
@@ -161,6 +176,14 @@ export interface Viewport {
 export interface Layout {
   readonly nodePositions: Record<string, NodePosition>
   readonly viewport: Viewport
+  /**
+   * Per-feature node-position OVERRIDES, keyed by feature id (submodel id or
+   * the `__ungrouped__` sentinel) then node id. In the "Features as pages"
+   * view the deterministic grid provides defaults; once a user drags a node it
+   * gets an entry here (in the feature's own origin-based coordinate space) so
+   * the drag sticks instead of snapping back to the grid. Optional / additive.
+   */
+  readonly bySubmodel?: Record<string, Record<string, NodePosition>>
 }
 
 // ── Event Model (root) ──────────────────────────────────────

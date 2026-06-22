@@ -1,19 +1,27 @@
-import { useReducer, useCallback, useState, useEffect, useRef } from 'react'
+import { useReducer, useCallback, useState, useEffect, useRef, useMemo } from 'react'
 import { ReactFlowProvider } from '@xyflow/react'
+import { Flex, Box } from '@mantine/core'
+import { notifications } from '@mantine/notifications'
 import { reducer, ModelContext } from './state/store'
 import { Canvas } from './ui/Canvas'
-import { Toolbar } from './ui/Toolbar'
-import { FileMenu } from './ui/FileMenu'
-import { Toast } from './ui/Toast'
+import { HeaderBar } from './ui/shell/HeaderBar'
+import { ActivityRail } from './ui/shell/ActivityRail'
+import { EmptyLens } from './ui/lenses/EmptyLens'
+import type { Lens } from './ui/lenses/lenses'
+import { CommandPalette } from './ui/CommandPalette'
+import { createNode, createSuccessor, type CreatePlacement } from './ui/canvas/nodeCreation'
 import { InvalidModelModal } from './ui/InvalidModelModal'
+import { FeatureNavigator } from './ui/FeatureNavigator'
 import { HealingOverlay, type HealLogLine } from './ui/HealingOverlay'
 import { newModel, jsonToModel, modelToJson } from './io/fileOps'
 import { saveToStorage, loadFromStorage } from './io/persistence'
 import { getEdgeTypeForConnection } from './ui/connectionRules'
 import { computeNodeAlignments } from './ui/layout/grid'
 import { autoLayoutMissingPositions } from './ui/layout/autoLayout'
-import { stackSubmodels } from './ui/layout/submodels'
-import type { EdgeType } from './model/types'
+import { reflowBands } from './ui/layout/bandGrid'
+import { buildNodeSubmodelMap } from './ui/layout/submodels'
+import { UNGROUPED_FEATURE } from './ui/featurePages'
+import type { EdgeType, EventModel, NodeType } from './model/types'
 import { IdeClient, type ConnectionState, type RpcResult } from './ipc/client'
 import { initialize, type InitializeResult } from './ipc/initialize'
 import {
@@ -26,21 +34,63 @@ import {
   type ValidationError,
 } from './ipc/eventModel'
 import { StatusBar } from './ipc/StatusBar'
+import { useAutosave } from './io/useAutosave'
+import { validate, countIssues, type Issue } from './model/validate'
+import { ProblemsPanel } from './ui/ProblemsPanel'
 
 const CLIENT_INFO = { name: 'neoide-frontend', version: '0.0.1' }
+
+// Transient status messages now go through Mantine's notification system
+// (replaces the old bespoke <Toast>). Auto-dismisses; bottom-center per main.tsx.
+const notify = (message: string) => notifications.show({ message })
 
 function getInitialModel() {
   return loadFromStorage() ?? newModel()
 }
 
+/**
+ * When submodels are in use, lay each one out as its own band grid. No-op
+ * (returns the same model) for legacy models with no submodel assigned, so
+ * the global-timeline layout is untouched. Idempotent.
+ */
+function applyBandReflow(model: EventModel): EventModel {
+  const adjustments = reflowBands(model)
+  if (adjustments.length === 0) return model
+  const positions = { ...model.layout.nodePositions }
+  for (const a of adjustments) positions[a.nodeId] = { x: a.x, y: a.y }
+  return { ...model, layout: { ...model.layout, nodePositions: positions } }
+}
+
 function App() {
   const [model, dispatch] = useReducer(reducer, null, getInitialModel)
   const [dirty, setDirty] = useState(false)
-  const [toastMessage, setToastMessage] = useState<string | null>(null)
   const [flashingSliceId, setFlashingSliceId] = useState<string | null>(null)
   const [flashingEntityId, setFlashingEntityId] = useState<string | null>(null)
   const modelRef = useRef(model)
   modelRef.current = model
+
+  // ── "Features as pages" view state ──────────────────────────
+  // A model with >=1 submodel shows exactly one FEATURE (page) at a time. The
+  // active feature is local UI state (not part of the persisted model). When
+  // there are no submodels, the canvas falls back to the flat global timeline.
+  const [activeFeatureId, setActiveFeatureId] = useState<string>(UNGROUPED_FEATURE)
+  // Active lens (Model built; Schema/Logs/Emulate are roadmap placeholders).
+  const [lens, setLens] = useState<Lens>('model')
+  const featureMode = model.submodels.length > 0
+  const nodeSubmodel = useMemo(() => buildNodeSubmodelMap(model), [model])
+  const hasUngrouped = useMemo(
+    () =>
+      model.chapters.some((c) => !c.submodelId) ||
+      model.nodes.some((n) => (nodeSubmodel.get(n.id) ?? null) === null),
+    [model.chapters, model.nodes, nodeSubmodel],
+  )
+
+  // Breadcrumb: the active feature's name (null in flat mode / no submodels).
+  const activeFeatureName = useMemo(() => {
+    if (!featureMode) return null
+    if (activeFeatureId === UNGROUPED_FEATURE) return 'Ungrouped'
+    return model.submodels.find((s) => s.id === activeFeatureId)?.name ?? null
+  }, [featureMode, activeFeatureId, model.submodels])
 
   // Auto-save to localStorage on every model change
   useEffect(() => {
@@ -69,6 +119,74 @@ function App() {
   const [fitSignal, setFitSignal] = useState<number | undefined>(undefined)
   const [healLog, setHealLog] = useState<HealLogLine[]>([])
   const clientRef = useRef<IdeClient | null>(null)
+
+  // Keep the active feature valid: when the model has features but the current
+  // selection no longer exists (deleted, or Ungrouped emptied), fall back to
+  // the first feature so the canvas never renders an unknown empty page.
+  useEffect(() => {
+    if (!featureMode) return
+    const valid =
+      activeFeatureId === UNGROUPED_FEATURE
+        ? hasUngrouped
+        : model.submodels.some((s) => s.id === activeFeatureId)
+    if (!valid) {
+      const first = [...model.submodels].sort((a, b) => a.order - b.order)[0]
+      setActiveFeatureId(first ? first.id : UNGROUPED_FEATURE)
+      setFitSignal((n) => (n ?? 0) + 1)
+    }
+  }, [featureMode, activeFeatureId, model.submodels, hasUngrouped])
+
+  // ── Autosave (git is the rollback layer; no Save button) ────
+  const connOpen = conn.status === 'open'
+  const writeFn = useCallback(async (content: string) => {
+    const client = clientRef.current
+    if (!client) return false
+    const res = await writeEventModel(client, content)
+    return res.ok
+  }, [])
+  const { saveState, flushNow } = useAutosave({
+    model,
+    dirty,
+    connOpen,
+    write: writeFn,
+    onSaved: () => setDirty(false),
+  })
+
+  // Cmd/Ctrl+S flushes the autosave immediately (muscle memory; not a git op).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault()
+        void flushNow()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [flushNow])
+
+  // ── Live validation (debounced 350ms, never blocks autosave) ─
+  const [issues, setIssues] = useState<Issue[]>([])
+  useEffect(() => {
+    const id = setTimeout(() => setIssues(validate(model)), 350)
+    return () => clearTimeout(id)
+  }, [model])
+  const issueCounts = useMemo(() => countIssues(issues), [issues])
+  const [problemsOpen, setProblemsOpen] = useState(false)
+
+  // ── Focus primitive: select + frame a node, switching feature if needed.
+  // Drives Problems-panel jump and cross-feature portal hops. `focusRequest`
+  // is consumed by Canvas (selects + fits the node once its feature mounts).
+  const [focusRequest, setFocusRequest] = useState<{ nodeId: string; nonce: number } | null>(null)
+  const focusNode = useCallback((nodeId: string) => {
+    const m = modelRef.current
+    if (!m.nodes.some((n) => n.id === nodeId)) return
+    if (m.submodels.length > 0) {
+      const feature = buildNodeSubmodelMap(m).get(nodeId) ?? null
+      setActiveFeatureId(feature ?? UNGROUPED_FEATURE)
+    }
+    setFocusRequest((prev) => ({ nodeId, nonce: (prev?.nonce ?? 0) + 1 }))
+    setFitSignal((n) => (n ?? 0) + 1)
+  }, [])
 
   // Subscribe to `$/progress` notifications while a heal is in flight so the
   // HealingOverlay can render claude's stdout/stderr line by line. Each
@@ -128,7 +246,7 @@ function App() {
   const applyReadResult = useCallback(
     (readRes: RpcResult<ReadEventModelResult>) => {
       if (!readRes.ok) {
-        setToastMessage(`Failed to read event-model.json: ${readRes.error.message}`)
+        notify(`Failed to read event-model.json: ${readRes.error.message}`)
         return
       }
       const { content, validation } = readRes.result
@@ -144,7 +262,11 @@ function App() {
             // sensible default layout instead of stacking everything at the
             // origin (common after AI healing, which often omits positions).
             // Idempotent — a no-op when every node already has a real position.
-            const loaded = autoLayoutMissingPositions(parsed)
+            const laidOut = autoLayoutMissingPositions(parsed)
+            // Then, if submodels are in use, lay each one out as its own band
+            // grid — so reloads after Tidy / heal / chapter-reorder restore the
+            // banded layout instead of leaving the global single timeline.
+            const loaded = applyBandReflow(laidOut)
             dispatch({ type: 'loadModel', model: loaded })
             setDirty(loaded !== parsed)
           }
@@ -194,14 +316,14 @@ function App() {
   const handleHealAccept = useCallback(async () => {
     const client = clientRef.current
     if (!client) {
-      setToastMessage('not connected to neo — cannot heal')
+      notify('not connected to neo — cannot heal')
       setPendingInvalid(null)
       return
     }
     setHealing(true)
     const healRes = await healEventModel(client)
     if (!healRes.ok) {
-      setToastMessage(`Healing failed: ${healRes.error.message}`)
+      notify(`Healing failed: ${healRes.error.message}`)
       setHealing(false)
       setCancellingHeal(false)
       setPendingInvalid(null)
@@ -219,7 +341,7 @@ function App() {
     }
     if (healRes.result.outcome.status === 'cancelled') {
       const applied = healRes.result.outcome.deterministicApplied
-      setToastMessage(
+      notify(
         applied > 0
           ? `Heal cancelled — kept ${applied} deterministic fix${applied === 1 ? '' : 'es'}.`
           : 'Heal cancelled.',
@@ -254,7 +376,7 @@ function App() {
     setCancellingHeal(true)
     const res = await cancelHealEventModel(client)
     if (!res.ok) {
-      setToastMessage(`Could not cancel heal: ${res.error.message}`)
+      notify(`Could not cancel heal: ${res.error.message}`)
       setCancellingHeal(false)
     }
     // On success we deliberately leave `cancellingHeal=true` until the
@@ -269,19 +391,16 @@ function App() {
   const handleManualHeal = useCallback(async () => {
     const client = clientRef.current
     if (!client) {
-      setToastMessage('not connected to neo — cannot heal')
+      notify('not connected to neo — cannot heal')
       return
     }
-    if (dirty) {
-      const confirmed = window.confirm(
-        'You have unsaved changes. The AI will edit the file on disk; your unsaved work will be discarded on reload. Continue?',
-      )
-      if (!confirmed) return
-    }
+    // Autosave already persisted local edits; flush any pending write so the
+    // agent operates on the latest model.
+    await flushNow()
     setHealing(true)
     const healRes = await healEventModel(client, 'improve')
     if (!healRes.ok) {
-      setToastMessage(`Healing failed: ${healRes.error.message}`)
+      notify(`Healing failed: ${healRes.error.message}`)
       setHealing(false)
       setCancellingHeal(false)
       return
@@ -298,7 +417,7 @@ function App() {
     }
     if (healRes.result.outcome.status === 'cancelled') {
       const applied = healRes.result.outcome.deterministicApplied
-      setToastMessage(
+      notify(
         applied > 0
           ? `Heal cancelled — kept ${applied} deterministic fix${applied === 1 ? '' : 'es'}.`
           : 'Heal cancelled.',
@@ -314,7 +433,7 @@ function App() {
     setHealing(false)
     setCancellingHeal(false)
     applyReadResult(reload)
-  }, [applyReadResult, dirty])
+  }, [applyReadResult, flushNow])
 
   // "Tidy by flow" button (FileMenu). Runs the deterministic layout +
   // wave-ordering pass server-side — no LLM, no model structural changes —
@@ -322,26 +441,21 @@ function App() {
   const handleRelayout = useCallback(async () => {
     const client = clientRef.current
     if (!client) {
-      setToastMessage('not connected to neo — cannot tidy')
+      notify('not connected to neo — cannot tidy')
       return
     }
-    if (dirty) {
-      const confirmed = window.confirm(
-        'You have unsaved changes. Tidy by flow will overwrite the file on disk; your unsaved work will be discarded on reload. Continue?',
-      )
-      if (!confirmed) return
-    }
+    await flushNow()
     setRelayouting(true)
     const res = await relayoutEventModel(client)
     if (!res.ok) {
-      setToastMessage(`Tidy by flow failed: ${res.error.message}`)
+      notify(`Tidy by flow failed: ${res.error.message}`)
       setRelayouting(false)
       return
     }
     if (res.result.applied === 0) {
-      setToastMessage('Already tidy — slices already follow the flow.')
+      notify('Already tidy — slices already follow the flow.')
     } else {
-      setToastMessage(
+      notify(
         `Tidied by flow — ${res.result.applied} change${res.result.applied === 1 ? '' : 's'}.`,
       )
     }
@@ -350,9 +464,62 @@ function App() {
     applyReadResult(reload)
     // Re-frame the canvas on the tidied (possibly moved) nodes.
     setFitSignal((n) => (n ?? 0) + 1)
-  }, [applyReadResult, dirty])
+  }, [applyReadResult, flushNow])
+
+  // Chapters panel: drag-reorder a chapter. Persists the new `chapter.order`,
+  // then runs the SAME server-side relayout as "Tidy by flow" — which now
+  // ranks flows by `chapter.order` — so the timeline visibly resequences and
+  // the order survives later tidy/heal. Writing first preserves any unsaved
+  // edits (unlike Tidy, which discards them). Gated on `relayouting` so an
+  // in-flight round-trip blocks overlapping drops (race-safe).
+  const handleReorderChapters = useCallback(
+    async (orderedChapterIds: string[]) => {
+      const client = clientRef.current
+      if (!client) {
+        notify('not connected to neo — cannot reorder chapters')
+        return
+      }
+      if (relayouting) return
+      // `dispatch` schedules a re-render; it does NOT update modelRef.current
+      // synchronously, so compute the next model forward for the disk write
+      // (mirrors handleAssignNodeToSlice / handleAssignChapterToSubmodel).
+      const action = { type: 'reorderChapters' as const, orderedChapterIds }
+      const next = reducer(modelRef.current, action)
+      dispatch(action) // optimistic: the panel reorders instantly
+      setRelayouting(true)
+      const written = await writeEventModel(client, modelToJson(next))
+      if (!written.ok) {
+        notify(`Reorder failed: ${written.error.message}`)
+        setRelayouting(false)
+        return
+      }
+      const res = await relayoutEventModel(client)
+      if (!res.ok) {
+        notify(`Reorder failed: ${res.error.message}`)
+        setRelayouting(false)
+        return
+      }
+      const reload = await readEventModel(client)
+      setRelayouting(false)
+      applyReadResult(reload)
+      setFitSignal((n) => (n ?? 0) + 1)
+    },
+    [applyReadResult, relayouting],
+  )
 
   const markDirty = useCallback(() => setDirty(true), [])
+
+  // Navigator slice drag-and-drop: reorder a slice and/or move it to another
+  // chapter, in one op. Writes `slice.chapterId`/`order` and lets autosave +
+  // the per-feature grid re-lay out the columns — no relayout round-trip (the
+  // wave pass would override a manual slice order; "Tidy by flow" still can).
+  const handleMoveSlice = useCallback(
+    (sliceId: string, chapterId: string | null, orderedSliceIds: string[]) => {
+      dispatch({ type: 'moveSliceToChapter', sliceId, chapterId, orderedSliceIds })
+      markDirty()
+    },
+    [markDirty],
+  )
 
   const handleAddEvent = useCallback(() => {
     dispatch({ type: 'addEvent', name: 'New Event' })
@@ -390,7 +557,7 @@ function App() {
         (n) => n.type === 'event' && n.entityId === entityId,
       )
       if (hasEvents) {
-        setToastMessage('You can only delete entities without events')
+        notify('You can only delete entities without events')
         setFlashingEntityId(entityId)
         setTimeout(() => setFlashingEntityId(null), 600)
         return
@@ -410,7 +577,7 @@ function App() {
     (sliceId: string) => {
       const hasNodes = modelRef.current.nodes.some((n) => n.sliceId === sliceId)
       if (hasNodes) {
-        setToastMessage('You can only delete empty slices')
+        notify('You can only delete empty slices')
         setFlashingSliceId(sliceId)
         setTimeout(() => setFlashingSliceId(null), 600)
         return
@@ -491,6 +658,30 @@ function App() {
     [markDirty],
   )
 
+  // Gesture creation: a node where the cursor is (right-click / double-click).
+  // Forward-compute so the new node id is known, then select + frame it.
+  const handleCreateNodeAt = useCallback(
+    (type: NodeType, place: CreatePlacement) => {
+      const { model: next, nodeId } = createNode(modelRef.current, type, place)
+      dispatch({ type: 'loadModel', model: next })
+      markDirty()
+      setFocusRequest((prev) => ({ nodeId, nonce: (prev?.nonce ?? 0) + 1 }))
+    },
+    [markDirty],
+  )
+
+  // Drag-a-wire-into-empty / "Add successor": create the valid successor + edge.
+  const handleCreateSuccessor = useCallback(
+    (sourceId: string, targetType: NodeType, place: CreatePlacement) => {
+      const { model: next, nodeId } = createSuccessor(modelRef.current, sourceId, targetType, place)
+      if (!nodeId) return
+      dispatch({ type: 'loadModel', model: next })
+      markDirty()
+      setFocusRequest((prev) => ({ nodeId, nonce: (prev?.nonce ?? 0) + 1 }))
+    },
+    [markDirty],
+  )
+
   const handleEdgesDelete = useCallback(
     (edgeIds: string[]) => {
       for (const id of edgeIds) {
@@ -504,6 +695,14 @@ function App() {
   const handleNodeRename = useCallback(
     (nodeId: string, name: string) => {
       dispatch({ type: 'updateNodeName', nodeId, name })
+      markDirty()
+    },
+    [markDirty],
+  )
+
+  const handleNodeFieldsChange = useCallback(
+    (nodeId: string, fields: import('./model/types').Field[]) => {
+      dispatch({ type: 'setNodeFields', nodeId, fields })
       markDirty()
     },
     [markDirty],
@@ -542,8 +741,53 @@ function App() {
     [markDirty],
   )
 
-  const handleAddSubmodel = useCallback(() => {
-    dispatch({ type: 'addSubmodel', name: 'New Submodel' })
+  // Feature-mode node drop: store a per-feature position override (so the drag
+  // sticks) and (re)assign slice/entity from where it landed.
+  const handleFeatureNodeMove = useCallback(
+    (
+      featureId: string,
+      nodeId: string,
+      sliceId: string | null,
+      entityId: string | null | undefined,
+      x: number,
+      y: number,
+    ) => {
+      if (sliceId !== null) dispatch({ type: 'assignNodeToSlice', nodeId, sliceId })
+      if (entityId !== undefined) dispatch({ type: 'assignNodeToEntity', nodeId, entityId })
+      dispatch({ type: 'setFeatureNodePosition', featureId, nodeId, x, y })
+      markDirty()
+    },
+    [markDirty],
+  )
+
+  // Switch the canvas to a feature. `focusNodeId` (from a cross-feature portal
+  // hop) selects + frames that node on arrival so the trace continues.
+  const handleSelectFeature = useCallback((featureId: string, focusNodeId?: string) => {
+    setActiveFeatureId(featureId)
+    setFitSignal((n) => (n ?? 0) + 1)
+    if (focusNodeId) setFocusRequest((prev) => ({ nodeId: focusNodeId, nonce: (prev?.nonce ?? 0) + 1 }))
+  }, [])
+
+  // Problems-panel row click → jump to the offending element.
+  const handleFocusIssue = useCallback(
+    (issue: Issue) => {
+      if (issue.nodeId) focusNode(issue.nodeId)
+      else if (issue.featureId) handleSelectFeature(issue.featureId)
+      else if (issue.edgeId) {
+        const edge = modelRef.current.edges.find((e) => e.id === issue.edgeId)
+        if (edge) focusNode(edge.sourceId)
+      }
+    },
+    [focusNode, handleSelectFeature],
+  )
+
+  // Create an empty feature and switch to it.
+  const handleAddFeature = useCallback(() => {
+    const next = reducer(modelRef.current, { type: 'addSubmodel', name: 'New Feature' })
+    const created = next.submodels[next.submodels.length - 1]
+    dispatch({ type: 'loadModel', model: next })
+    if (created) setActiveFeatureId(created.id)
+    setFitSignal((n) => (n ?? 0) + 1)
     markDirty()
   }, [markDirty])
 
@@ -555,36 +799,51 @@ function App() {
     [markDirty],
   )
 
-  const handleRemoveSubmodel = useCallback(
+  // Delete a feature. removeSubmodel detaches its chapters to Ungrouped (never
+  // deletes them). If the deleted feature was active, fall back to the first
+  // remaining feature (or Ungrouped).
+  const handleDeleteFeature = useCallback(
     (submodelId: string) => {
-      // Detach the submodel's chapters, then re-stack so the freed nodes
-      // settle back out of the (now gone) band.
-      const afterRemove = reducer(modelRef.current, { type: 'removeSubmodel', submodelId })
-      const adjustments = stackSubmodels(afterRemove)
-      dispatch({ type: 'removeSubmodel', submodelId })
-      if (adjustments.length > 0) {
-        dispatch({ type: 'batchUpdatePositions', changes: adjustments })
-      }
+      const next = reducer(modelRef.current, { type: 'removeSubmodel', submodelId })
+      dispatch({ type: 'loadModel', model: next })
+      setActiveFeatureId((cur) => {
+        if (cur !== submodelId) return cur
+        const first = [...next.submodels].sort((a, b) => a.order - b.order)[0]
+        return first ? first.id : UNGROUPED_FEATURE
+      })
+      setFitSignal((n) => (n ?? 0) + 1)
       markDirty()
     },
     [markDirty],
   )
 
+  // Create-from-selection: a new feature owning the selected chapters (their
+  // nodes follow transitively via slice → chapter → submodel). Switch to it.
+  const handleCreateFeatureFromChapters = useCallback(
+    (chapterIds: string[]) => {
+      let next = reducer(modelRef.current, { type: 'addSubmodel', name: 'New Feature' })
+      const created = next.submodels[next.submodels.length - 1]
+      if (created) {
+        for (const chapterId of chapterIds) {
+          next = reducer(next, {
+            type: 'assignChapterToSubmodel',
+            chapterId,
+            submodelId: created.id,
+          })
+        }
+      }
+      dispatch({ type: 'loadModel', model: next })
+      if (created) setActiveFeatureId(created.id)
+      setFitSignal((n) => (n ?? 0) + 1)
+      markDirty()
+    },
+    [markDirty],
+  )
+
+  // Flat-mode chapter-arrow dropdown still assigns a chapter to a submodel.
   const handleAssignChapterToSubmodel = useCallback(
     (chapterId: string, submodelId: string | null) => {
-      // Assign, then reflow the whole canvas so each submodel's nodes drop
-      // into their own vertical band (computed forward from the post-assign
-      // model, mirroring handleAssignNodeToSlice).
-      const afterAssign = reducer(modelRef.current, {
-        type: 'assignChapterToSubmodel',
-        chapterId,
-        submodelId,
-      })
-      const adjustments = stackSubmodels(afterAssign)
       dispatch({ type: 'assignChapterToSubmodel', chapterId, submodelId })
-      if (adjustments.length > 0) {
-        dispatch({ type: 'batchUpdatePositions', changes: adjustments })
-      }
       markDirty()
     },
     [markDirty],
@@ -599,108 +858,136 @@ function App() {
   )
 
   const handleNew = useCallback(() => {
-    if (dirty) {
-      const confirmed = window.confirm(
-        'You have unsaved changes. Are you sure you want to create a new model? All changes will be lost.',
-      )
-      if (!confirmed) return
-    }
+    // Persist the current model before resetting (git keeps the history).
+    void flushNow()
     dispatch({ type: 'loadModel', model: newModel() })
     setDirty(false)
-  }, [dirty])
+  }, [flushNow])
 
   const handleOpen = useCallback(async () => {
     const client = clientRef.current
     if (!client) {
-      setToastMessage('not connected to neo — cannot Open')
+      notify('not connected to neo — cannot Open')
       return
     }
-    if (dirty) {
-      const confirmed = window.confirm(
-        'You have unsaved changes. Re-opening event-model.json from disk will discard them. Continue?',
-      )
-      if (!confirmed) return
-    }
+    await flushNow()
     const res = await readEventModel(client)
     if (res.ok && res.result.validation.status === 'notFound') {
-      setToastMessage('event-model.json does not exist in the workspace yet')
+      notify('event-model.json does not exist in the workspace yet')
       return
     }
     applyReadResult(res)
-  }, [dirty, applyReadResult])
-
-  const handleSave = useCallback(async () => {
-    const client = clientRef.current
-    if (!client) {
-      setToastMessage('not connected to neo — cannot Save')
-      return
-    }
-    const content = modelToJson(model)
-    const res = await writeEventModel(client, content)
-    if (res.ok) {
-      setDirty(false)
-      setToastMessage(`saved to ${res.result.path}`)
-    } else {
-      setToastMessage(`Save failed: ${res.error.message}`)
-    }
-  }, [model])
+  }, [flushNow, applyReadResult])
 
   return (
     <ModelContext.Provider value={{ model, dispatch }}>
       <ReactFlowProvider>
-        <div className="flex flex-col w-full h-full">
-          <FileMenu
+        <Flex direction="column" w="100%" h="100vh">
+          <HeaderBar
+            projectName={init?.workspace.project?.name ?? model.name}
+            featureName={activeFeatureName}
             onNew={handleNew}
             onOpen={handleOpen}
-            onSave={handleSave}
             onHeal={handleManualHeal}
             onRelayout={handleRelayout}
-            dirty={dirty}
             healing={healing}
             relayouting={relayouting}
+            modelActive={lens === 'model'}
           />
-          <Toolbar
-            onAddEvent={handleAddEvent}
-            onAddCommand={handleAddCommand}
-            onAddQuery={handleAddQuery}
-            onAddIntegration={handleAddIntegration}
-            onAddUIPlaceholder={handleAddUIPlaceholder}
-            onAddEntity={handleAddEntity}
-            onAddSlice={handleAddSlice}
-            onAddChapter={handleAddChapter}
-            onAddSubmodel={handleAddSubmodel}
+          <Flex flex={1} mih={0}>
+            <ActivityRail lens={lens} onChange={setLens} />
+            <Box flex={1} mih={0}>
+              {lens === 'model' ? (
+                <Flex direction="column" h="100%">
+                  <Flex flex={1} mih={0}>
+                    <FeatureNavigator
+                      chapters={model.chapters}
+                      slices={model.slices}
+                      submodels={model.submodels}
+                      activeFeatureId={activeFeatureId}
+                      hasUngrouped={hasUngrouped}
+                      busy={relayouting || healing}
+                      onSelectFeature={handleSelectFeature}
+                      onReorder={handleReorderChapters}
+                      onMoveSlice={handleMoveSlice}
+                      onCreateFeatureFromChapters={handleCreateFeatureFromChapters}
+                      onAddFeature={handleAddFeature}
+                      onRenameFeature={handleRenameSubmodel}
+                      onDeleteFeature={handleDeleteFeature}
+                    />
+                    <Box flex={1} mih={0}>
+                      <Canvas
+                        model={model}
+                        activeFeatureId={activeFeatureId}
+                        onNavigateToFeature={handleSelectFeature}
+                        focusRequest={focusRequest ?? undefined}
+                        onPositionChange={handlePositionChange}
+                        onConnect={handleConnect}
+                        onNodesDelete={handleNodesDelete}
+                        onEdgesDelete={handleEdgesDelete}
+                        onNodeRename={handleNodeRename}
+                        onEntityRename={handleEntityRename}
+                        onSliceRename={handleSliceRename}
+                        onAssignNodeToSlice={handleAssignNodeToSlice}
+                        onAssignNodeToEntity={handleAssignNodeToEntity}
+                        onFeatureNodeMove={handleFeatureNodeMove}
+                        onSliceDelete={handleRemoveSlice}
+                        onEntityDelete={handleRemoveEntity}
+                        onChapterRename={handleRenameChapter}
+                        onChapterSliceRange={handleChapterSliceRange}
+                        onChapterDelete={handleRemoveChapter}
+                        onSubmodelRename={handleRenameSubmodel}
+                        onSubmodelDelete={handleDeleteFeature}
+                        onAssignChapterToSubmodel={handleAssignChapterToSubmodel}
+                        onCreateNode={handleCreateNodeAt}
+                        onCreateSuccessor={handleCreateSuccessor}
+                        onNodeFieldsChange={handleNodeFieldsChange}
+                        onAddEntity={handleAddEntity}
+                        onAddSlice={handleAddSlice}
+                        onAddChapter={handleAddChapter}
+                        flashingSliceId={flashingSliceId}
+                        flashingEntityId={flashingEntityId}
+                        fitSignal={fitSignal}
+                      />
+                    </Box>
+                    <ProblemsPanel
+                      issues={issues}
+                      open={problemsOpen}
+                      onClose={() => setProblemsOpen(false)}
+                      onFocusIssue={handleFocusIssue}
+                    />
+                  </Flex>
+                </Flex>
+              ) : (
+                <EmptyLens lens={lens} />
+              )}
+            </Box>
+          </Flex>
+          <StatusBar
+            state={conn}
+            init={init}
+            saveState={saveState}
+            issueCounts={issueCounts}
+            onToggleProblems={() => setProblemsOpen((o) => !o)}
+            onRetrySave={() => void flushNow()}
           />
-          <div className="flex flex-1 min-h-0">
-            <div className="flex-1">
-              <Canvas
-                model={model}
-                onPositionChange={handlePositionChange}
-                onConnect={handleConnect}
-                onNodesDelete={handleNodesDelete}
-                onEdgesDelete={handleEdgesDelete}
-                onNodeRename={handleNodeRename}
-                onEntityRename={handleEntityRename}
-                onSliceRename={handleSliceRename}
-                onAssignNodeToSlice={handleAssignNodeToSlice}
-                onAssignNodeToEntity={handleAssignNodeToEntity}
-                onSliceDelete={handleRemoveSlice}
-                onEntityDelete={handleRemoveEntity}
-                onChapterRename={handleRenameChapter}
-                onChapterSliceRange={handleChapterSliceRange}
-                onChapterDelete={handleRemoveChapter}
-                onSubmodelRename={handleRenameSubmodel}
-                onSubmodelDelete={handleRemoveSubmodel}
-                onAssignChapterToSubmodel={handleAssignChapterToSubmodel}
-                flashingSliceId={flashingSliceId}
-                flashingEntityId={flashingEntityId}
-                fitSignal={fitSignal}
-              />
-            </div>
-          </div>
-          <StatusBar state={conn} init={init} />
-        </div>
+        </Flex>
       </ReactFlowProvider>
-      <Toast message={toastMessage} onDismiss={() => setToastMessage(null)} />
+      <CommandPalette
+        onNew={handleNew}
+        onOpen={handleOpen}
+        onRelayout={handleRelayout}
+        onHeal={handleManualHeal}
+        onAddEvent={handleAddEvent}
+        onAddCommand={handleAddCommand}
+        onAddQuery={handleAddQuery}
+        onAddIntegration={handleAddIntegration}
+        onAddUIPlaceholder={handleAddUIPlaceholder}
+        onAddEntity={handleAddEntity}
+        onAddSlice={handleAddSlice}
+        onAddChapter={handleAddChapter}
+        onSelectLens={setLens}
+      />
       {pendingInvalid && !healing && (
         <InvalidModelModal
           errors={pendingInvalid.errors}

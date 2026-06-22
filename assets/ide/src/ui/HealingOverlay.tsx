@@ -1,5 +1,8 @@
 import { useEffect, useMemo, useRef } from 'react'
+import { Group, Text, Box, Stack, Button, Loader, Paper, Code } from '@mantine/core'
+import { IconCheck } from '@tabler/icons-react'
 import { reduceHealLog, type HealEvent } from './healEvents'
+import classes from './HealingOverlay.module.css'
 
 export interface HealLogLine {
   /** Subprocess stream: "stdout" (claude's content / reasoning) or "stderr"
@@ -13,12 +16,9 @@ interface HealingOverlayProps {
   /** Live tail of claude's output, streamed via `$/progress` notifications.
    *  Newest line at the bottom. Empty array shows just the spinner. */
   log?: HealLogLine[]
-  /** Click handler for the Cancel button in the overlay header. When
-   *  omitted, the button is not rendered (useful for the rare callers
-   *  that just want a non-interruptible overlay). */
+  /** Click handler for the Cancel button. When omitted, no button is rendered. */
   onCancel?: () => void
-  /** Disable the Cancel button while a cancel is already in flight, so
-   *  rapid double-clicks don't fire repeat `cancelHealEventModel` calls. */
+  /** Disable Cancel while a cancel is already in flight. */
   cancelling?: boolean
 }
 
@@ -26,8 +26,6 @@ export function HealingOverlay({ message, log, onCancel, cancelling }: HealingOv
   const scrollerRef = useRef<HTMLDivElement>(null)
 
   // Parse the raw streamed lines into a typed timeline of "thoughts".
-  // Reducing the whole log on every render is fine — the timeline tops out
-  // at a few hundred items per heal, and React/Tailwind paint is dominant.
   const events: HealEvent[] = useMemo(() => reduceHealLog(log ?? []), [log])
 
   useEffect(() => {
@@ -36,52 +34,41 @@ export function HealingOverlay({ message, log, onCancel, cancelling }: HealingOv
   }, [events])
 
   return (
-    <div
-      role="status"
-      aria-live="polite"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-    >
-      <div className="bg-white rounded-lg shadow-xl flex flex-col w-[min(760px,92vw)] h-[min(620px,82vh)]">
-        <div className="flex items-center gap-4 px-6 py-4 border-b border-gray-200">
-          <div
-            aria-hidden
-            className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin shrink-0"
-          />
-          <div className="text-sm text-gray-800 flex-1">
-            {message ?? 'Healing event model…'}
-          </div>
-          <div className="text-xs text-gray-500 shrink-0">
+    <div role="status" aria-live="polite" className={classes.backdrop}>
+      <Paper className={classes.panel} withBorder shadow="xl" radius="md" p={0}>
+        <div className={classes.header}>
+          <Loader size="sm" data-testid="heal-spinner" />
+          <Text size="sm" style={{ flex: 1 }}>{message ?? 'Healing event model…'}</Text>
+          <Text size="xs" c="dimmed">
             {events.length === 0
               ? 'waiting for the agent…'
               : `${events.length} ${events.length === 1 ? 'step' : 'steps'}`}
-          </div>
+          </Text>
           {onCancel && (
-            <button
-              type="button"
+            <Button
+              size="xs"
+              variant="default"
               onClick={onCancel}
               disabled={cancelling}
               data-testid="heal-cancel"
-              className="px-3 py-1.5 text-xs rounded border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
             >
               {cancelling ? 'Cancelling…' : 'Cancel'}
-            </button>
+            </Button>
           )}
         </div>
-        <div
-          ref={scrollerRef}
-          data-testid="heal-log"
-          className="px-5 py-4 overflow-y-auto flex-1 bg-gray-50 space-y-3"
-        >
+        <Box ref={scrollerRef} data-testid="heal-log" className={classes.log}>
           {events.length === 0 ? (
-            <div className="text-sm text-gray-500 italic">
-              The agent is starting up. Its reasoning, tool calls, and results
-              will appear here as soon as the first output arrives.
-            </div>
+            <Text size="sm" c="dimmed" fs="italic">
+              The agent is starting up. Its reasoning, tool calls, and results will
+              appear here as soon as the first output arrives.
+            </Text>
           ) : (
-            events.map((event) => <HealEventCard key={event.id} event={event} />)
+            <Stack gap="sm">
+              {events.map((event) => <HealEventCard key={event.id} event={event} />)}
+            </Stack>
           )}
-        </div>
-      </div>
+        </Box>
+      </Paper>
     </div>
   )
 }
@@ -90,93 +77,63 @@ function HealEventCard({ event }: { event: HealEvent }) {
   switch (event.kind) {
     case 'thinking':
       return (
-        <div
-          data-testid="heal-event-thinking"
-          className="border-l-2 border-gray-300 pl-3 text-sm text-gray-600 italic whitespace-pre-wrap break-words"
-        >
-          <div className="text-[10px] uppercase tracking-wider font-semibold text-gray-400 not-italic mb-0.5">
-            thinking
-          </div>
-          {event.text || <span className="text-gray-400">…</span>}
-        </div>
+        <Box data-testid="heal-event-thinking" pl="sm" className={classes.thinkingCard}>
+          <Text size="10px" fw={600} tt="uppercase" c="dimmed" mb={2}>thinking</Text>
+          <Text size="sm" c="dimmed" fs="italic" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            {event.text || '…'}
+          </Text>
+        </Box>
       )
     case 'text':
       return (
-        <div
-          data-testid="heal-event-text"
-          className="text-sm text-gray-800 whitespace-pre-wrap break-words"
-        >
+        <Text data-testid="heal-event-text" size="sm" style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
           {event.text}
-        </div>
+        </Text>
       )
     case 'tool_use': {
       const formatted = tryFormatJson(event.input)
       return (
-        <div
-          data-testid="heal-event-tool-use"
-          className="border border-indigo-100 bg-indigo-50/60 rounded-md px-3 py-2"
-        >
-          <div className="flex items-center gap-2 text-sm">
-            <span className="font-mono text-indigo-700 font-semibold">
-              {event.name}
-            </span>
-            <span className="text-xs text-indigo-500/70">tool call</span>
-          </div>
+        <Paper data-testid="heal-event-tool-use" withBorder p="xs" bg="color-mix(in srgb, var(--em-feature) 10%, transparent)">
+          <Group gap="xs">
+            <Text size="sm" ff="monospace" fw={600} c="emFeature">{event.name}</Text>
+            <Text size="xs" c="dimmed">tool call</Text>
+          </Group>
           {formatted && (
-            <pre className="mt-1 font-mono text-xs text-indigo-900/80 whitespace-pre-wrap break-words leading-snug">
-              {formatted}
-            </pre>
+            <Code block mt={4} fz="xs">{formatted}</Code>
           )}
-        </div>
+        </Paper>
       )
     }
     case 'tool_result':
       return (
-        <div
-          data-testid="heal-event-tool-result"
-          className="border border-emerald-100 bg-emerald-50/60 rounded-md px-3 py-2"
-        >
-          <div className="text-[10px] uppercase tracking-wider font-semibold text-emerald-600 mb-1">
-            result
-          </div>
-          <pre className="font-mono text-xs text-emerald-900/80 whitespace-pre-wrap break-words leading-snug">
+        <Paper data-testid="heal-event-tool-result" withBorder p="xs" bg="color-mix(in srgb, var(--mantine-color-green-6) 10%, transparent)">
+          <Text size="10px" fw={600} tt="uppercase" c="green" mb={4}>result</Text>
+          <Code block fz="xs">
             {event.preview}
-            {event.truncated && (
-              <span className="text-emerald-600/60"> …(truncated)</span>
-            )}
-          </pre>
-        </div>
+            {event.truncated && ' …(truncated)'}
+          </Code>
+        </Paper>
       )
     case 'status':
       return (
-        <div
-          data-testid="heal-event-status"
-          className="text-xs text-gray-400 italic"
-        >
-          {event.label}…
-        </div>
+        <Text data-testid="heal-event-status" size="xs" c="dimmed" fs="italic">{event.label}…</Text>
       )
     case 'auto_repair':
       return (
-        <div
-          data-testid="heal-event-auto-repair"
-          className="border border-emerald-300 bg-emerald-50 rounded-md px-3 py-2"
-        >
-          <div className="flex items-center gap-2 text-sm text-emerald-900">
-            <span aria-hidden className="text-emerald-600 font-semibold">✓</span>
-            <span className="font-medium">Auto-repaired {event.appliedCount}{' '}
-              {event.appliedCount === 1 ? 'item' : 'items'}</span>
+        <Paper data-testid="heal-event-auto-repair" withBorder p="xs" bg="color-mix(in srgb, var(--mantine-color-green-6) 12%, transparent)">
+          <Group gap="xs">
+            <IconCheck size={14} color="var(--mantine-color-green-6)" />
+            <Text size="sm" fw={500}>
+              Auto-repaired {event.appliedCount} {event.appliedCount === 1 ? 'item' : 'items'}
+            </Text>
             {event.residualCount > 0 && (
-              <span className="text-emerald-700">
-                · {event.residualCount} residual{event.residualCount === 1 ? '' : 's'} need
-                LLM
-              </span>
+              <Text size="sm" c="green">
+                · {event.residualCount} residual{event.residualCount === 1 ? '' : 's'} need LLM
+              </Text>
             )}
-          </div>
-          {event.summary && (
-            <div className="text-xs text-emerald-800/80 mt-0.5">{event.summary}</div>
-          )}
-        </div>
+          </Group>
+          {event.summary && <Text size="xs" c="dimmed" mt={2}>{event.summary}</Text>}
+        </Paper>
       )
     case 'api_retry': {
       const reason =
@@ -187,41 +144,34 @@ function HealEventCard({ event }: { event: HealEvent }) {
             : `Anthropic API returned HTTP ${event.errorStatus} (${event.error})`
       const delaySec = (event.delayMs / 1000).toFixed(1)
       return (
-        <div
-          data-testid="heal-event-api-retry"
-          className="border border-amber-200 bg-amber-50 rounded-md px-3 py-2"
-        >
-          <div className="flex items-center gap-2 text-sm text-amber-900">
-            <div
-              aria-hidden
-              className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin shrink-0"
-            />
-            <span className="font-medium">{reason}.</span>
-            <span className="text-amber-700">
+        <Paper data-testid="heal-event-api-retry" withBorder p="xs" bg="color-mix(in srgb, var(--mantine-color-yellow-6) 12%, transparent)">
+          <Group gap="xs" wrap="nowrap">
+            <Loader size={12} color="yellow" />
+            <Text size="sm" fw={500}>{reason}.</Text>
+            <Text size="sm" c="yellow.8">
               retrying attempt {event.attempt}
               {event.maxRetries > 0 && `/${event.maxRetries}`} in {delaySec}s…
-            </span>
-          </div>
-        </div>
+            </Text>
+          </Group>
+        </Paper>
       )
     }
     case 'raw':
       return (
-        <div
+        <Text
           data-testid="heal-event-raw"
-          className={`font-mono text-xs whitespace-pre-wrap break-words ${
-            event.stream === 'stderr' ? 'text-amber-700' : 'text-gray-500'
-          }`}
+          size="xs"
+          ff="monospace"
+          c={event.stream === 'stderr' ? 'orange' : 'dimmed'}
+          style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}
         >
           {event.text}
-        </div>
+        </Text>
       )
   }
 }
 
-/** Best-effort pretty-print of a (possibly partial) JSON string. Returns
- *  the original text if it doesn't parse — we'd rather show partial JSON
- *  exactly than not show it at all. */
+/** Best-effort pretty-print of a (possibly partial) JSON string. */
 function tryFormatJson(input: string): string {
   if (!input) return ''
   try {

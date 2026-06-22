@@ -1,0 +1,58 @@
+/* Self-contained styling for the shared domain-node chrome. Colors come from
+   the event-modeling theme tokens (see src/theme.ts cssVariablesResolver) so
+   there is ONE source of truth for the node palette. This module is the
+   hard-rule-sanctioned home for the node's specific visuals. */
+
+.node {
+  box-sizing: border-box;
+  position: relative;
+  min-width: 120px;
+  max-width: 220px;
+  padding: 8px 16px;
+  border-radius: var(--mantine-radius-md);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.3;
+  text-align: center;
+  word-break: break-word;
+  color: var(--mantine-color-white);
+  box-shadow: var(--mantine-shadow-sm);
+  transition: outline-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.node[data-variant='event'] {
+  background: var(--em-event);
+}
+.node[data-variant='command'] {
+  background: var(--em-command);
+}
+.node[data-variant='query'] {
+  background: var(--em-query);
+}
+.node[data-variant='integration'] {
+  background: var(--em-integration);
+}
+.node[data-variant='uiPlaceholder'] {
+  background: var(--mantine-color-body);
+  color: var(--mantine-color-text);
+  /* UI placeholders carry the event-modeling yellow as a dashed accent. */
+  border: 2px dashed var(--em-ui);
+}
+
+.node[data-selected='true'] {
+  outline: 2px solid var(--em-selection);
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--em-selection) 30%, transparent);
+}
+
+.icon {
+  display: inline-flex;
+  vertical-align: -2px;
+  margin-right: 4px;
+}
+
+/* Slot for semantic-zoom field details (Phase 2c). */
+.details {
+  margin-top: 6px;
+  text-align: left;
+}

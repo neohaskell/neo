@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react'
-import type { EventModel, EdgeType } from '../model/types'
+import type { EventModel, EdgeType, Field } from '../model/types'
 import {
   addEvent,
   addCommand,
@@ -14,6 +14,8 @@ import {
   renameEntity,
   addChapter,
   removeChapter,
+  reorderChapters,
+  moveSliceToChapter,
   addSlice,
   removeSlice,
   renameSlice,
@@ -23,10 +25,12 @@ import {
   assignEventToEntity,
   renameChapter,
   updateNodeName,
+  setNodeFields,
   addSubmodel,
   renameSubmodel,
   removeSubmodel,
   assignChapterToSubmodel,
+  setFeatureNodePosition,
 } from '../model/operations'
 import { applyPositionChanges } from '../ui/adapter'
 
@@ -38,6 +42,7 @@ export type Action =
   | { type: 'addUIPlaceholder'; name: string }
   | { type: 'removeNode'; nodeId: string }
   | { type: 'updateNodeName'; nodeId: string; name: string }
+  | { type: 'setNodeFields'; nodeId: string; fields: readonly Field[] }
   | { type: 'addEdge'; edgeType: EdgeType; sourceId: string; targetId: string; sourceHandle?: string | null; targetHandle?: string | null }
   | { type: 'removeEdge'; edgeId: string }
   | { type: 'addEntity'; name: string }
@@ -46,6 +51,8 @@ export type Action =
   | { type: 'addChapter'; name: string }
   | { type: 'removeChapter'; chapterId: string }
   | { type: 'renameChapter'; chapterId: string; name: string }
+  | { type: 'reorderChapters'; orderedChapterIds: string[] }
+  | { type: 'moveSliceToChapter'; sliceId: string; chapterId: string | null; orderedSliceIds: string[] }
   | { type: 'addSubmodel'; name: string }
   | { type: 'removeSubmodel'; submodelId: string }
   | { type: 'renameSubmodel'; submodelId: string; name: string }
@@ -58,6 +65,7 @@ export type Action =
   | { type: 'assignNodeToSlice'; nodeId: string; sliceId: string | null }
   | { type: 'assignNodeToEntity'; nodeId: string; entityId: string | null }
   | { type: 'updatePosition'; nodeId: string; x: number; y: number }
+  | { type: 'setFeatureNodePosition'; featureId: string; nodeId: string; x: number; y: number }
   | { type: 'batchUpdatePositions'; changes: { nodeId: string; x: number; y: number }[] }
   | { type: 'loadModel'; model: EventModel }
 
@@ -82,6 +90,8 @@ export function reducer(model: EventModel, action: Action): EventModel {
       return removeNode(model, action.nodeId)
     case 'updateNodeName':
       return updateNodeName(model, action.nodeId, action.name)
+    case 'setNodeFields':
+      return setNodeFields(model, action.nodeId, action.fields)
     case 'addEdge':
       return addEdge(model, {
         id: edgeId(),
@@ -105,6 +115,10 @@ export function reducer(model: EventModel, action: Action): EventModel {
       return removeChapter(model, action.chapterId)
     case 'renameChapter':
       return renameChapter(model, action.chapterId, action.name)
+    case 'reorderChapters':
+      return reorderChapters(model, action.orderedChapterIds)
+    case 'moveSliceToChapter':
+      return moveSliceToChapter(model, action.sliceId, action.chapterId, action.orderedSliceIds)
     case 'addSubmodel':
       return addSubmodel(model, { name: action.name })
     case 'removeSubmodel':
@@ -131,6 +145,8 @@ export function reducer(model: EventModel, action: Action): EventModel {
       return applyPositionChanges(model, [
         { id: action.nodeId, x: action.x, y: action.y },
       ])
+    case 'setFeatureNodePosition':
+      return setFeatureNodePosition(model, action.featureId, action.nodeId, action.x, action.y)
     case 'batchUpdatePositions':
       return applyPositionChanges(
         model,

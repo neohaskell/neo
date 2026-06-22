@@ -1,4 +1,7 @@
+import { ActionIcon } from '@mantine/core'
+import { IconX } from '@tabler/icons-react'
 import { EditableLabel } from './EditableLabel'
+import classes from './SubmodelBandNode.module.css'
 
 interface Props {
   data: {
@@ -8,15 +11,15 @@ interface Props {
   }
 }
 
-// A submodel band is a translucent full-bleed rectangle drawn BEHIND the
-// graph (lowest z-index) that visually contains all of a feature's chapters
-// and slices. Its body is pointer-transparent so nodes inside stay
-// interactive; only the top-left label chip captures clicks (rename/delete).
+// A submodel band is a translucent full-bleed rectangle drawn BEHIND the graph
+// (lowest z-index) that visually contains a feature's chapters/slices. Its body
+// is pointer-transparent so nodes inside stay interactive; only the top-left
+// chip captures clicks (rename/delete).
 export function SubmodelBandNodeComponent({ data }: Props) {
   return (
-    <div className="w-full h-full rounded-lg border-2 border-indigo-300 bg-indigo-50/40 relative pointer-events-none">
-      <div className="absolute left-3 top-2 flex items-center gap-2 pointer-events-auto">
-        <span className="text-sm font-bold uppercase tracking-wide text-indigo-500">
+    <div className={classes.band}>
+      <div className={classes.chip}>
+        <span className={classes.label}>
           {data.onRename ? (
             <EditableLabel label={data.label} onRename={data.onRename} />
           ) : (
@@ -24,14 +27,16 @@ export function SubmodelBandNodeComponent({ data }: Props) {
           )}
         </span>
         {data.onDelete && (
-          <button
-            type="button"
+          <ActionIcon
+            size="xs"
+            color="red"
+            variant="subtle"
             onClick={data.onDelete}
-            className="text-indigo-300 hover:text-red-500 text-xs leading-none px-1"
             title="Remove submodel (keeps its chapters)"
+            aria-label="Remove submodel"
           >
-            ✕
-          </button>
+            <IconX size={12} />
+          </ActionIcon>
         )}
       </div>
     </div>

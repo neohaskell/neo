@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useState, useEffect, useRef } from 'react'
+import { useMemo, useCallback, useState, useEffect, useRef, type MouseEvent as ReactMouseEvent } from 'react'
 import {
   ReactFlow,
   Background,
@@ -7,6 +7,7 @@ import {
   type OnNodesChange,
   type OnEdgesChange,
   type OnConnect,
+  type OnConnectEnd,
   type Connection,
   type Node,
   type Edge,
@@ -14,15 +15,39 @@ import {
   applyEdgeChanges,
   useReactFlow,
 } from '@xyflow/react'
+import { useComputedColorScheme, Menu } from '@mantine/core'
 import '@xyflow/react/dist/style.css'
 import { nodeTypes } from './nodes'
+import { CanvasMenu } from './canvas/CanvasMenu'
+import type { CreatePlacement } from './canvas/nodeCreation'
+import { successorsFor } from './connectionRules'
 import { toReactFlowNodes, toReactFlowEdges } from './adapter'
-import { buildGridNodes, computeSliceLayouts, computeEntityLaneLayouts, getEntityAtY, CHAPTER_ARROW_Y, type SliceLayout } from './layout/grid'
-import { buildSubmodelBandNodes, submodelsInUse } from './layout/submodels'
-import type { EventModel } from '../model/types'
+import { buildGridNodes, computeSliceLayouts, computeEntityLaneLayouts, getEntityAtY, CHAPTER_ARROW_Y, CHAPTER_ARROW_HEIGHT, type SliceLayout } from './layout/grid'
+import { buildNodeSubmodelMap } from './layout/submodels'
+import {
+  computeFeatureGrid,
+  buildPerBandGridNodes,
+  type BandGrid,
+} from './layout/bandGrid'
+import {
+  UNGROUPED_FEATURE,
+  buildFeatureRenderEdges,
+  type FeatureId,
+} from './featurePages'
+import { traceFromNode, type Trace } from './trace'
+import type { EventModel, NodeType } from '../model/types'
 
 interface CanvasProps {
   model: EventModel
+  /** Active feature (submodel id or UNGROUPED_FEATURE). When the model has
+   *  submodels, the canvas shows ONLY this feature's nodes (one screen at a
+   *  time). Ignored for legacy models with no submodels (flat timeline). */
+  activeFeatureId?: string
+  /** Navigate to another feature; `focusNodeId` (a cross-feature portal hop)
+   *  selects + frames that node on arrival so the trace continues. */
+  onNavigateToFeature?: (featureId: string, focusNodeId?: string) => void
+  /** When set (changing nonce), select + frame this node (problems jump / portal hop). */
+  focusRequest?: { nodeId: string; nonce: number }
   onPositionChange?: (nodeId: string, x: number, y: number) => void
   onConnect?: (sourceId: string, targetId: string, sourceHandle: string | null, targetHandle: string | null) => void
   onNodesDelete?: (nodeIds: string[]) => void
@@ -32,6 +57,17 @@ interface CanvasProps {
   onSliceRename?: (sliceId: string, name: string) => void
   onAssignNodeToSlice?: (nodeId: string, sliceId: string | null, x: number, y: number) => void
   onAssignNodeToEntity?: (nodeId: string, entityId: string | null) => void
+  /** Feature-mode drop: persist a per-feature position override (so the drag
+   *  sticks instead of snapping to the grid) and (re)assign slice/entity.
+   *  `entityId === undefined` means the node is not an event. */
+  onFeatureNodeMove?: (
+    featureId: string,
+    nodeId: string,
+    sliceId: string | null,
+    entityId: string | null | undefined,
+    x: number,
+    y: number,
+  ) => void
   onSliceDelete?: (sliceId: string) => void
   onEntityDelete?: (entityId: string) => void
   onChapterRename?: (chapterId: string, name: string) => void
@@ -40,20 +76,32 @@ interface CanvasProps {
   onSubmodelRename?: (submodelId: string, name: string) => void
   onSubmodelDelete?: (submodelId: string) => void
   onAssignChapterToSubmodel?: (chapterId: string, submodelId: string | null) => void
+  /** Create a node of `type` at a placement (right-click / double-click pane). */
+  onCreateNode?: (type: NodeType, place: CreatePlacement) => void
+  /** Create the valid successor of a node + the typed edge (drag-to-empty / menu). */
+  onCreateSuccessor?: (sourceId: string, targetType: NodeType, place: CreatePlacement) => void
+  /** Edit a node's schema fields (semantic zoom). */
+  onNodeFieldsChange?: (nodeId: string, fields: import('../model/types').Field[]) => void
+  /** Structural adds from the pane menu (no position). */
+  onAddEntity?: () => void
+  onAddSlice?: () => void
+  onAddChapter?: () => void
   flashingSliceId?: string | null
   flashingEntityId?: string | null
   /** Bump this to re-fit the viewport to the content (e.g. after a server
    *  reload such as "Tidy by flow", which moves nodes while React Flow's
-   *  mount-only `fitView` does not re-run). Leave undefined to skip. */
+   *  mount-only `fitView` does not re-run, or after switching feature). */
   fitSignal?: number
 }
 
 /** Node types that are visual background (lanes/columns/bands) — excluded
- *  from fit-to-view so the viewport frames the actual content. */
+ *  from fit-to-view so the viewport frames the actual content. Chapter arrows
+ *  are deliberately NOT excluded: they sit at the top of the diagram and must
+ *  be framed (otherwise the viewport scrolls past them and chapters look
+ *  missing). */
 const BACKGROUND_NODE_TYPES = new Set([
   'entityLane',
   'sliceColumn',
-  'chapterArrow',
   'submodelBand',
 ])
 
@@ -66,7 +114,37 @@ function getSliceAtX(layouts: SliceLayout[], x: number): string | null {
   return null
 }
 
+/**
+ * The slice nearest to `x` (containing it, else closest by edge distance).
+ * Used for feature-mode node creation: a node MUST land in a slice to be a
+ * member of the active feature (membership = slice→chapter→submodel), so a drop
+ * outside any column snaps to the nearest one instead of silently becoming
+ * ungrouped and vanishing from the page. Returns null only when there are no
+ * slices at all.
+ */
+function nearestSliceAtX(layouts: SliceLayout[], x: number): string | null {
+  if (layouts.length === 0) return null
+  let best = layouts[0]
+  let bestDist = Infinity
+  for (const l of layouts) {
+    const dist = x < l.xStart ? l.xStart - x : x > l.xStart + l.width ? x - (l.xStart + l.width) : 0
+    if (dist < bestDist) {
+      bestDist = dist
+      best = l
+    }
+  }
+  return best.sliceId
+}
+
 const CHAPTER_ARROW_PREFIX = '__chapter-arrow-'
+
+const NODE_LABEL: Record<NodeType, string> = {
+  event: 'Event',
+  command: 'Command',
+  query: 'Query',
+  integration: 'Integration',
+  uiPlaceholder: 'UI Placeholder',
+}
 
 /** Returns the slice at x only if it's free or already owned by chapterId */
 function getAvailableSliceAtX(
@@ -83,8 +161,78 @@ function getAvailableSliceAtX(
   return sliceId
 }
 
+// ── Trace styling (selected-node edge highlighting) ──────────
+// Colors are theme tokens (see cssVariablesResolver) so the causal line stays
+// visible on both the light and dark canvas.
+const TRACED_DOMAIN_STYLE = { stroke: 'var(--em-trace)', strokeWidth: 4.5, opacity: 1 }
+const TRACED_PORTAL_STYLE = { stroke: 'var(--em-trace-portal)', strokeWidth: 3, opacity: 1 }
+const DIM_OPACITY = 0.18
+
+function portalEdgeId(nodeId: string): string | null {
+  const m = /^__portal-(?:out|in)-(.+)$/.exec(nodeId)
+  return m ? m[1] : null
+}
+
+/** Restyle edges for an active trace: highlight the selected node's direct
+ *  outgoing edges (animated, dash-marching outward), dim the rest. No-op when
+ *  nothing is selected. */
+function applyTraceToEdges(edges: Edge[], trace: Trace, active: boolean): Edge[] {
+  if (!active) return edges
+  return edges.map((e) => {
+    if (trace.edgeIds.has(e.id)) {
+      const isPortal =
+        (e.source?.startsWith('__portal') ?? false) || (e.target?.startsWith('__portal') ?? false)
+      return {
+        ...e,
+        animated: true,
+        zIndex: 10,
+        style: { ...e.style, ...(isPortal ? TRACED_PORTAL_STYLE : TRACED_DOMAIN_STYLE) },
+      }
+    }
+    return { ...e, animated: false, style: { ...e.style, opacity: DIM_OPACITY } }
+  })
+}
+
+const TRACEABLE_NODE_TYPES = new Set([
+  'event',
+  'command',
+  'query',
+  'integration',
+  'uiPlaceholder',
+  'boundaryPortal',
+])
+
+/** Dim off-trace domain nodes + portals; keep on-trace ones bright (and ring an
+ *  on-trace portal — "the flow continues through this door"). Background grid
+ *  nodes (lanes/columns/bands) are never touched. */
+function applyTraceToNodes(nodes: Node[], trace: Trace, active: boolean): Node[] {
+  if (!active) return nodes
+  return nodes.map((n) => {
+    const type = n.type ?? ''
+    if (!TRACEABLE_NODE_TYPES.has(type)) return n
+    if (type === 'boundaryPortal') {
+      const eid = portalEdgeId(n.id)
+      const on = eid ? trace.edgeIds.has(eid) : false
+      return {
+        ...n,
+        style: {
+          ...n.style,
+          opacity: on ? 1 : DIM_OPACITY,
+          outline: on ? '2px solid var(--em-trace-portal)' : undefined,
+          borderRadius: on ? 8 : undefined,
+        },
+      }
+    }
+    const on = trace.nodeIds.has(n.id)
+    return { ...n, style: { ...n.style, opacity: on ? 1 : 0.22 } }
+  })
+}
+
 export function Canvas({
   model,
+  activeFeatureId,
+  onNavigateToFeature,
+  focusRequest,
   onPositionChange,
   onConnect: onConnectProp,
   onNodesDelete,
@@ -94,6 +242,7 @@ export function Canvas({
   onSliceRename,
   onAssignNodeToSlice,
   onAssignNodeToEntity,
+  onFeatureNodeMove,
   onSliceDelete,
   onEntityDelete,
   onChapterRename,
@@ -102,16 +251,23 @@ export function Canvas({
   onSubmodelRename,
   onSubmodelDelete,
   onAssignChapterToSubmodel,
+  onCreateNode,
+  onCreateSuccessor,
+  onNodeFieldsChange,
+  onAddEntity,
+  onAddSlice,
+  onAddChapter,
   flashingSliceId,
   flashingEntityId,
   fitSignal,
 }: CanvasProps) {
   const reactFlow = useReactFlow()
+  const colorScheme = useComputedColorScheme('dark')
 
   // Re-fit the viewport whenever `fitSignal` changes (a server reload moved
-  // the nodes). React Flow's `fitView` prop only runs on mount, so without
-  // this an off-origin layout — e.g. right after "Tidy by flow" — would leave
-  // the canvas looking empty until the user manually zoomed to fit.
+  // the nodes, or the user switched feature). React Flow's `fitView` prop only
+  // runs on mount, so without this an off-origin layout would leave the canvas
+  // looking empty until the user manually zoomed to fit.
   useEffect(() => {
     if (fitSignal === undefined) return
     const id = setTimeout(() => {
@@ -129,6 +285,7 @@ export function Canvas({
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null)
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null)
   const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null)
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const selectedSliceRef = useRef<string | null>(null)
   selectedSliceRef.current = selectedSliceId
   const selectedEntityRef = useRef<string | null>(null)
@@ -148,8 +305,92 @@ export function Canvas({
   const entityLaneLayoutsRef = useRef(entityLaneLayouts)
   entityLaneLayoutsRef.current = entityLaneLayouts
 
-  const domainNodes = useMemo(() => toReactFlowNodes(model, onNodeRename), [model, onNodeRename])
-  const modelEdges = useMemo(() => toReactFlowEdges(model), [model])
+  // ── Feature ("page") mode ────────────────────────────────────
+  // A model with >=1 submodel renders exactly ONE feature at a time (the
+  // active one); the stacked-bands view is gone. A legacy model with no
+  // submodels renders the flat global timeline, exactly as before.
+  const nodeSubmodel = useMemo(() => buildNodeSubmodelMap(model), [model])
+  const featureMode = model.submodels.length > 0
+  const activeFeature: FeatureId = activeFeatureId ?? UNGROUPED_FEATURE
+  const featureFid = activeFeature === UNGROUPED_FEATURE ? null : activeFeature
+
+  const featureGrid = useMemo<BandGrid | null>(
+    () => (featureMode ? computeFeatureGrid(model, featureFid) : null),
+    [featureMode, model, featureFid],
+  )
+  const featureGridRef = useRef<BandGrid | null>(featureGrid)
+  featureGridRef.current = featureGrid
+  const featureModeRef = useRef(featureMode)
+  featureModeRef.current = featureMode
+  const activeFeatureRef = useRef(activeFeature)
+  activeFeatureRef.current = activeFeature
+
+  const featureMemberIds = useMemo(() => {
+    if (!featureMode) return null
+    const ids = new Set<string>()
+    for (const n of model.nodes) if ((nodeSubmodel.get(n.id) ?? null) === featureFid) ids.add(n.id)
+    return ids
+  }, [featureMode, model.nodes, nodeSubmodel, featureFid])
+
+  // Feature-mode positions: the deterministic grid provides defaults, but a
+  // per-feature `bySubmodel` override (set when the user drags a node) wins —
+  // so a drag sticks instead of snapping back to the grid.
+  const featurePositions = useMemo(() => {
+    if (!featureMode || !featureGrid) return null
+    const merged = new Map(featureGrid.positions)
+    const overrides = model.layout.bySubmodel?.[activeFeature]
+    if (overrides) {
+      for (const [id, pos] of Object.entries(overrides)) {
+        if (!featureMemberIds || featureMemberIds.has(id)) merged.set(id, pos)
+      }
+    }
+    return merged
+  }, [featureMode, featureGrid, model.layout.bySubmodel, activeFeature, featureMemberIds])
+
+  const domainNodes = useMemo(() => {
+    if (featureMode && featurePositions && featureMemberIds) {
+      return toReactFlowNodes(model, onNodeRename, {
+        positions: featurePositions,
+        includeIds: featureMemberIds,
+        onFieldsChange: onNodeFieldsChange,
+      })
+    }
+    return toReactFlowNodes(model, onNodeRename, { onFieldsChange: onNodeFieldsChange })
+  }, [featureMode, featurePositions, featureMemberIds, model, onNodeRename, onNodeFieldsChange])
+
+  const entityNames = useMemo(
+    () => new Map(model.entities.map((e) => [e.id, e.name])),
+    [model.entities],
+  )
+  const sliceNames = useMemo(
+    () => new Map(model.slices.map((s) => [s.id, s.name])),
+    [model.slices],
+  )
+
+  const featureName = useCallback(
+    (fid: FeatureId) =>
+      fid === UNGROUPED_FEATURE
+        ? 'Ungrouped'
+        : model.submodels.find((s) => s.id === fid)?.name ?? 'Feature',
+    [model.submodels],
+  )
+
+  const featureRender = useMemo(() => {
+    if (!featureMode || !featureGrid) return { edges: [] as Edge[], portalNodes: [] as Node[] }
+    return buildFeatureRenderEdges(
+      model,
+      activeFeature,
+      featureGrid,
+      nodeSubmodel,
+      featureName,
+      onNavigateToFeature,
+    )
+  }, [featureMode, featureGrid, model, activeFeature, nodeSubmodel, featureName, onNavigateToFeature])
+
+  const modelEdges = useMemo(
+    () => (featureMode ? featureRender.edges : toReactFlowEdges(model)),
+    [featureMode, featureRender, model],
+  )
   const [edges, setEdges] = useState<Edge[]>(modelEdges)
 
   useEffect(() => {
@@ -208,6 +449,7 @@ export function Canvas({
 
   const activeHighlight = highlightedSliceId ?? selectedSliceId
 
+  // Global flat-timeline grid (only used when there are no submodels).
   const gridNodes = useMemo(
     () => buildGridNodes(
       model, onEntityRename, onSliceRename, activeHighlight, flashingSliceId,
@@ -218,30 +460,96 @@ export function Canvas({
     [model, onEntityRename, onSliceRename, activeHighlight, flashingSliceId, handleSliceSelect, highlightedEntityId, flashingEntityId, selectedEntityId, handleEntitySelect, onChapterRename, selectedChapterId, handleChapterSelect, handleChapterEndDrag, handleChapterEndDrop, onAssignChapterToSubmodel],
   )
 
-  const submodelBandNodes = useMemo(
-    () => buildSubmodelBandNodes(model, onSubmodelRename, onSubmodelDelete),
-    [model, onSubmodelRename, onSubmodelDelete],
-  )
+  // Background nodes for the single active feature: its slice columns + its
+  // (compact) entity lanes + a titled band rectangle. The Ungrouped feature
+  // gets no rename/delete affordances (it isn't a real submodel).
+  const featureBackgroundNodes = useMemo(() => {
+    if (!featureMode || !featureGrid) return [] as Node[]
+    return buildPerBandGridNodes([featureGrid], {
+      entityName: entityNames,
+      sliceName: sliceNames,
+      highlightedSliceId: activeHighlight,
+      flashingSliceId,
+      onRenameSlice: onSliceRename,
+      onSliceSelect: handleSliceSelect,
+      highlightedEntityId,
+      flashingEntityId,
+      selectedEntityId,
+      onRenameEntity: onEntityRename,
+      onEntitySelect: handleEntitySelect,
+      onSubmodelRename: featureFid ? onSubmodelRename : undefined,
+      onSubmodelDelete: featureFid ? onSubmodelDelete : undefined,
+    })
+  }, [
+    featureMode, featureGrid, entityNames, sliceNames, activeHighlight, flashingSliceId,
+    onSliceRename, handleSliceSelect, highlightedEntityId, flashingEntityId, selectedEntityId,
+    onEntityRename, handleEntitySelect, featureFid, onSubmodelRename, onSubmodelDelete,
+  ])
 
-  // When submodels are in use they become the vertical organiser. The
-  // entity swim-lanes (full-width horizontal bands) and slice columns
-  // (full-height vertical strips) both assume ONE shared timeline, so they
-  // visually fight the stacked bands — suppress them and let the submodel
-  // bands carry the grouping. Chapter arrows stay (they host the
-  // submodel-assignment control).
-  const inUseSubmodels = submodelsInUse(model)
+  // Chapter arrows for the active feature: a labeled bar spanning each
+  // chapter's slices (positioned against the feature's band-local slice
+  // layout). Display-only here — rename / select(delete) / submodel-assign
+  // work, but range-resize stays in the flat view (slice ranges are computed
+  // over the GLOBAL slice order, which a per-feature drag can't honour).
+  const featureChapterArrows = useMemo(() => {
+    if (!featureMode || !featureGrid) return [] as Node[]
+    const sliceById = new Map(featureGrid.slices.map((s) => [s.sliceId, s]))
+    const y = featureGrid.yOrigin + 2
+    const arrows: Node[] = []
+    for (const chapter of [...model.chapters].sort((a, b) => a.order - b.order)) {
+      const layouts = model.slices
+        .filter((s) => s.chapterId === chapter.id)
+        .map((s) => sliceById.get(s.id))
+        .filter((l): l is SliceLayout => l !== undefined)
+      if (layouts.length === 0) continue // chapter has no slice on this feature
+      const xStart = Math.min(...layouts.map((l) => l.xStart))
+      const xEnd = Math.max(...layouts.map((l) => l.xStart + l.width))
+      arrows.push({
+        id: `__chapter-arrow-${chapter.id}`,
+        type: 'chapterArrow',
+        position: { x: xStart, y },
+        data: {
+          label: chapter.name,
+          chapterId: chapter.id,
+          unassigned: false,
+          selected: selectedChapterId === chapter.id,
+          onSelect: () => handleChapterSelect(chapter.id),
+          onRename: onChapterRename ? (name: string) => onChapterRename(chapter.id, name) : undefined,
+          submodels: model.submodels,
+          currentSubmodelId: chapter.submodelId ?? null,
+          onAssignSubmodel: onAssignChapterToSubmodel
+            ? (submodelId: string | null) => onAssignChapterToSubmodel(chapter.id, submodelId)
+            : undefined,
+        },
+        draggable: false,
+        selectable: false,
+        focusable: false,
+        style: {
+          width: Math.max(80, xEnd - xStart),
+          height: CHAPTER_ARROW_HEIGHT,
+          zIndex: 1,
+          overflow: 'visible' as const,
+          pointerEvents: 'all' as const,
+        },
+      })
+    }
+    return arrows
+  }, [
+    featureMode, featureGrid, model.chapters, model.slices, model.submodels,
+    selectedChapterId, handleChapterSelect, onChapterRename, onAssignChapterToSubmodel,
+  ])
 
-  // Background nodes first (submodel bands behind everything), then domain nodes.
-  const modelNodes = useMemo(
-    () => [
-      ...submodelBandNodes,
-      ...(inUseSubmodels ? [] : gridNodes.entityLaneNodes),
-      ...(inUseSubmodels ? [] : gridNodes.sliceColumnNodes),
+  const modelNodes = useMemo(() => {
+    if (featureMode) {
+      return [...featureBackgroundNodes, ...featureChapterArrows, ...featureRender.portalNodes, ...domainNodes]
+    }
+    return [
+      ...gridNodes.entityLaneNodes,
+      ...gridNodes.sliceColumnNodes,
       ...gridNodes.chapterArrowNodes,
       ...domainNodes,
-    ],
-    [submodelBandNodes, inUseSubmodels, gridNodes, domainNodes],
-  )
+    ]
+  }, [featureMode, featureBackgroundNodes, featureChapterArrows, featureRender, gridNodes, domainNodes])
 
   const [nodes, setNodes] = useState<Node[]>(modelNodes)
 
@@ -263,7 +571,8 @@ export function Canvas({
 
         if (change.type !== 'position') continue
 
-        // Handle chapter arrow dragging (constrain to Y, highlight slice)
+        // Handle chapter arrow dragging (flat mode only — constrain to Y,
+        // highlight slice). Feature mode renders no chapter arrows.
         if (change.id.startsWith(CHAPTER_ARROW_PREFIX)) {
           const chapterId = change.id.slice(CHAPTER_ARROW_PREFIX.length)
           if (change.dragging && change.position) {
@@ -321,42 +630,63 @@ export function Canvas({
           continue
         }
 
-        // Skip other __ nodes (slice columns, entity lanes)
+        // Skip other __ nodes (slice columns, entity lanes, bands, portals)
         if (change.id.startsWith('__')) continue
+
+        // Hit-test the dragged node against the active feature's local grid
+        // (feature mode) or the global grid (flat mode).
+        const fGrid = featureModeRef.current ? featureGridRef.current : null
+        const sliceLayoutsHit = fGrid ? fGrid.slices : sliceLayoutsRef.current
+        const entityLayoutsHit = fGrid ? fGrid.lanes : entityLaneLayoutsRef.current
 
         if (change.dragging && change.position) {
           // Node is being dragged — highlight the slice under it
           draggingNodeRef.current = change.id
           const nodeType = model.nodes.find((n) => n.id === change.id)?.type ?? null
           draggingNodeTypeRef.current = nodeType
-          const sliceId = getSliceAtX(sliceLayoutsRef.current, change.position.x)
+          const sliceId = getSliceAtX(sliceLayoutsHit, change.position.x)
           setHighlightedSliceId(sliceId)
           // Only highlight entity lanes for event nodes
           if (nodeType === 'event') {
-            const entityId = getEntityAtY(entityLaneLayoutsRef.current, change.position.y)
+            const entityId = getEntityAtY(entityLayoutsHit, change.position.y)
             setHighlightedEntityId(entityId)
           }
         } else if (!change.dragging && change.position) {
-          // Node was dropped — assign to slice and entity, then clear highlights
-          const sliceId = getSliceAtX(sliceLayoutsRef.current, change.position.x)
-          if (draggingNodeRef.current) {
+          // Node was dropped.
+          const sliceId = getSliceAtX(sliceLayoutsHit, change.position.x)
+          if (featureModeRef.current) {
+            // Feature mode: persist a per-feature position override (so the
+            // drag sticks) and (re)assign slice/entity from the drop location.
+            const nid = draggingNodeRef.current ?? change.id
+            const nodeType = model.nodes.find((n) => n.id === nid)?.type ?? null
+            const entityId =
+              nodeType === 'event' ? getEntityAtY(entityLayoutsHit, change.position.y) : undefined
+            onFeatureNodeMove?.(
+              activeFeatureRef.current,
+              nid,
+              sliceId,
+              entityId,
+              change.position.x,
+              change.position.y,
+            )
+          } else if (draggingNodeRef.current) {
             onAssignNodeToSlice?.(draggingNodeRef.current, sliceId, change.position.x, change.position.y)
             // Assign event to entity on drop
             if (draggingNodeTypeRef.current === 'event') {
-              const entityId = getEntityAtY(entityLaneLayoutsRef.current, change.position.y)
+              const entityId = getEntityAtY(entityLayoutsHit, change.position.y)
               onAssignNodeToEntity?.(draggingNodeRef.current, entityId)
             }
-            draggingNodeRef.current = null
-            draggingNodeTypeRef.current = null
           } else {
             onPositionChange?.(change.id, change.position.x, change.position.y)
           }
+          draggingNodeRef.current = null
+          draggingNodeTypeRef.current = null
           setHighlightedSliceId(null)
           setHighlightedEntityId(null)
         }
       }
     },
-    [onPositionChange, onAssignNodeToSlice, onAssignNodeToEntity, onChapterSliceRange, model.nodes, model.slices],
+    [onPositionChange, onAssignNodeToSlice, onAssignNodeToEntity, onFeatureNodeMove, onChapterSliceRange, model.nodes, model.slices, nodes],
   )
 
   const handleConnect: OnConnect = useCallback(
@@ -388,6 +718,9 @@ export function Canvas({
 
   const handleEdgesDelete = useCallback(
     (deleted: { id: string }[]) => {
+      // Portal edges share their model edge id, so deleting one removes the
+      // underlying model edge — that's correct (the cross-feature edge is
+      // gone). Synthetic portal NODES are never deleted (selectable: false).
       onEdgesDelete?.(deleted.map((e) => e.id))
     },
     [onEdgesDelete],
@@ -397,10 +730,114 @@ export function Canvas({
     setSelectedSliceId(null)
     setSelectedEntityId(null)
     setSelectedChapterId(null)
+    setSelectedNodeId(null)
   }, [])
+
+  // ── Gesture node creation (right-click / double-click / drag-into-empty) ──
+  // No toolbar: nodes are created where the cursor is. Placement is hit-tested
+  // against the active grid so the new node lands in the slice/entity it was
+  // dropped on (and, in feature mode, joins that feature).
+  type MenuState =
+    | { kind: 'none' }
+    | { kind: 'pane'; x: number; y: number; place: CreatePlacement }
+    | { kind: 'node'; x: number; y: number; nodeId: string; nodeType: NodeType; place: CreatePlacement }
+    | { kind: 'successor'; x: number; y: number; sourceId: string; options: NodeType[]; place: CreatePlacement }
+  const [menu, setMenu] = useState<MenuState>({ kind: 'none' })
+  const closeMenu = useCallback(() => setMenu({ kind: 'none' }), [])
+
+  // Placement from canvas flow coordinates. In feature mode a node MUST land in
+  // a slice to be a member of the active feature, so a drop outside any column
+  // snaps to the nearest slice (never silently ungrouped → vanished).
+  const placementAtFlow = useCallback((fx: number, fy: number): CreatePlacement => {
+    const inFeature = featureModeRef.current
+    const fGrid = inFeature ? featureGridRef.current : null
+    const sliceHit = fGrid ? fGrid.slices : sliceLayoutsRef.current
+    const entityHit = fGrid ? fGrid.lanes : entityLaneLayoutsRef.current
+    let sliceId = getSliceAtX(sliceHit, fx)
+    if (sliceId == null && inFeature) sliceId = nearestSliceAtX(sliceHit, fx)
+    return {
+      x: fx,
+      y: fy,
+      sliceId,
+      entityId: getEntityAtY(entityHit, fy),
+      featureId: inFeature ? activeFeatureRef.current : null,
+    }
+  }, [])
+
+  const placementAtClient = useCallback(
+    (clientX: number, clientY: number): CreatePlacement => {
+      const flow = reactFlow.screenToFlowPosition({ x: clientX, y: clientY })
+      return placementAtFlow(flow.x, flow.y)
+    },
+    [reactFlow, placementAtFlow],
+  )
+
+  const handlePaneContextMenu = useCallback(
+    (e: ReactMouseEvent | MouseEvent) => {
+      e.preventDefault()
+      setMenu({ kind: 'pane', x: e.clientX, y: e.clientY, place: placementAtClient(e.clientX, e.clientY) })
+    },
+    [placementAtClient],
+  )
+
+  const handleNodeContextMenu = useCallback(
+    (e: ReactMouseEvent, node: Node) => {
+      if (node.id.startsWith('__')) return
+      e.preventDefault()
+      const nodeType = model.nodes.find((n) => n.id === node.id)?.type
+      if (!nodeType) return
+      // Hit-test at the source node's own position (same column) and place the
+      // successor below it, so it lands in the right slice — not at a pixel
+      // offset that may cross into a neighbouring column.
+      setMenu({
+        kind: 'node',
+        x: e.clientX,
+        y: e.clientY,
+        nodeId: node.id,
+        nodeType,
+        place: placementAtFlow(node.position.x, node.position.y + 140),
+      })
+    },
+    [placementAtFlow, model.nodes],
+  )
+
+  const handleDoubleClick = useCallback(
+    (e: ReactMouseEvent) => {
+      const target = e.target as HTMLElement
+      if (!target.classList?.contains('react-flow__pane')) return
+      setMenu({ kind: 'pane', x: e.clientX, y: e.clientY, place: placementAtClient(e.clientX, e.clientY) })
+    },
+    [placementAtClient],
+  )
+
+  // Drop a connection in empty space → spawn the valid successor + typed edge.
+  const handleConnectEnd: OnConnectEnd = useCallback(
+    (event, connectionState) => {
+      // A real edge was made (onConnect handled it), or the wire was dropped
+      // onto an existing node (even an invalid target) — don't spawn a duplicate.
+      if (connectionState.isValid || connectionState.toNode) return
+      const fromId = connectionState.fromNode?.id
+      if (!fromId || fromId.startsWith('__')) return
+      const sourceType = model.nodes.find((n) => n.id === fromId)?.type
+      if (!sourceType) return
+      const options = successorsFor(sourceType)
+      if (options.length === 0) return
+      const pt = 'changedTouches' in event ? event.changedTouches[0] : event
+      const place = placementAtClient(pt.clientX, pt.clientY)
+      if (options.length === 1) {
+        onCreateSuccessor?.(fromId, options[0], place)
+      } else {
+        setMenu({ kind: 'successor', x: pt.clientX, y: pt.clientY, sourceId: fromId, options, place })
+      }
+    },
+    [model.nodes, placementAtClient, onCreateSuccessor],
+  )
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setSelectedNodeId(null)
+      }
       if (e.key === 'Backspace') {
         if (selectedChapterRef.current) {
           onChapterDelete?.(selectedChapterRef.current)
@@ -416,27 +853,119 @@ export function Canvas({
     return () => window.removeEventListener('keydown', handleKeyDown)
   }, [onSliceDelete, onEntityDelete, onChapterDelete])
 
+  // ── Trace: highlight the selected node's direct outgoing edges ──
+  const trace = useMemo(() => traceFromNode(model, selectedNodeId), [model, selectedNodeId])
+  const traceActive = selectedNodeId !== null
+  const handleSelectionChange = useCallback(({ nodes: sel }: { nodes: Node[] }) => {
+    const domain = sel.find((n) => !n.id.startsWith('__'))
+    setSelectedNodeId(domain ? domain.id : null)
+  }, [])
+  const displayNodes = useMemo(
+    () => applyTraceToNodes(nodes, trace, traceActive),
+    [nodes, trace, traceActive],
+  )
+  const displayEdges = useMemo(
+    () => applyTraceToEdges(edges, trace, traceActive),
+    [edges, trace, traceActive],
+  )
+
+  // Focus request (Problems-panel jump / cross-feature portal hop): select +
+  // frame the node once the active feature's nodes have mounted.
+  useEffect(() => {
+    if (!focusRequest) return
+    const { nodeId } = focusRequest
+    const id = setTimeout(() => {
+      setSelectedNodeId(nodeId)
+      setNodes((nds) => nds.map((n) => ({ ...n, selected: n.id === nodeId })))
+      const target = reactFlow.getNode(nodeId)
+      if (target) reactFlow.fitView({ nodes: [target], padding: 0.3, duration: 300, maxZoom: 1.2 })
+    }, 60)
+    return () => clearTimeout(id)
+  }, [focusRequest, reactFlow])
+
   return (
-    <div className="w-full h-full" data-testid="canvas">
+    <div data-testid="canvas" style={{ width: '100%', height: '100%' }} onDoubleClick={handleDoubleClick}>
       <ReactFlow
-        nodes={nodes}
-        edges={edges}
+        colorMode={colorScheme}
+        nodes={displayNodes}
+        edges={displayEdges}
         nodeTypes={nodeTypes}
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
         onConnect={handleConnect}
+        onConnectEnd={handleConnectEnd}
         onNodesDelete={handleNodesDelete}
         onEdgesDelete={handleEdgesDelete}
         onPaneClick={handlePaneClick}
+        onPaneContextMenu={handlePaneContextMenu}
+        onNodeContextMenu={handleNodeContextMenu}
+        onSelectionChange={handleSelectionChange}
         connectionMode={ConnectionMode.Loose}
         deleteKeyCode="Backspace"
         zoomOnDoubleClick={false}
         fitView
-        fitViewOptions={{ nodes: nodes.filter((n) => n.type !== 'entityLane' && n.type !== 'sliceColumn' && n.type !== 'chapterArrow' && n.type !== 'submodelBand') }}
+        fitViewOptions={{ nodes: nodes.filter((n) => !BACKGROUND_NODE_TYPES.has(n.type ?? '')) }}
       >
         <Background />
         <Controls />
       </ReactFlow>
+
+      <CanvasMenu opened={menu.kind !== 'none'} x={menu.kind === 'none' ? 0 : menu.x} y={menu.kind === 'none' ? 0 : menu.y} onClose={closeMenu}>
+        {menu.kind === 'pane' && (
+          <>
+            <Menu.Label>Add here</Menu.Label>
+            {(['event', 'command', 'query', 'integration', 'uiPlaceholder'] as NodeType[]).map((t) => (
+              <Menu.Item
+                key={t}
+                data-testid={`pane-add-${t}`}
+                onClick={() => { onCreateNode?.(t, menu.place); closeMenu() }}
+              >
+                {NODE_LABEL[t]}
+              </Menu.Item>
+            ))}
+            <Menu.Divider />
+            <Menu.Item onClick={() => { onAddEntity?.(); closeMenu() }}>Entity</Menu.Item>
+            <Menu.Item onClick={() => { onAddSlice?.(); closeMenu() }}>Slice</Menu.Item>
+            <Menu.Item onClick={() => { onAddChapter?.(); closeMenu() }}>Chapter</Menu.Item>
+          </>
+        )}
+        {menu.kind === 'node' && (
+          <>
+            <Menu.Label>Add successor</Menu.Label>
+            {successorsFor(menu.nodeType).length === 0 ? (
+              <Menu.Item disabled>No valid successor</Menu.Item>
+            ) : (
+              successorsFor(menu.nodeType).map((t) => (
+                <Menu.Item
+                  key={t}
+                  data-testid={`node-add-successor-${t}`}
+                  onClick={() => { onCreateSuccessor?.(menu.nodeId, t, menu.place); closeMenu() }}
+                >
+                  {NODE_LABEL[t]}
+                </Menu.Item>
+              ))
+            )}
+            <Menu.Divider />
+            <Menu.Item color="red" data-testid="node-delete" onClick={() => { onNodesDelete?.([menu.nodeId]); closeMenu() }}>
+              Delete
+            </Menu.Item>
+          </>
+        )}
+        {menu.kind === 'successor' && (
+          <>
+            <Menu.Label>Create…</Menu.Label>
+            {menu.options.map((t) => (
+              <Menu.Item
+                key={t}
+                data-testid={`successor-add-${t}`}
+                onClick={() => { onCreateSuccessor?.(menu.sourceId, t, menu.place); closeMenu() }}
+              >
+                {NODE_LABEL[t]}
+              </Menu.Item>
+            ))}
+          </>
+        )}
+      </CanvasMenu>
     </div>
   )
 }

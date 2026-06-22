@@ -714,10 +714,18 @@ fn order_slices_by_wave(model: &Value, plan: &MaterializePlan, diff: &mut HealDi
                 id.clone()
             } else {
                 let id = synth_id("chapter", &root_name);
+                // Persist the SAME order the flow was ranked by, so a re-run
+                // reads it back and produces an empty diff (fixed point). New
+                // flows land after any user-ordered chapters.
+                let order = wave
+                    .flow_synth_order
+                    .get(&root_name)
+                    .copied()
+                    .unwrap_or(rank as f64);
                 diff.add_chapters.push(ChapterToAdd {
                     id: id.clone(),
                     name: root_name.clone(),
-                    order: rank as f64,
+                    order,
                     reason: format!("chapter for causal flow starting at {root_name}"),
                 });
                 resolved_chapter.insert(root_name.clone(), id.clone());
@@ -790,6 +798,12 @@ struct WaveOrder {
     /// connected component of the slice-precedence graph; the root is the
     /// flow's initializer (or, lacking one, its left-most slice).
     slice_flow: BTreeMap<String, (String, usize)>,
+    /// flow root slice name -> the `order` value to persist when SYNTHESIZING a
+    /// brand-new chapter for that flow. Equals the `eff_order` the flow was
+    /// ranked by, so the synthesized chapter's stored order matches the value
+    /// that produced its column — making a re-run a fixed point. (User-set
+    /// chapter orders are never overwritten; see `order_slices_by_wave`.)
+    flow_synth_order: BTreeMap<String, f64>,
 }
 
 /// `(name, id)` total-order key for a slice — the single source of
@@ -990,12 +1004,55 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
         comp_members.entry(r).or_default().push(s.clone());
     }
 
+    // `chapter.order` is the user-authoritative axis for horizontal flow
+    // ordering. Build chapter-order lookups (by id + by name) and each slice's
+    // chapterId from the model. The wave pass only READS these — it NEVER
+    // rewrites an existing chapter's order (see `order_slices_by_wave`) — so a
+    // manual drag-reorder in the Chapters panel resequences the timeline and
+    // survives "Tidy by flow" / heal.
+    let mut chapter_order_by_id: BTreeMap<String, f64> = BTreeMap::new();
+    let mut chapter_order_by_name: BTreeMap<String, f64> = BTreeMap::new();
+    if let Some(arr) = model.get("chapters").and_then(|v| v.as_array()) {
+        for c in arr {
+            let order = c.get("order").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if let Some(id) = c.get("id").and_then(|v| v.as_str()) {
+                chapter_order_by_id.insert(id.to_string(), order);
+            }
+            if let Some(name) = c.get("name").and_then(|v| v.as_str()) {
+                chapter_order_by_name.insert(name.to_string(), order);
+            }
+        }
+    }
+    let mut slice_chapter: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
+        for s in arr {
+            if let (Some(id), Some(ch)) = (
+                s.get("id").and_then(|v| v.as_str()),
+                s.get("chapterId")
+                    .and_then(|v| if v.is_null() { None } else { v.as_str() }),
+            ) {
+                slice_chapter.insert(id.to_string(), ch.to_string());
+            }
+        }
+    }
+    let max_existing_order = chapter_order_by_id
+        .values()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
     // Component root (initializer-first, then smallest (layer, name_key)) +
-    // min layer, then rank components by (min_layer, name_key(root)).
+    // min layer + the flow's effective chapter order. Components (flows) are
+    // ranked by `(eff_order, min_layer, name_key(root))`: chapter order first,
+    // the original deterministic wave tiebreak second.
     struct Comp {
         members: Vec<String>,
         root: String,
         min_layer: usize,
+        /// The flow's existing chapter order, if it already has one (via a
+        /// member slice's chapterId, else the chapter named after the root).
+        /// `None` for a brand-new flow — assigned a trailing order below.
+        existing_order: Option<f64>,
+        eff_order: f64,
     }
     let mut comps: Vec<Comp> = Vec::new();
     for (_r, members) in comp_members {
@@ -1019,20 +1076,69 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
             }
         }
         let root = root.unwrap_or_default();
+        let root_name = slice_name.get(&root).cloned().unwrap_or_default();
+        // Prefer a member slice's chapterId; fall back to the chapter named
+        // after the flow root (the heal-by-name convention). The min across
+        // members keeps a multi-chapter flow adjacent to its lowest chapter.
+        let existing_order = members
+            .iter()
+            .filter_map(|m| slice_chapter.get(m))
+            .filter_map(|cid| chapter_order_by_id.get(cid).copied())
+            .fold(None, |acc: Option<f64>, o| {
+                Some(acc.map_or(o, |a: f64| a.min(o)))
+            })
+            .or_else(|| chapter_order_by_name.get(&root_name).copied());
         comps.push(Comp {
             members,
             root,
             min_layer,
+            existing_order,
+            eff_order: 0.0,
         });
     }
+    // Brand-new flows (no chapter yet) append AFTER all existing chapters,
+    // ordered among themselves by their natural `(min_layer, nkey(root))` wave
+    // position. With no chapters at all, `base = -1` so they get `0,1,2,…` —
+    // byte-identical to the pre-feature ranking (all wave tests stay green).
+    let base = if max_existing_order.is_finite() {
+        max_existing_order
+    } else {
+        -1.0
+    };
+    let mut new_idx: Vec<usize> = comps
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.existing_order.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    new_idx.sort_by(|&a, &b| {
+        (comps[a].min_layer, nkey(&slice_name, &comps[a].root))
+            .cmp(&(comps[b].min_layer, nkey(&slice_name, &comps[b].root)))
+    });
+    for (k, &i) in new_idx.iter().enumerate() {
+        comps[i].eff_order = base + 1.0 + k as f64;
+    }
+    for c in comps.iter_mut() {
+        if let Some(o) = c.existing_order {
+            c.eff_order = o;
+        }
+    }
     comps.sort_by(|a, b| {
-        (a.min_layer, nkey(&slice_name, &a.root))
-            .cmp(&(b.min_layer, nkey(&slice_name, &b.root)))
+        a.eff_order
+            .partial_cmp(&b.eff_order)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (a.min_layer, nkey(&slice_name, &a.root))
+                    .cmp(&(b.min_layer, nkey(&slice_name, &b.root)))
+            })
     });
     let mut comp_rank: BTreeMap<String, usize> = BTreeMap::new();
     let mut flow_root: BTreeMap<String, String> = BTreeMap::new();
+    // root name -> the order to persist if this flow's chapter is synthesized.
+    let mut flow_synth_order: BTreeMap<String, f64> = BTreeMap::new();
     for (rank, c) in comps.iter().enumerate() {
         let root_name = slice_name.get(&c.root).cloned().unwrap_or_default();
+        flow_synth_order.insert(root_name.clone(), c.eff_order);
         for m in &c.members {
             comp_rank.insert(m.clone(), rank);
             flow_root.insert(m.clone(), root_name.clone());
@@ -1115,6 +1221,7 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
     WaveOrder {
         slice_order: final_order,
         slice_flow,
+        flow_synth_order,
     }
 }
 
@@ -2943,6 +3050,204 @@ mod tests {
             );
         }
         out
+    }
+
+    /// Two independent single-entity flows for the chapter-ordering tests:
+    /// flow A = `Aone`(cmd CA → evt EA) → `Atwo`(query QA); flow B likewise
+    /// with `Bone`/`Btwo`. `chapters` is the chapters array verbatim; `ch_a`
+    /// / `ch_b` set each flow's slices' `chapterId` (None → null).
+    fn two_flows_model(chapters: Value, ch_a: Option<&str>, ch_b: Option<&str>) -> Value {
+        let cid_a = ch_a.map(Value::from).unwrap_or(Value::Null);
+        let cid_b = ch_b.map(Value::from).unwrap_or(Value::Null);
+        serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": chapters,
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "sA1", "name": "Aone", "chapterId": cid_a, "order": 0 },
+                { "id": "sA2", "name": "Atwo", "chapterId": cid_a, "order": 0 },
+                { "id": "sB1", "name": "Bone", "chapterId": cid_b, "order": 0 },
+                { "id": "sB2", "name": "Btwo", "chapterId": cid_b, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "ca", "type": "command", "name": "CA", "sliceId": "sA1", "entityId": "e" },
+                { "id": "ea", "type": "event",   "name": "EA", "sliceId": "sA1", "entityId": "e" },
+                { "id": "qa", "type": "query",   "name": "QA", "sliceId": "sA2" },
+                { "id": "cb", "type": "command", "name": "CB", "sliceId": "sB1", "entityId": "e" },
+                { "id": "eb", "type": "event",   "name": "EB", "sliceId": "sB1", "entityId": "e" },
+                { "id": "qb", "type": "query",   "name": "QB", "sliceId": "sB2" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent", "sourceId": "ca", "targetId": "ea" },
+                { "id": "x2", "type": "eventFeedsQuery",      "sourceId": "ea", "targetId": "qa" },
+                { "id": "x3", "type": "commandProducesEvent", "sourceId": "cb", "targetId": "eb" },
+                { "id": "x4", "type": "eventFeedsQuery",      "sourceId": "eb", "targetId": "qb" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    fn no_inspection() -> ProjectInspection {
+        ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![],
+        }
+    }
+
+    #[test]
+    fn chapter_order_drives_slice_columns() {
+        // Two flows owned by two chapters. "ChB" has order 0, "ChA" order 1 —
+        // so flow B leads even though its root ("Bone") sorts AFTER "Aone"
+        // alphabetically. This is the feature: a manual chapter order overrides
+        // the natural wave tiebreak. (Contrast the baseline test below, where
+        // with no chapters the SAME graph orders Aone before Bone.)
+        let model = two_flows_model(
+            serde_json::json!([
+                { "id": "chA", "name": "ChA", "order": 1 },
+                { "id": "chB", "name": "ChB", "order": 0 }
+            ]),
+            Some("chA"),
+            Some("chB"),
+        );
+        let o = wave_orders(&model);
+        assert_eq!(o["Bone"], 0.0, "chapter order 0 wins the left edge; got {o:?}");
+        assert_eq!(o["Btwo"], 1.0, "{o:?}");
+        assert_eq!(o["Aone"], 2.0, "{o:?}");
+        assert_eq!(o["Atwo"], 3.0, "{o:?}");
+    }
+
+    #[test]
+    fn empty_chapters_model_is_byte_identical_to_baseline() {
+        // The SAME graph as chapter_order_drives_slice_columns but with NO
+        // chapters and un-chaptered slices: ranking falls back to the natural
+        // (min_layer, name) wave, so flow A precedes flow B. Proves chapter
+        // order is the ONLY thing that flipped them above, and that a
+        // chapterless model is unchanged from the pre-feature behaviour.
+        let model = two_flows_model(serde_json::json!([]), None, None);
+        let o = wave_orders(&model);
+        assert_eq!(o["Aone"], 0.0, "{o:?}");
+        assert_eq!(o["Atwo"], 1.0, "{o:?}");
+        assert_eq!(o["Bone"], 2.0, "{o:?}");
+        assert_eq!(o["Btwo"], 3.0, "{o:?}");
+    }
+
+    #[test]
+    fn chapter_reorder_keeps_flow_contiguous() {
+        // Chapter X (order 1) owns a 3-slice linear flow; chapter Y (order 0)
+        // owns a 1-slice flow. Y leads; X's three slices stay a contiguous
+        // 1,2,3 block in wave order — reordering never splits a flow.
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [
+                { "id": "chX", "name": "ChX", "order": 1 },
+                { "id": "chY", "name": "ChY", "order": 0 }
+            ],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "x1", "name": "Xone",   "chapterId": "chX", "order": 0 },
+                { "id": "x2", "name": "Xtwo",   "chapterId": "chX", "order": 0 },
+                { "id": "x3", "name": "Xthree", "chapterId": "chX", "order": 0 },
+                { "id": "y1", "name": "Yone",   "chapterId": "chY", "order": 0 }
+            ],
+            "nodes": [
+                { "id": "cx",  "type": "command", "name": "CX",  "sliceId": "x1", "entityId": "e" },
+                { "id": "ex",  "type": "event",   "name": "EX",  "sliceId": "x1", "entityId": "e" },
+                { "id": "ix",  "type": "integration", "name": "IX", "sliceId": "x2", "kind": "inbound" },
+                { "id": "cx2", "type": "command", "name": "CX2", "sliceId": "x3", "entityId": "e" },
+                { "id": "cy",  "type": "command", "name": "CY",  "sliceId": "y1", "entityId": "e" }
+            ],
+            "edges": [
+                { "id": "e1", "type": "commandProducesEvent",       "sourceId": "cx", "targetId": "ex" },
+                { "id": "e2", "type": "eventTriggersIntegration",   "sourceId": "ex", "targetId": "ix" },
+                { "id": "e3", "type": "integrationTriggersCommand", "sourceId": "ix", "targetId": "cx2" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let o = wave_orders(&model);
+        assert_eq!(o["Yone"], 0.0, "chapter order 0 leads; got {o:?}");
+        assert_eq!(
+            [o["Xone"], o["Xtwo"], o["Xthree"]],
+            [1.0, 2.0, 3.0],
+            "X's flow stays a contiguous, wave-ordered block; got {o:?}",
+        );
+    }
+
+    #[test]
+    fn manual_chapter_reorder_is_fixed_point() {
+        // After relayout honours the manual chapter order, a SECOND relayout
+        // must produce no slice/chapter/position changes.
+        let mut m = two_flows_model(
+            serde_json::json!([
+                { "id": "chA", "name": "ChA", "order": 1 },
+                { "id": "chB", "name": "ChB", "order": 0 }
+            ]),
+            Some("chA"),
+            Some("chB"),
+        );
+        let insp = no_inspection();
+        let d1 = compute_diff(&m, &insp);
+        crate::ide::heal::apply::apply_diff(&mut m, &d1);
+        let d2 = compute_diff(&m, &insp);
+        assert!(
+            d2.update_slices.is_empty(),
+            "slice order must be stable on re-run; got {:?}",
+            d2.update_slices,
+        );
+        assert!(
+            d2.add_chapters.is_empty(),
+            "no new chapters on re-run; got {:?}",
+            d2.add_chapters,
+        );
+        assert!(
+            d2.fix_positions.is_empty(),
+            "node x must be a fixed point; got {:?}",
+            d2.fix_positions,
+        );
+    }
+
+    #[test]
+    fn reorder_then_new_flow_appends_and_is_idempotent() {
+        // Existing user chapters at order 0 and 1; a NEW heal-owned flow with
+        // no chapter must get a synthesized chapter ordered AFTER them
+        // (max 1 + 1 = 2), and a second relayout must be a fixed point.
+        let mut m = two_flows_model(
+            serde_json::json!([
+                { "id": "chA", "name": "ChA", "order": 1 },
+                { "id": "chB", "name": "ChB", "order": 0 }
+            ]),
+            Some("chA"),
+            Some("chB"),
+        );
+        m["slices"].as_array_mut().unwrap().push(serde_json::json!(
+            { "id": "slice-heal-gamma", "name": "GammaFlow", "chapterId": null, "order": 0 }
+        ));
+        m["nodes"].as_array_mut().unwrap().push(serde_json::json!(
+            { "id": "cg", "type": "command", "name": "CG", "sliceId": "slice-heal-gamma", "entityId": "e" }
+        ));
+        let insp = no_inspection();
+        let d1 = compute_diff(&m, &insp);
+        let gamma = d1
+            .add_chapters
+            .iter()
+            .find(|c| c.name == "GammaFlow")
+            .expect("a chapter is synthesized for the new flow");
+        assert_eq!(
+            gamma.order, 2.0,
+            "new flow appends after the user's chapters (max 1 + 1); got {:?}",
+            d1.add_chapters,
+        );
+        crate::ide::heal::apply::apply_diff(&mut m, &d1);
+        let d2 = compute_diff(&m, &insp);
+        assert!(
+            d2.add_chapters.is_empty(),
+            "persisted chapter is reused on re-run, not re-synthesized; got {:?}",
+            d2.add_chapters,
+        );
+        assert!(
+            d2.update_slices.is_empty(),
+            "orders are stable on re-run; got {:?}",
+            d2.update_slices,
+        );
     }
 
     #[test]

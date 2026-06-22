@@ -332,6 +332,61 @@ mod tests {
     }
 
     #[test]
+    fn valid_model_with_bysubmodel_layout_passes() {
+        // Per-feature node-position overrides (Features-as-pages free drag).
+        let mut m = minimal_valid();
+        m["layout"]["bySubmodel"] =
+            json!({ "sm1": { "n1": { "x": 1.0, "y": 2.0 } }, "__ungrouped__": { "n2": { "x": 3.0, "y": 4.0 } } });
+        let raw = serde_json::to_string(&m).unwrap();
+        assert_eq!(validate_event_model(&raw), ValidationOutcome::Valid);
+    }
+
+    #[test]
+    fn valid_node_with_fields_passes() {
+        // A node carrying optional schema `fields` validates (semantic zoom /
+        // Schema lens). `fields` is additive; absence is also valid (covered by
+        // the minimal/full model tests above).
+        let mut m = minimal_valid();
+        m["nodes"] = json!([
+            {
+                "id": "n1", "type": "command", "name": "PlaceOrder",
+                "entityId": null, "sliceId": null,
+                "fields": [
+                    {"name": "orderId", "type": "UUID"},
+                    {"name": "total", "type": "Money"}
+                ]
+            }
+        ]);
+        let raw = serde_json::to_string(&m).unwrap();
+        assert_eq!(validate_event_model(&raw), ValidationOutcome::Valid);
+    }
+
+    #[test]
+    fn invalid_node_fields_rejected() {
+        // `fields` must be an array of {name, type}; a bare string is rejected.
+        let mut m = minimal_valid();
+        m["nodes"] = json!([
+            {"id": "n1", "type": "query", "name": "Q", "sliceId": null, "fields": "nope"}
+        ]);
+        let raw = serde_json::to_string(&m).unwrap();
+        let errors = invalid_errors(validate_event_model(&raw));
+        assert!(!errors.is_empty(), "expected a schema error for non-array fields");
+    }
+
+    #[test]
+    fn invalid_node_field_missing_type_rejected() {
+        // Each field requires both `name` and `type`.
+        let mut m = minimal_valid();
+        m["nodes"] = json!([
+            {"id": "n1", "type": "query", "name": "Q", "sliceId": null,
+             "fields": [{"name": "orderId"}]}
+        ]);
+        let raw = serde_json::to_string(&m).unwrap();
+        let errors = invalid_errors(validate_event_model(&raw));
+        assert!(!errors.is_empty(), "expected a schema error for a field missing `type`");
+    }
+
+    #[test]
     fn model_without_submodels_array_is_valid_backcompat() {
         // Files authored before submodels existed have no `submodels` key and
         // no `submodelId` on chapters — they must keep validating.
