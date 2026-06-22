@@ -113,11 +113,12 @@ describe('computePerBandGrids', () => {
     const [onb] = computePerBandGrids(twoSubmodelModel())
     const cmd = onb.positions.get('n1')!
     const evt = onb.positions.get('n2')!
-    // command sits at the band-local command band (yOrigin + COMMAND_BAND_Y)
-    expect(cmd.y).toBe(onb.yOrigin + 320)
-    // event sits inside its entity lane (User lane yStart + 60)
+    // event sits inside its entity lane (User lane yStart + EVENT_LANE_INSET 60)
     const userLane = onb.lanes.find((l) => l.entityId === 'User')!
     expect(evt.y).toBe(userLane.yStart + 60)
+    // command band sits in the open region ABOVE the entity lanes.
+    expect(cmd.y).toBeGreaterThan(onb.yOrigin)
+    expect(cmd.y).toBeLessThan(userLane.yStart)
   })
 
   it('uiPlaceholder_above_band', () => {
@@ -127,7 +128,10 @@ describe('computePerBandGrids', () => {
       nodes: [...m.nodes, { id: 'ui', type: 'uiPlaceholder', name: 'Form', sliceId: 's1' }],
     }
     const [onb] = computePerBandGrids(model)
-    expect(onb.positions.get('ui')!.y).toBe(onb.yOrigin + 160)
+    // UI placeholder sits in the open region, above the command band (n1, s1).
+    const uiY = onb.positions.get('ui')!.y
+    expect(uiY).toBeGreaterThan(onb.yOrigin)
+    expect(uiY).toBeLessThanOrEqual(onb.positions.get('n1')!.y)
   })
 
   it('ungrouped_region_stays_on_top', () => {
@@ -234,10 +238,10 @@ describe('computeFeatureGrid', () => {
     expect(grid.rect.yStart).toBe(0)
     expect(grid.slices.map((s) => s.sliceId)).toEqual(['s1', 's2'])
     expect(grid.lanes.map((l) => l.entityId)).toEqual(['User', 'Acct'])
-    // command at COMMAND_BAND_Y (320), lanes start at LANES_TOP
-    // (HEADER_HEIGHT 40 + TOP_MARGIN 600 = 640).
-    expect(grid.positions.get('n1')!.y).toBe(320)
-    expect(grid.lanes[0].yStart).toBe(640)
+    // command band sits in the open region above the first entity lane.
+    expect(grid.positions.get('n1')!.y).toBeGreaterThan(0)
+    expect(grid.positions.get('n1')!.y).toBeLessThan(grid.lanes[0].yStart)
+    expect(grid.lanes[0].yStart).toBeGreaterThan(0)
   })
 
   it('only includes the requested feature’s members', () => {
@@ -291,10 +295,10 @@ describe('computeFeatureGrid', () => {
     const cmd = grid.positions.get('n1')!
     const q = grid.positions.get('q1')!
     const i = grid.positions.get('i1')!
-    // Same horizontal level (the command band y).
-    expect(cmd.y).toBe(320)
-    expect(q.y).toBe(320)
-    expect(i.y).toBe(320)
+    // Same horizontal level (the command band y) — above the lanes.
+    expect(q.y).toBe(cmd.y)
+    expect(i.y).toBe(cmd.y)
+    expect(cmd.y).toBeLessThan(grid.lanes[0].yStart)
     // Laid out side by side: command → query → integration.
     expect(q.x).toBeGreaterThan(cmd.x)
     expect(i.x).toBeGreaterThan(q.x)

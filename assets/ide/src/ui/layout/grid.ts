@@ -43,7 +43,7 @@ export function computeEntityLaneLayouts(model: EventModel): EntityLaneLayout[] 
       if (!inLane) continue
       const pos = model.layout.nodePositions[node.id]
       if (!pos) continue
-      const { height: nodeHeight } = estimateNodeDimensions(node.name)
+      const { height: nodeHeight } = estimateNodeDimensions(node.name, node.fields)
       const nodeBottom = pos.y + nodeHeight + NODE_BREATHING_ROOM
       if (nodeBottom > maxBottom) maxBottom = nodeBottom
     }
@@ -105,7 +105,7 @@ export function computeSliceLayouts(model: EventModel): SliceLayout[] {
       for (const node of sliceNodes) {
         const pos = model.layout.nodePositions[node.id]
         if (pos) {
-          const { width: nodeWidth } = estimateNodeDimensions(node.name)
+          const { width: nodeWidth } = estimateNodeDimensions(node.name, node.fields)
           minX = Math.min(minX, pos.x)
           maxX = Math.max(maxX, pos.x + nodeWidth + NODE_BREATHING_ROOM)
         }

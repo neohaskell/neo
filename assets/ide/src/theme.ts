@@ -78,6 +78,20 @@ export const cssVariablesResolver: CSSVariablesResolver = (t) => ({
     '--em-integration': t.colors.emIntegration[6],
     '--em-ui': t.colors.emUI[6],
     '--em-feature': t.colors.emFeature[5],
+
+    // ── Record-card node tokens ──────────────────────────────────────────
+    // Each node is a two-zone card: a saturated COLOR HEADER (type name) over a
+    // neutral BODY (field rows). The header hue is the event-modeling identity
+    // color, but DARKENED toward black so white header text clears WCAG AA
+    // (white needs header relative-luminance ≤ 0.183, i.e. ≥ 4.5:1). The mix %
+    // is tuned per hue — green is brightest so it darkens most. The bright
+    // identity color is kept for the thin left rail (--em-* directly), so the
+    // hue still reads at full saturation somewhere on every card.
+    '--node-header-event': `color-mix(in srgb, ${t.colors.emEvent[6]} 78%, black)`,
+    '--node-header-command': `color-mix(in srgb, ${t.colors.emCommand[6]} 78%, black)`,
+    '--node-header-query': `color-mix(in srgb, ${t.colors.emQuery[6]} 66%, black)`,
+    '--node-header-integration': `color-mix(in srgb, ${t.colors.emIntegration[6]} 78%, black)`,
+    '--node-header-text': t.white,
   },
   light: {
     '--em-selection': t.colors.emFeature[6],
@@ -89,6 +103,13 @@ export const cssVariablesResolver: CSSVariablesResolver = (t) => ({
     // Trace highlight (selected node's causal path).
     '--em-trace': t.colors.dark[8],
     '--em-trace-portal': t.colors.emFeature[7],
+    // Node body zone (light scheme): the per-variant faint tint is mixed onto
+    // this base in NodeShell.module.css.
+    '--node-body-base': t.white,
+    '--node-body-text': t.colors.dark[7],
+    '--node-type-text': t.colors.gray[6],
+    '--node-border': t.colors.gray[3],
+    '--node-divider': t.colors.gray[2],
   },
   dark: {
     '--em-selection': t.colors.emFeature[4],
@@ -99,5 +120,12 @@ export const cssVariablesResolver: CSSVariablesResolver = (t) => ({
     '--em-edge-portal': t.colors.emFeature[4],
     '--em-trace': t.colors.gray[2],
     '--em-trace-portal': t.colors.emFeature[4],
+    // Node body zone (dark scheme). Field NAMES use gray[1] (≈15:1 on dark[7]);
+    // field TYPES use dark[1] dimmed (≈6.6:1) — both clear AA.
+    '--node-body-base': t.colors.dark[7],
+    '--node-body-text': t.colors.gray[1],
+    '--node-type-text': t.colors.dark[1],
+    '--node-border': t.colors.dark[4],
+    '--node-divider': t.colors.dark[5],
   },
 })

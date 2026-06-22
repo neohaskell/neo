@@ -44,13 +44,55 @@ const DEMO_MODEL = JSON.stringify({
   ],
   nodes: [
     { id: 'ui1', type: 'uiPlaceholder', name: 'Product Page', sliceId: 's1' },
-    { id: 'cmd1', type: 'command', name: 'AddItemToCart', entityId: 'eCart', sliceId: 's1' },
-    { id: 'ev1', type: 'event', name: 'ItemAdded', entityId: 'eCart', sliceId: 's1' },
-    { id: 'q1', type: 'query', name: 'CartView', sliceId: 's2' },
-    { id: 'cmd2', type: 'command', name: 'Checkout', entityId: 'eOrder', sliceId: 's3' },
-    { id: 'ev2', type: 'event', name: 'OrderPlaced', entityId: 'eOrder', sliceId: 's3' },
-    { id: 'int1', type: 'integration', name: 'Stripe', kind: 'outbound', sliceId: 's3' },
-    { id: 'ev3', type: 'event', name: 'PaymentCaptured', entityId: 'eOrder', sliceId: 's3' },
+    {
+      id: 'cmd1', type: 'command', name: 'AddItemToCart', entityId: 'eCart', sliceId: 's1',
+      fields: [
+        { name: 'productId', type: 'UUID' },
+        { name: 'quantity', type: 'Int' },
+      ],
+    },
+    {
+      id: 'ev1', type: 'event', name: 'ItemAdded', entityId: 'eCart', sliceId: 's1',
+      fields: [
+        { name: 'productId', type: 'UUID' },
+        { name: 'quantity', type: 'Int' },
+        { name: 'addedAt', type: 'Timestamp' },
+      ],
+    },
+    {
+      id: 'q1', type: 'query', name: 'CartView', sliceId: 's2',
+      fields: [
+        { name: 'items', type: '[CartLine]' },
+        { name: 'subtotal', type: 'Money' },
+      ],
+    },
+    {
+      id: 'cmd2', type: 'command', name: 'Checkout', entityId: 'eOrder', sliceId: 's3',
+      fields: [
+        { name: 'cartId', type: 'UUID' },
+        { name: 'paymentMethod', type: 'PaymentMethod' },
+      ],
+    },
+    {
+      id: 'ev2', type: 'event', name: 'OrderPlaced', entityId: 'eOrder', sliceId: 's3',
+      fields: [
+        { name: 'orderId', type: 'UUID' },
+        { name: 'total', type: 'Money' },
+        { name: 'placedAt', type: 'Timestamp' },
+      ],
+    },
+    {
+      id: 'int1', type: 'integration', name: 'Stripe', kind: 'outbound', sliceId: 's3',
+      fields: [{ name: 'apiKey', type: 'Secret' }],
+    },
+    {
+      id: 'ev3', type: 'event', name: 'PaymentCaptured', entityId: 'eOrder', sliceId: 's3',
+      fields: [
+        { name: 'orderId', type: 'UUID' },
+        { name: 'amount', type: 'Money' },
+        { name: 'capturedAt', type: 'Timestamp' },
+      ],
+    },
   ],
   edges: [
     { id: 'e1', type: 'commandProducesEvent', sourceId: 'cmd1', targetId: 'ev1' },
@@ -66,6 +108,10 @@ const model = process.env.NEO_SHOT_MODEL
   : DEMO_MODEL
 const out = process.env.NEO_SHOT_OUT ?? 'e2e-out/critique-main.png'
 const fullPage = process.env.NEO_SHOT_FULL === '1'
+// NEO_SHOT_ZOOMOUT: number of zoom-out clicks before the shot. Lets a critique
+// capture the zoomed-out "flow" level-of-detail (nodes collapse to header-only
+// below COLLAPSE_THRESHOLD). 0 = default fit-to-view (full record cards).
+const zoomOutClicks = Number(process.env.NEO_SHOT_ZOOMOUT ?? '0')
 
 async function seed(page: Page, value: string) {
   await page.addInitScript(
@@ -78,5 +124,10 @@ test('capture main screen', async ({ page }) => {
   await seed(page, model)
   await page.goto('/')
   await page.waitForTimeout(1500)
+  for (let i = 0; i < zoomOutClicks; i++) {
+    await page.locator('.react-flow__controls-zoomout').click()
+    await page.waitForTimeout(200)
+  }
+  if (zoomOutClicks > 0) await page.waitForTimeout(400)
   await page.screenshot({ path: out, fullPage })
 })

@@ -18,25 +18,32 @@ import type { NodePositionAdjustment, SliceLayout, EntityLaneLayout } from './gr
 //
 // Constants must stay in lockstep with grid.ts / autoLayout.ts (the same
 // re-declare-with-a-lockstep-comment pattern autoLayout.ts uses).
-const LANE_HEIGHT = 200
+//
+// The vertical scaffold (UI row → command band → entity lanes) is DERIVED from
+// the actual record-card heights per feature (see layoutFeature), so cards are
+// never lost in fixed oceans of empty space. Only the fixed anchors below
+// remain constants.
 const HEADER_HEIGHT = 40
-// Generous open room above the entity lanes: the slice header, the UI
-// placeholders, and the command/query/integration band all live here, with
-// plenty of breathing space before the event lanes begin.
-const TOP_MARGIN = 600
 const SLICE_PADDING = 40
 const MIN_COLUMN_WIDTH = 200
-const STACK_DY = 80
+/** Vertical gap between the open-region rows (header → UI → command → lanes). */
+const ROW_GAP = 36
+/** Gap between two record cards stacked in the same lane column. */
+const STACK_GAP = 24
 /** Band-local y of the slice header bar (top of the slice columns). */
 const SLICE_HEADER_TOP = 80
-/** UI placeholders row — in the open band region, just below the slice header. */
-const UI_Y = 160
-/** Commands / queries / integrations band — below the UI row. */
-const COMMAND_BAND_Y = 320
-/** First entity lane, band-local. */
-const LANES_TOP = HEADER_HEIGHT + TOP_MARGIN // 640
-/** An event's offset inside its entity lane. */
+/** Top of the open region (UI row), just below the slice header bar. */
+const OPEN_TOP = SLICE_HEADER_TOP + HEADER_HEIGHT + ROW_GAP
+/** An event's offset from its lane's top edge (clears the lane label). */
 const EVENT_LANE_INSET = 60
+/** Bottom padding below the deepest card in a lane. */
+const LANE_BOTTOM_PAD = 24
+/** Floor height for a lane that has events. */
+const MIN_LANE_HEIGHT = 130
+/** Collapsed height for an empty lane (an unused/orphan aggregate). */
+const EMPTY_LANE_HEIGHT = 96
+/** Fallback lane-top for bands with no lanes (rare). */
+const FALLBACK_LANES_TOP = 200
 
 // Band rectangle padding + vertical spacing between bands.
 const BAND_VGAP = 220
@@ -91,7 +98,7 @@ function ungroupedBottom(
     const pos = model.layout.nodePositions[node.id]
     if (!pos) continue
     found = true
-    const { height } = estimateNodeDimensions(node.name)
+    const { height } = estimateNodeDimensions(node.name, node.fields)
     maxBottom = Math.max(maxBottom, pos.y + height)
   }
   return found ? maxBottom : null
@@ -153,10 +160,12 @@ function layoutFeature(
     let cursor = 0
     for (const n of arr) {
       cmdXOffset.set(n.id, cursor)
-      cursor += estimateNodeDimensions(n.name).width + COMMAND_GAP
+      cursor += estimateNodeDimensions(n.name, n.fields).width + COMMAND_GAP
     }
     cmdSpread.set(sid, Math.max(0, cursor - COMMAND_GAP)) // drop the trailing gap
   }
+
+  const heightOf = (n: ModelNode) => estimateNodeDimensions(n.name, n.fields).height
 
   const sliceLayouts: SliceLayout[] = []
   const sliceX = new Map<string, number>()
@@ -166,7 +175,10 @@ function layoutFeature(
     let singleMax = MIN_COLUMN_WIDTH
     for (const n of members) {
       if (n.sliceId !== slice.id || COMMAND_BAND_TYPES.has(n.type)) continue
-      singleMax = Math.max(singleMax, estimateNodeDimensions(n.name).width + SLICE_PADDING * 2)
+      singleMax = Math.max(
+        singleMax,
+        estimateNodeDimensions(n.name, n.fields).width + SLICE_PADDING * 2,
+      )
     }
     const spread = cmdSpread.get(slice.id) ?? 0
     const cmdWidth = spread > 0 ? spread + SLICE_PADDING * 2 : 0
@@ -188,62 +200,86 @@ function layoutFeature(
     .filter((e) => featureEventEntities.has(e.id) || !referencedGlobal.has(e.id))
     .sort((a, b) => a.order - b.order)
 
-  // Deterministic lane height: max events of this entity in any one slice
-  // column drives the stack depth — derived from counts, never positions.
+  // Vertical scaffold DERIVED from the tallest card in each open-region row, so
+  // the band is as tall as its content needs and no taller. UI placeholders sit
+  // in the top row; the command/query/integration band sits below them; entity
+  // lanes begin below the command band.
+  const maxUiH = members
+    .filter((n) => n.type === 'uiPlaceholder')
+    .reduce((m, n) => Math.max(m, heightOf(n)), 0)
+  const maxCmdH = members
+    .filter((n) => COMMAND_BAND_TYPES.has(n.type))
+    .reduce((m, n) => Math.max(m, heightOf(n)), 0)
+  const uiY = OPEN_TOP
+  const commandBandY = OPEN_TOP + (maxUiH > 0 ? maxUiH + ROW_GAP : 0)
+  const lanesTop = commandBandY + (maxCmdH > 0 ? maxCmdH + ROW_GAP : 0) + ROW_GAP
+
+  // Deterministic lane height: the deepest slice column's stacked event cards
+  // (summed REAL heights + gaps) drive it. An empty lane collapses to a thin
+  // rail so an unused aggregate reads as intentionally empty, not as a void.
   const laneHeight = new Map<string, number>()
   for (const entity of bandEntities) {
     const perColumn = new Map<string, number>()
     for (const n of members) {
       if (n.type !== 'event' || n.entityId !== entity.id || n.sliceId === null) continue
-      perColumn.set(n.sliceId, (perColumn.get(n.sliceId) ?? 0) + 1)
+      perColumn.set(n.sliceId, (perColumn.get(n.sliceId) ?? 0) + heightOf(n) + STACK_GAP)
     }
-    const maxStack = perColumn.size > 0 ? Math.max(...perColumn.values()) : 1
+    if (perColumn.size === 0) {
+      laneHeight.set(entity.id, EMPTY_LANE_HEIGHT)
+      continue
+    }
+    const deepest = Math.max(...perColumn.values()) - STACK_GAP // drop trailing gap
     laneHeight.set(
       entity.id,
-      Math.max(LANE_HEIGHT, (maxStack - 1) * STACK_DY + EVENT_LANE_INSET + SLICE_PADDING),
+      Math.max(MIN_LANE_HEIGHT, EVENT_LANE_INSET + deepest + LANE_BOTTOM_PAD),
     )
   }
 
   const laneLayouts: EntityLaneLayout[] = []
   const laneLocalY = new Map<string, number>()
-  let laneCursor = LANES_TOP
+  let laneCursor = lanesTop
   for (const entity of bandEntities) {
-    const h = laneHeight.get(entity.id) ?? LANE_HEIGHT
+    const h = laneHeight.get(entity.id) ?? MIN_LANE_HEIGHT
     laneLayouts.push({ entityId: entity.id, yStart: yOrigin + laneCursor, height: h })
     laneLocalY.set(entity.id, laneCursor)
     laneCursor += h
   }
 
-  // Place nodes. Siblings sharing a bucket stack by STACK_DY.
+  // Place nodes. Process in a STABLE order (name, id) so stacked siblings get a
+  // deterministic vertical order regardless of model.nodes ordering. Siblings
+  // sharing a bucket stack by their REAL heights (a running cursor), so a tall
+  // card never overlaps the one below it.
   const positions = new Map<string, { x: number; y: number }>()
-  const stack = new Map<string, number>()
-  const rankOf = (bucket: string): number => {
-    const r = stack.get(bucket) ?? 0
-    stack.set(bucket, r + 1)
-    return r
-  }
-  for (const node of members) {
+  const stackCursor = new Map<string, number>()
+  const ordered = [...members].sort(
+    (a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id),
+  )
+  for (const node of ordered) {
     const colX = node.sliceId !== null ? sliceX.get(node.sliceId) ?? 0 : 0
     let x = colX + SLICE_PADDING
     let localY: number
     if (node.type === 'event') {
       const lane = node.entityId !== null ? laneLocalY.get(node.entityId) : undefined
-      const base = (lane ?? LANES_TOP) + EVENT_LANE_INSET
-      localY = base + rankOf(`${node.sliceId}|event|${node.entityId}`) * STACK_DY
+      const base = (lane ?? lanesTop) + EVENT_LANE_INSET
+      const bucket = `${node.sliceId}|event|${node.entityId}`
+      localY = stackCursor.get(bucket) ?? base
+      stackCursor.set(bucket, localY + heightOf(node) + STACK_GAP)
     } else if (node.type === 'uiPlaceholder') {
-      localY = UI_Y + rankOf(`${node.sliceId}|ui`) * STACK_DY
+      const bucket = `${node.sliceId}|ui`
+      localY = stackCursor.get(bucket) ?? uiY
+      stackCursor.set(bucket, localY + heightOf(node) + STACK_GAP)
     } else if (COMMAND_BAND_TYPES.has(node.type)) {
       // Command / query / integration: one shared level, side by side (the
       // column was widened above to fit them).
-      localY = COMMAND_BAND_Y
+      localY = commandBandY
       x = colX + SLICE_PADDING + (cmdXOffset.get(node.id) ?? 0)
     } else {
-      localY = COMMAND_BAND_Y
+      localY = commandBandY
     }
     positions.set(node.id, { x, y: yOrigin + localY })
   }
 
-  const bandHeight = LANES_TOP + (laneCursor - LANES_TOP) + BAND_PAD
+  const bandHeight = laneCursor + BAND_PAD
 
   return {
     submodelId,
@@ -498,7 +534,7 @@ export function buildPerBandGridNodes(grids: BandGrid[], opts: BandNodeOptions):
     if (opts.onAddEntity) {
       const lastBottom = band.lanes.reduce(
         (m, l) => Math.max(m, l.yStart + l.height),
-        band.yOrigin + LANES_TOP,
+        band.yOrigin + FALLBACK_LANES_TOP,
       )
       nodes.push({
         id: `__add-entity-${band.submodelId}`,

@@ -929,6 +929,10 @@ export function Canvas({
         deleteKeyCode="Backspace"
         zoomOnDoubleClick={false}
         fitView
+        // Allow zooming further out than React Flow's 0.5 default so a large
+        // model fits on screen and nodes reach the header-only "flow" LOD
+        // (collapse below COLLAPSE_THRESHOLD in semanticZoom.ts).
+        minZoom={0.2}
         fitViewOptions={{ nodes: nodes.filter((n) => !BACKGROUND_NODE_TYPES.has(n.type ?? '')) }}
       >
         <Background />
