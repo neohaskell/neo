@@ -148,7 +148,7 @@ describe('App — base render', () => {
     render(<App />)
     // The shell chrome: header actions + the activity rail + canvas. Node
     // creation is gesture/palette-driven now (no toolbar buttons).
-    expect(screen.getByRole('button', { name: /new/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^new$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /heal with ai/i })).toBeInTheDocument()
     expect(screen.getByTestId('activity-rail')).toBeInTheDocument()
     expect(screen.getByTestId('canvas')).toBeInTheDocument()
@@ -170,7 +170,7 @@ describe('App — base render', () => {
 
   it('shows file/model actions in the header', () => {
     render(<App />)
-    expect(screen.getByRole('button', { name: /new/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^new$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /open/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /tidy by flow/i })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument()

@@ -85,6 +85,9 @@ interface CanvasProps {
   /** Structural adds from the pane menu (no position). */
   onAddEntity?: () => void
   onAddSlice?: () => void
+  /** Feature-aware add-slice for the canvas "+" — attaches to a chapter so the
+   *  new slice appears inside the active feature. */
+  onAddSliceToChapter?: (chapterId: string | null) => void
   onAddChapter?: () => void
   flashingSliceId?: string | null
   flashingEntityId?: string | null
@@ -99,10 +102,13 @@ interface CanvasProps {
  *  are deliberately NOT excluded: they sit at the top of the diagram and must
  *  be framed (otherwise the viewport scrolls past them and chapters look
  *  missing). */
+// Excluded from fit-to-view so the viewport frames real content. The submodel
+// band is deliberately NOT excluded: in feature ("page") mode it is the frame
+// that bounds the whole feature, and framing it keeps the entity-label gutter
+// on-screen (otherwise the lanes' left labels are clipped off the left edge).
 const BACKGROUND_NODE_TYPES = new Set([
   'entityLane',
   'sliceColumn',
-  'submodelBand',
 ])
 
 function getSliceAtX(layouts: SliceLayout[], x: number): string | null {
@@ -256,6 +262,7 @@ export function Canvas({
   onNodeFieldsChange,
   onAddEntity,
   onAddSlice,
+  onAddSliceToChapter,
   onAddChapter,
   flashingSliceId,
   flashingEntityId,
@@ -463,6 +470,21 @@ export function Canvas({
   // Background nodes for the single active feature: its slice columns + its
   // (compact) entity lanes + a titled band rectangle. The Ungrouped feature
   // gets no rename/delete affordances (it isn't a real submodel).
+  // Canvas "+ slice": attach the new slice to the active feature's last chapter
+  // so it lands as a column inside the feature (not ungrouped/invisible). Falls
+  // back to the plain add when no chapter-aware handler is wired.
+  const handleAddSliceToFeature = useCallback(() => {
+    if (onAddSliceToChapter) {
+      const fid = activeFeatureRef.current
+      const chapters = model.chapters
+        .filter((c) => (fid === UNGROUPED_FEATURE ? !c.submodelId : c.submodelId === fid))
+        .sort((a, b) => a.order - b.order)
+      onAddSliceToChapter(chapters.length ? chapters[chapters.length - 1].id : null)
+    } else {
+      onAddSlice?.()
+    }
+  }, [model.chapters, onAddSliceToChapter, onAddSlice])
+
   const featureBackgroundNodes = useMemo(() => {
     if (!featureMode || !featureGrid) return [] as Node[]
     return buildPerBandGridNodes([featureGrid], {
@@ -479,11 +501,14 @@ export function Canvas({
       onEntitySelect: handleEntitySelect,
       onSubmodelRename: featureFid ? onSubmodelRename : undefined,
       onSubmodelDelete: featureFid ? onSubmodelDelete : undefined,
+      onAddSlice: handleAddSliceToFeature,
+      onAddEntity,
     })
   }, [
     featureMode, featureGrid, entityNames, sliceNames, activeHighlight, flashingSliceId,
     onSliceRename, handleSliceSelect, highlightedEntityId, flashingEntityId, selectedEntityId,
     onEntityRename, handleEntitySelect, featureFid, onSubmodelRename, onSubmodelDelete,
+    handleAddSliceToFeature, onAddEntity,
   ])
 
   // Chapter arrows for the active feature: a labeled bar spanning each

@@ -100,26 +100,6 @@ export function ChapterArrowNodeComponent({ data }: Props) {
               data.label
             )}
           </span>
-          {data.submodels && data.submodels.length > 0 && data.onAssignSubmodel && (
-            <select
-              className={`${classes.select} nodrag`}
-              value={data.currentSubmodelId ?? ''}
-              onClick={(e) => e.stopPropagation()}
-              onMouseDown={(e) => e.stopPropagation()}
-              onChange={(e) => {
-                e.stopPropagation()
-                data.onAssignSubmodel?.(e.target.value === '' ? null : e.target.value)
-              }}
-              title="Group this chapter under a submodel"
-            >
-              <option value="">— no submodel —</option>
-              {data.submodels.map((sm) => (
-                <option key={sm.id} value={sm.id}>
-                  {sm.name}
-                </option>
-              ))}
-            </select>
-          )}
         </div>
       </div>
     </div>

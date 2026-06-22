@@ -20,22 +20,38 @@ import type { NodePositionAdjustment, SliceLayout, EntityLaneLayout } from './gr
 // re-declare-with-a-lockstep-comment pattern autoLayout.ts uses).
 const LANE_HEIGHT = 200
 const HEADER_HEIGHT = 40
-const TOP_MARGIN = 300
+// Generous open room above the entity lanes: the slice header, the UI
+// placeholders, and the command/query/integration band all live here, with
+// plenty of breathing space before the event lanes begin.
+const TOP_MARGIN = 600
 const SLICE_PADDING = 40
 const MIN_COLUMN_WIDTH = 200
 const STACK_DY = 80
-/** First entity lane, band-local (mirrors grid.ts HEADER_HEIGHT+TOP_MARGIN). */
-const LANES_TOP = HEADER_HEIGHT + TOP_MARGIN // 340
-/** Commands / queries / integrations band, band-local (mirrors autoLayout bandY). */
-const COMMAND_BAND_Y = HEADER_HEIGHT + 80 // 120
-/** UI placeholders sit just under the band label, above the command band. */
-const UI_Y = 40
+/** Band-local y of the slice header bar (top of the slice columns). */
+const SLICE_HEADER_TOP = 80
+/** UI placeholders row — in the open band region, just below the slice header. */
+const UI_Y = 160
+/** Commands / queries / integrations band — below the UI row. */
+const COMMAND_BAND_Y = 320
+/** First entity lane, band-local. */
+const LANES_TOP = HEADER_HEIGHT + TOP_MARGIN // 640
 /** An event's offset inside its entity lane. */
 const EVENT_LANE_INSET = 60
 
-// Band rectangle padding + vertical spacing between bands (mirror submodels.ts).
+// Band rectangle padding + vertical spacing between bands.
 const BAND_VGAP = 220
 const BAND_PAD = 90
+// Horizontal frame padding. The LEFT pad doubles as the entity-label gutter, so
+// it must match the entity-lane label column width (EntityLaneNode .labelCol =
+// 100px). The slice columns start at band-local x=0, i.e. just right of the
+// gutter, and the frame closes with a slim right pad. Keeping these explicit
+// (instead of one symmetric BAND_PAD) is what keeps lanes + columns from
+// poking outside the frame.
+const LANE_LABEL_GUTTER = 100
+// Right pad is wide enough to host the "add slice" (+) button inside the frame.
+const FRAME_RIGHT_PAD = 64
+/** Diameter of the canvas add (+) buttons (mirrors AddButtonNode.module.css). */
+const ADD_BTN = 34
 
 const COMMAND_BAND_TYPES = new Set(['command', 'query', 'integration'])
 /** Horizontal gap between command-band nodes sharing a slice's top level. */
@@ -104,6 +120,7 @@ function layoutFeature(
   yOrigin: number,
   submodelId: string,
   name: string,
+  referencedGlobal: Set<string>,
 ): BandGrid {
   // Columns: this feature's slices (sorted by slice.order), laid contiguously
   // from band-local x = 0. Column width fits the widest node in the slice.
@@ -160,13 +177,15 @@ function layoutFeature(
   }
   const bandWidth = Math.max(xCursor, MIN_COLUMN_WIDTH)
 
-  // Rows: entities owning >=1 EVENT in this feature, sorted by entity.order.
-  // (Commands/queries/integrations sit in the top band, not in lanes.)
-  const bandEntities = [...new Set(
+  // Rows: entities owning >=1 EVENT in this feature, PLUS "orphan" entities that
+  // have no events anywhere yet — so a freshly added entity shows as an empty
+  // lane you can drop events into. Entities used only by OTHER features stay
+  // hidden (keeps each feature compact). Sorted by entity.order.
+  const featureEventEntities = new Set(
     members.map(eventEntityId).filter((e): e is string => e !== null),
-  )]
-    .map((id) => entityById.get(id))
-    .filter((e): e is Entity => e !== undefined)
+  )
+  const bandEntities = [...entityById.values()]
+    .filter((e) => featureEventEntities.has(e.id) || !referencedGlobal.has(e.id))
     .sort((a, b) => a.order - b.order)
 
   // Deterministic lane height: max events of this entity in any one slice
@@ -234,18 +253,37 @@ function layoutFeature(
     lanes: laneLayouts,
     positions,
     rect: {
-      xStart: -BAND_PAD,
+      // Left edge sits a label-gutter to the left of the columns; right edge a
+      // slim pad past the last column — so entity lanes (which span the full
+      // rect) and the columns are both fully contained.
+      xStart: -LANE_LABEL_GUTTER,
       yStart: yOrigin,
-      width: bandWidth + BAND_PAD * 2,
+      width: bandWidth + LANE_LABEL_GUTTER + FRAME_RIGHT_PAD,
       height: bandHeight,
     },
   }
+}
+
+/**
+ * Entity ids referenced by ANY node (event or command) anywhere in the model.
+ * An entity NOT in this set is "orphan" — newly created and unused — and gets a
+ * lane in every feature so you can drop events into it. A command-only entity is
+ * referenced, so it stays lane-less (lanes are for events/aggregates).
+ */
+function referencedEntities(model: EventModel): Set<string> {
+  const s = new Set<string>()
+  for (const n of model.nodes) {
+    const eid = (n as { entityId?: string | null }).entityId
+    if (typeof eid === 'string') s.add(eid)
+  }
+  return s
 }
 
 export function computePerBandGrids(model: EventModel): BandGrid[] {
   const nodeSubmodel = buildNodeSubmodelMap(model)
   const sliceById = new Map(model.slices.map((s) => [s.id, s]))
   const entityById = new Map(model.entities.map((e) => [e.id, e]))
+  const referenced = referencedEntities(model)
 
   const membersBySubmodel = new Map<string, ModelNode[]>()
   for (const node of model.nodes) {
@@ -265,7 +303,7 @@ export function computePerBandGrids(model: EventModel): BandGrid[] {
   for (const submodel of orderedSubmodels) {
     const members = membersBySubmodel.get(submodel.id)
     if (!members || members.length === 0) continue
-    const grid = layoutFeature(members, sliceById, entityById, yCursor, submodel.id, submodel.name)
+    const grid = layoutFeature(members, sliceById, entityById, yCursor, submodel.id, submodel.name, referenced)
     grids.push(grid)
     yCursor += grid.rect.height + BAND_VGAP
   }
@@ -290,7 +328,15 @@ export function computeFeatureGrid(model: EventModel, featureId: string | null):
     featureId === null
       ? 'Ungrouped'
       : model.submodels.find((s) => s.id === featureId)?.name ?? 'Feature'
-  return layoutFeature(members, sliceById, entityById, 0, featureId ?? '__ungrouped__', name)
+  return layoutFeature(
+    members,
+    sliceById,
+    entityById,
+    0,
+    featureId ?? '__ungrouped__',
+    name,
+    referencedEntities(model),
+  )
 }
 
 /**
@@ -337,6 +383,9 @@ export interface BandNodeOptions {
   onEntitySelect?: (entityId: string) => void
   onSubmodelRename?: (submodelId: string, name: string) => void
   onSubmodelDelete?: (submodelId: string) => void
+  /** Canvas "+" buttons: add a slice (right of the columns) / entity (below the lanes). */
+  onAddSlice?: () => void
+  onAddEntity?: () => void
 }
 
 /**
@@ -359,9 +408,6 @@ export function buildPerBandGridNodes(grids: BandGrid[], opts: BandNodeOptions):
         onRename: opts.onSubmodelRename
           ? (name: string) => opts.onSubmodelRename!(band.submodelId, name)
           : undefined,
-        onDelete: opts.onSubmodelDelete
-          ? () => opts.onSubmodelDelete!(band.submodelId)
-          : undefined,
       },
       draggable: false,
       selectable: false,
@@ -374,7 +420,7 @@ export function buildPerBandGridNodes(grids: BandGrid[], opts: BandNodeOptions):
       },
     })
 
-    const columnTop = band.yOrigin + COMMAND_BAND_Y - HEADER_HEIGHT
+    const columnTop = band.yOrigin + SLICE_HEADER_TOP
     const columnHeight = band.rect.yStart + band.rect.height - columnTop
     for (const col of band.slices) {
       nodes.push({
@@ -408,7 +454,9 @@ export function buildPerBandGridNodes(grids: BandGrid[], opts: BandNodeOptions):
       nodes.push({
         id: `__band-lane-${band.submodelId}-${lane.entityId}`,
         type: 'entityLane',
-        position: { x: -100, y: lane.yStart },
+        // Span the band rectangle EXACTLY (left gutter through right pad) so the
+        // swim lane is contained by the frame, never poking out the sides.
+        position: { x: band.rect.xStart, y: lane.yStart },
         data: {
           label: opts.entityName.get(lane.entityId) ?? '',
           entityId: lane.entityId,
@@ -423,11 +471,44 @@ export function buildPerBandGridNodes(grids: BandGrid[], opts: BandNodeOptions):
         selectable: false,
         focusable: false,
         style: {
-          width: band.rect.width + 100,
+          width: band.rect.width,
           height: lane.height,
           zIndex: -2,
           pointerEvents: 'all' as const,
         },
+      })
+    }
+
+    // "+" to add a slice — just right of the last column, on the header row.
+    if (opts.onAddSlice) {
+      const lastRight = band.slices.reduce((m, s) => Math.max(m, s.xStart + s.width), 0)
+      nodes.push({
+        id: `__add-slice-${band.submodelId}`,
+        type: 'addButton',
+        position: { x: lastRight + 14, y: columnTop + (HEADER_HEIGHT - ADD_BTN) / 2 },
+        data: { label: 'Add slice', onClick: opts.onAddSlice, testId: 'add-slice-button' },
+        draggable: false,
+        selectable: false,
+        focusable: false,
+        style: { width: ADD_BTN, height: ADD_BTN, zIndex: 2, pointerEvents: 'all' as const },
+      })
+    }
+
+    // "+" to add an entity — below the last lane, in the entity-label gutter.
+    if (opts.onAddEntity) {
+      const lastBottom = band.lanes.reduce(
+        (m, l) => Math.max(m, l.yStart + l.height),
+        band.yOrigin + LANES_TOP,
+      )
+      nodes.push({
+        id: `__add-entity-${band.submodelId}`,
+        type: 'addButton',
+        position: { x: band.rect.xStart + (LANE_LABEL_GUTTER - ADD_BTN) / 2, y: lastBottom + 14 },
+        data: { label: 'Add entity', onClick: opts.onAddEntity, testId: 'add-entity-button' },
+        draggable: false,
+        selectable: false,
+        focusable: false,
+        style: { width: ADD_BTN, height: ADD_BTN, zIndex: 2, pointerEvents: 'all' as const },
       })
     }
   }

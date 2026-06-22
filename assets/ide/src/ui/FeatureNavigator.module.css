@@ -27,6 +27,32 @@
   pointer-events: none;
 }
 
+/* "Add new feature" affordance at the top of the list — looks like a feature
+   row but dashed/ghost to denote creation. */
+.addRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 6px;
+  border: 1px dashed var(--mantine-color-default-border);
+  border-radius: var(--mantine-radius-sm);
+  padding: 6px 8px;
+  font-size: 14px;
+  color: var(--mantine-color-dimmed);
+  background: transparent;
+  cursor: pointer;
+}
+.addRow:hover {
+  border-color: var(--em-feature);
+  color: var(--em-feature);
+  background: color-mix(in srgb, var(--em-feature) 8%, transparent);
+}
+.addRow:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* Feature (page) row */
 .featureRow {
   display: flex;

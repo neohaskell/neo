@@ -233,26 +233,26 @@ export function FeatureNavigator({
     <aside className={classes.panel} data-testid="features-panel">
       <div className={classes.header}>
         <Text size="sm" fw={600}>Features</Text>
-        <Button
-          size="compact-xs"
-          variant="light"
-          color="emFeature"
-          leftSection={<IconPlus size={12} />}
+      </div>
+
+      <div className={`${classes.list} ${busy ? classes.busy : ''}`}>
+        <button
+          type="button"
           data-testid="add-feature"
+          className={classes.addRow}
           disabled={busy}
           onClick={onAddFeature}
         >
-          Feature
-        </Button>
-      </div>
+          <IconPlus size={14} />
+          <span>New feature</span>
+        </button>
 
-      {features.length === 0 ? (
-        <Text p="sm" size="sm" c="dimmed">
-          No features yet. Add a feature, or group slices into chapters first.
-        </Text>
-      ) : (
-        <div className={`${classes.list} ${busy ? classes.busy : ''}`}>
-          {features.map((f) => {
+        {features.length === 0 ? (
+          <Text px="xs" py="sm" size="sm" c="dimmed">
+            No features yet — add one, or group slices into chapters first.
+          </Text>
+        ) : (
+          features.map((f) => {
             const isActive = f.id === activeFeatureId
             const featureChapters = chaptersOf(f.id)
             return (
@@ -315,9 +315,9 @@ export function FeatureNavigator({
                 )}
               </div>
             )
-          })}
-        </div>
-      )}
+          })
+        )}
+      </div>
 
       {selected.size > 0 && (
         <div className={classes.selectionBar}>

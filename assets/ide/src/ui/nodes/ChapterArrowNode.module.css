@@ -73,12 +73,3 @@
   white-space: nowrap;
   border-radius: var(--mantine-radius-sm);
 }
-
-.select {
-  background: var(--mantine-color-body);
-  border: 1px solid color-mix(in srgb, var(--em-feature) 40%, transparent);
-  border-radius: var(--mantine-radius-sm);
-  font-size: 10px;
-  color: var(--em-feature);
-  padding: 1px 4px;
-}

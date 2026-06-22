@@ -113,8 +113,8 @@ describe('computePerBandGrids', () => {
     const [onb] = computePerBandGrids(twoSubmodelModel())
     const cmd = onb.positions.get('n1')!
     const evt = onb.positions.get('n2')!
-    // command sits at the band-local command band (yOrigin + 120)
-    expect(cmd.y).toBe(onb.yOrigin + 120)
+    // command sits at the band-local command band (yOrigin + COMMAND_BAND_Y)
+    expect(cmd.y).toBe(onb.yOrigin + 320)
     // event sits inside its entity lane (User lane yStart + 60)
     const userLane = onb.lanes.find((l) => l.entityId === 'User')!
     expect(evt.y).toBe(userLane.yStart + 60)
@@ -127,7 +127,7 @@ describe('computePerBandGrids', () => {
       nodes: [...m.nodes, { id: 'ui', type: 'uiPlaceholder', name: 'Form', sliceId: 's1' }],
     }
     const [onb] = computePerBandGrids(model)
-    expect(onb.positions.get('ui')!.y).toBe(onb.yOrigin + 40)
+    expect(onb.positions.get('ui')!.y).toBe(onb.yOrigin + 160)
   })
 
   it('ungrouped_region_stays_on_top', () => {
@@ -234,9 +234,10 @@ describe('computeFeatureGrid', () => {
     expect(grid.rect.yStart).toBe(0)
     expect(grid.slices.map((s) => s.sliceId)).toEqual(['s1', 's2'])
     expect(grid.lanes.map((l) => l.entityId)).toEqual(['User', 'Acct'])
-    // command at band-local command band (120), lanes start at LANES_TOP (340).
-    expect(grid.positions.get('n1')!.y).toBe(120)
-    expect(grid.lanes[0].yStart).toBe(340)
+    // command at COMMAND_BAND_Y (320), lanes start at LANES_TOP
+    // (HEADER_HEIGHT 40 + TOP_MARGIN 600 = 640).
+    expect(grid.positions.get('n1')!.y).toBe(320)
+    expect(grid.lanes[0].yStart).toBe(640)
   })
 
   it('only includes the requested feature’s members', () => {
@@ -291,9 +292,9 @@ describe('computeFeatureGrid', () => {
     const q = grid.positions.get('q1')!
     const i = grid.positions.get('i1')!
     // Same horizontal level (the command band y).
-    expect(cmd.y).toBe(120)
-    expect(q.y).toBe(120)
-    expect(i.y).toBe(120)
+    expect(cmd.y).toBe(320)
+    expect(q.y).toBe(320)
+    expect(i.y).toBe(320)
     // Laid out side by side: command → query → integration.
     expect(q.x).toBeGreaterThan(cmd.x)
     expect(i.x).toBeGreaterThan(q.x)

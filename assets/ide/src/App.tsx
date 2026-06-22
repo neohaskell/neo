@@ -573,6 +573,17 @@ function App() {
     markDirty()
   }, [markDirty])
 
+  // Feature-aware add: the canvas "+" attaches the new slice to a chapter (the
+  // active feature's last) so it appears as a column inside the feature instead
+  // of landing ungrouped/invisible.
+  const handleAddSliceToChapter = useCallback(
+    (chapterId: string | null) => {
+      dispatch({ type: 'addSlice', name: 'New Slice', chapterId: chapterId ?? undefined })
+      markDirty()
+    },
+    [markDirty],
+  )
+
   const handleRemoveSlice = useCallback(
     (sliceId: string) => {
       const hasNodes = modelRef.current.nodes.some((n) => n.sliceId === sliceId)
@@ -895,7 +906,6 @@ function App() {
             modelActive={lens === 'model'}
           />
           <Flex flex={1} mih={0}>
-            <ActivityRail lens={lens} onChange={setLens} />
             <Box flex={1} mih={0}>
               {lens === 'model' ? (
                 <Flex direction="column" h="100%">
@@ -944,6 +954,7 @@ function App() {
                         onNodeFieldsChange={handleNodeFieldsChange}
                         onAddEntity={handleAddEntity}
                         onAddSlice={handleAddSlice}
+                        onAddSliceToChapter={handleAddSliceToChapter}
                         onAddChapter={handleAddChapter}
                         flashingSliceId={flashingSliceId}
                         flashingEntityId={flashingEntityId}
@@ -962,6 +973,7 @@ function App() {
                 <EmptyLens lens={lens} />
               )}
             </Box>
+            <ActivityRail lens={lens} onChange={setLens} />
           </Flex>
           <StatusBar
             state={conn}
