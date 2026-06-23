@@ -307,3 +307,64 @@ describe('computeFeatureGrid', () => {
     expect(s1.width).toBeGreaterThan(i.x - cmd.x)
   })
 })
+
+// The deterministic grid is the SINGLE source of truth for node positions in
+// feature/page mode: a node's x is always its slice column + padding, so when a
+// slice is pushed (a sibling grows, slices reorder) every node moves WITH its
+// column. This is the regression guard for "slices move but nodes stay put".
+describe('node follows its slice column', () => {
+  // SLICE_PADDING in bandGrid.ts (event/UI nodes sit at colX + this).
+  const SLICE_PADDING = 40
+
+  it('every_node_x_aligns_with_its_slice_column', () => {
+    const grid = computeFeatureGrid(twoSubmodelModel(), 'smOnb')
+    const colX = new Map(grid.slices.map((s) => [s.sliceId, s.xStart]))
+    // n2 (event, s1) and n3 (event, s2) each sit at their column + padding.
+    for (const [id, sliceId] of [['n2', 's1'], ['n3', 's2']] as const) {
+      expect(grid.positions.get(id)!.x).toBe((colX.get(sliceId) ?? 0) + SLICE_PADDING)
+    }
+  })
+
+  it('node_follows_column_when_upstream_slice_grows', () => {
+    const base = twoSubmodelModel()
+    const baseGrid = computeFeatureGrid(base, 'smOnb')
+    const baseS2 = baseGrid.slices.find((s) => s.sliceId === 's2')!.xStart
+    const baseN3 = baseGrid.positions.get('n3')!.x
+    expect(baseN3).toBe(baseS2 + SLICE_PADDING)
+
+    // Grow the node in the UPSTREAM slice s1 (n2) with a long name so its card —
+    // and therefore s1's column — gets wider, pushing s2's column to the right.
+    const grown: EventModel = {
+      ...base,
+      nodes: base.nodes.map((n) =>
+        n.id === 'n2'
+          ? { ...n, name: 'SignedUpWithAnExtremelyLongDescriptiveEventName' }
+          : n,
+      ),
+    }
+    const grownGrid = computeFeatureGrid(grown, 'smOnb')
+    const grownS2 = grownGrid.slices.find((s) => s.sliceId === 's2')!.xStart
+    const grownN3 = grownGrid.positions.get('n3')!.x
+
+    // The upstream slice grew, so s2's column shifted right …
+    expect(grownS2).toBeGreaterThan(baseS2)
+    // … and n3 moved with its column by exactly the same delta (still padded).
+    expect(grownN3).toBe(grownS2 + SLICE_PADDING)
+    expect(grownN3 - baseN3).toBe(grownS2 - baseS2)
+  })
+
+  it('computeFeatureGrid_ignores_legacy_bySubmodel_overrides', () => {
+    const base = twoSubmodelModel()
+    const withOverride: EventModel = {
+      ...base,
+      layout: {
+        ...base.layout,
+        // A stale per-feature override far from the grid spot — must be ignored.
+        bySubmodel: { smOnb: { n3: { x: 99999, y: 99999 } } },
+      },
+    }
+    const plain = computeFeatureGrid(base, 'smOnb').positions.get('n3')
+    const overridden = computeFeatureGrid(withOverride, 'smOnb').positions.get('n3')
+    expect(overridden).toEqual(plain)
+  })
+})

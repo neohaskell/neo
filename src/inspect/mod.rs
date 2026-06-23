@@ -108,6 +108,10 @@ pub struct QueryInfo {
     /// `resolve_feeders`, else the all-local fallback. One `eventFeedsQuery`
     /// edge is drawn per entry.
     pub subscribes_to: Vec<String>,
+    /// Record fields of the query's read-model (`data <Query> = <Query> { … }`),
+    /// in source order. Empty when the parser couldn't extract them.
+    #[serde(default)]
+    pub fields: Vec<RecordField>,
     /// Entity fields the `combine` reads (`entity.<field>`). The read model's
     /// true data dependency on the aggregate. Not serialised — internal to
     /// inspection (no `neo inspect` consumer needs it).

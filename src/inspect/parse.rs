@@ -45,10 +45,21 @@ pub fn events_in_domain(dir: &Path) -> Vec<EventInfo> {
             continue;
         };
         let ctor_fields = extract_event_constructor_fields(&body);
+        let ctor_payloads = extract_event_constructor_payload_modules(&body);
         for name in extract_event_constructors(&body) {
             // Dedup across Core.hs + Event.hs without disturbing source order.
             if !out.iter().any(|e: &EventInfo| e.name == name) {
-                let fields = ctor_fields.get(&name).cloned().unwrap_or_default();
+                let mut fields = ctor_fields.get(&name).cloned().unwrap_or_default();
+                // Payload-module arm (`Ctor Module.Event`) — the real fields live
+                // in `Events/<Module>.hs` as `data Event = Event { … }`.
+                if fields.is_empty() {
+                    if let Some(module) = ctor_payloads.get(&name) {
+                        let payload = dir.join("Events").join(format!("{module}.hs"));
+                        if let Ok(pbody) = std::fs::read_to_string(&payload) {
+                            fields = first_data_record_fields(&pbody);
+                        }
+                    }
+                }
                 out.push(EventInfo {
                     name,
                     file: path.clone(),
@@ -341,10 +352,22 @@ fn parse_query_file(path: &Path, known_events: &[String]) -> Option<QueryInfo> {
     let combine = extract_method_body(&body, "combine").unwrap_or_default();
     let reads_entity_fields = extract_entity_field_reads(&combine);
     let (case_field, noop_values) = extract_combine_noop_values(&combine);
+    // Read-model fields: `data <Query> = <Query> { … }` in the query file (the
+    // type name follows the `deriveQuery ''<Query>` convention == file stem),
+    // falling back to the first data record in the file.
+    let fields = {
+        let named = data_type_record_fields(&body, &name);
+        if named.is_empty() {
+            first_data_record_fields(&body)
+        } else {
+            named
+        }
+    };
     Some(QueryInfo {
         name,
         file: path.to_path_buf(),
         subscribes_to,
+        fields,
         reads_entity_fields,
         case_field,
         noop_values,
@@ -984,6 +1007,47 @@ fn extract_event_constructor_fields(src: &str) -> BTreeMap<String, Vec<RecordFie
     out
 }
 
+/// Map each event-sum constructor to the payload MODULE referenced by its arm
+/// (`CounterCreated CounterCreated.Event` → `CounterCreated → CounterCreated`,
+/// `ProposalPdfUploaded PdfUploaded.Event` → `ProposalPdfUploaded → PdfUploaded`).
+/// Inline-record arms contribute nothing. Lets the field extractor read
+/// `Events/<Module>.hs` for the constructor's real fields.
+fn extract_event_constructor_payload_modules(src: &str) -> BTreeMap<String, String> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static PAYLOAD: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?m)^data\s+([A-Z]\w*Event)\b[^=]*=([\s\S]*?)(?:\n\S|\z)").unwrap()
+    });
+    let payload_re = PAYLOAD.get_or_init(|| Regex::new(r"\b([A-Z]\w*)\.Event\b").unwrap());
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let Some(cap) = re.captures(src) else {
+        return out;
+    };
+    let block = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+    for raw in block.split('|') {
+        let cleaned = raw.trim_start();
+        let cleaned = cleaned.trim_start_matches(|c: char| c == '|' || c.is_whitespace());
+        let ident: String = cleaned
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let Some(first) = ident.chars().next() else {
+            continue;
+        };
+        if !first.is_ascii_uppercase() {
+            continue;
+        }
+        // The arm text AFTER the constructor name — look for its `X.Event` payload.
+        let rest = &cleaned[ident.len()..];
+        if let Some(pc) = payload_re.captures(rest) {
+            if let Some(m) = pc.get(1) {
+                out.entry(ident).or_insert_with(|| m.as_str().to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Record fields of the `data <type_name> = <type_name> { … }` declaration in
 /// `src`. The `=` vs `::` distinction inside `parse_field_decl` means a record
 /// *update* (`X { f = v }`) in a `decide`/`handleEvent` body contributes no
@@ -1612,5 +1676,82 @@ data CartEvent
         assert_eq!(created.fields, vec![rf("entityId", "Uuid"), rf("ownerId", "Text")]);
         let added = events.iter().find(|e| e.name == "ItemAdded").unwrap();
         assert_eq!(added.fields, vec![rf("quantity", "Int")]);
+    }
+
+    #[test]
+    fn extract_event_constructor_payload_modules_maps_ctor_to_module() {
+        let src = "data CounterEvent\n  \
+                     = CounterCreated CounterCreated.Event\n  \
+                     | ProposalPdfUploaded PdfUploaded.Event\n  \
+                     deriving (Generic)\n";
+        let map = extract_event_constructor_payload_modules(src);
+        assert_eq!(map.get("CounterCreated").map(String::as_str), Some("CounterCreated"));
+        assert_eq!(map.get("ProposalPdfUploaded").map(String::as_str), Some("PdfUploaded"));
+    }
+
+    #[test]
+    fn events_in_domain_reads_payload_module_fields() {
+        // The real starter pattern: the sum arm is `Ctor Module.Event` and the
+        // fields live in `Events/<Module>.hs` as `data Event = Event { … }`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Events")).unwrap();
+        std::fs::write(
+            root.join("Event.hs"),
+            "module Starter.Counter.Event (CounterEvent (..)) where\n\
+             data CounterEvent\n  \
+               = CounterCreated CounterCreated.Event\n  \
+               | CounterIncremented CounterIncremented.Event\n  \
+               deriving (Generic, Show)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Events/CounterCreated.hs"),
+            "module Starter.Counter.Events.CounterCreated (Event (..)) where\n\
+             data Event = Event\n  \
+               { entityId :: Uuid\n  \
+               , label :: Text\n  \
+               }\n  \
+               deriving (Generic, Show)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Events/CounterIncremented.hs"),
+            "module Starter.Counter.Events.CounterIncremented (Event (..)) where\n\
+             data Event = Event { entityId :: Uuid, amount :: Int } deriving (Generic)\n",
+        )
+        .unwrap();
+        let events = events_in_domain(root);
+        let created = events.iter().find(|e| e.name == "CounterCreated").expect("CounterCreated event");
+        assert_eq!(created.fields, vec![rf("entityId", "Uuid"), rf("label", "Text")]);
+        let incr = events.iter().find(|e| e.name == "CounterIncremented").expect("CounterIncremented event");
+        assert_eq!(incr.fields, vec![rf("entityId", "Uuid"), rf("amount", "Int")]);
+    }
+
+    #[test]
+    fn queries_in_domain_extracts_read_model_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Queries")).unwrap();
+        std::fs::write(
+            root.join("Queries/CounterView.hs"),
+            "module Starter.Counter.Queries.CounterView (CounterView (..)) where\n\
+             data CounterView = CounterView\n  \
+               { counterId :: Uuid\n  \
+               , label :: Text\n  \
+               , value :: Int\n  \
+               }\n  \
+               deriving (Eq, Show, Generic)\n\n\
+             instance QueryOf CounterEntity CounterView where\n  \
+               combine entity _ = Update CounterView { counterId = entity.counterId }\n",
+        )
+        .unwrap();
+        let queries = queries_in_domain(root, &[]);
+        let q = queries.iter().find(|q| q.name == "CounterView").expect("CounterView query");
+        assert_eq!(
+            q.fields,
+            vec![rf("counterId", "Uuid"), rf("label", "Text"), rf("value", "Int")],
+            "read-model fields must come from the `data CounterView` record, not the combine update",
+        );
     }
 }

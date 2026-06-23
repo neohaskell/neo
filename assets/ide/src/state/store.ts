@@ -29,7 +29,6 @@ import {
   renameSubmodel,
   removeSubmodel,
   assignChapterToSubmodel,
-  setFeatureNodePosition,
 } from '../model/operations'
 import { applyPositionChanges } from '../ui/adapter'
 
@@ -63,7 +62,6 @@ export type Action =
   | { type: 'assignNodeToSlice'; nodeId: string; sliceId: string | null }
   | { type: 'assignNodeToEntity'; nodeId: string; entityId: string | null }
   | { type: 'updatePosition'; nodeId: string; x: number; y: number }
-  | { type: 'setFeatureNodePosition'; featureId: string; nodeId: string; x: number; y: number }
   | { type: 'batchUpdatePositions'; changes: { nodeId: string; x: number; y: number }[] }
   | { type: 'loadModel'; model: EventModel }
 
@@ -141,8 +139,6 @@ export function reducer(model: EventModel, action: Action): EventModel {
       return applyPositionChanges(model, [
         { id: action.nodeId, x: action.x, y: action.y },
       ])
-    case 'setFeatureNodePosition':
-      return setFeatureNodePosition(model, action.featureId, action.nodeId, action.x, action.y)
     case 'batchUpdatePositions':
       return applyPositionChanges(
         model,

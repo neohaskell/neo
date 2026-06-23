@@ -762,20 +762,18 @@ function App() {
     [markDirty],
   )
 
-  // Feature-mode node drop: store a per-feature position override (so the drag
-  // sticks) and (re)assign slice/entity from where it landed.
+  // Feature-mode node drop: (re)assign the node to the slice column / entity
+  // lane it landed on. The deterministic grid (computeFeatureGrid) then owns its
+  // x/y and re-stacks on the next render, so the node snaps into its cell and
+  // always follows its slice — no per-feature position override is written.
   const handleFeatureNodeMove = useCallback(
     (
-      featureId: string,
       nodeId: string,
       sliceId: string | null,
       entityId: string | null | undefined,
-      x: number,
-      y: number,
     ) => {
       if (sliceId !== null) dispatch({ type: 'assignNodeToSlice', nodeId, sliceId })
       if (entityId !== undefined) dispatch({ type: 'assignNodeToEntity', nodeId, entityId })
-      dispatch({ type: 'setFeatureNodePosition', featureId, nodeId, x, y })
       markDirty()
     },
     [markDirty],

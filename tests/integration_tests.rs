@@ -907,6 +907,11 @@ fn write_sync_fixture(root: &std::path::Path) {
          data AddItem = AddItem { stockId :: Uuid }\n\
          decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
     );
+    write(
+        "src/App/Cart/Queries/CartView.hs",
+        "module App.Cart.Queries.CartView (CartView (..)) where\n\
+         data CartView = CartView { cartId :: Uuid, itemCount :: Int } deriving (Generic)\n",
+    );
     let model = serde_json::json!({
         "id": "m", "name": "demo", "chapters": [], "entities": [], "slices": [],
         "nodes": [], "edges": [],
@@ -943,6 +948,56 @@ fn inspect_sync_updates_fields_from_source() {
     let cmd = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "AddItem").expect("command materialised");
     let cmd_names: Vec<&str> = cmd["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
     assert_eq!(cmd_names, vec!["stockId"], "command node fields synced from source");
+    // Query read-model fields sync too (the originally-missing case).
+    let q = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "CartView").expect("query materialised");
+    let q_names: Vec<&str> = q["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(q_names, vec!["cartId", "itemCount"], "query node fields synced from source");
+}
+
+#[test]
+fn inspect_sync_payload_module_event_fields() {
+    // The real starter event shape: a sum arm `Ctor Module.Event` whose fields
+    // live in `Events/<Module>.hs`. This was the originally-missing case —
+    // events showed no fields. Drive it through the shipped CLI path.
+    let temp = tempfile::tempdir().unwrap();
+    let write = |rel: &str, body: &str| {
+        let p = temp.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(
+        "src/App/Counter/Event.hs",
+        "module App.Counter.Event (CounterEvent (..)) where\n\
+         data CounterEvent = CounterCreated CounterCreated.Event deriving (Generic, Show)\n",
+    );
+    write(
+        "src/App/Counter/Events/CounterCreated.hs",
+        "module App.Counter.Events.CounterCreated (Event (..)) where\n\
+         data Event = Event { entityId :: Uuid, label :: Text } deriving (Generic, Show)\n",
+    );
+    // A command so the domain has a Commands/ dir and the event is reachable.
+    write(
+        "src/App/Counter/Commands/CreateCounter.hs",
+        "module App.Counter.Commands.CreateCounter where\n\
+         data CreateCounter = CreateCounter { label :: Text }\n\
+         decide _ _ _ = Decider.acceptExisting [CounterCreated {}]\n",
+    );
+    write(
+        "event-model.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "id": "m", "name": "demo", "chapters": [], "entities": [], "slices": [],
+            "nodes": [], "edges": [],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        }))
+        .unwrap(),
+    );
+
+    neo_cmd().args(["inspect", "sync"]).current_dir(temp.path()).assert().success();
+
+    let model = read_event_model(temp.path());
+    let ev = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "CounterCreated").expect("event node");
+    let names: Vec<&str> = ev["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["entityId", "label"], "payload-module event fields synced from Events/<Module>.hs");
 }
 
 #[test]

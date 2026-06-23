@@ -47,11 +47,26 @@ describe('createNode', () => {
     expect(created.sliceId).toBe('s1')
   })
 
-  it('stores a per-feature position override in feature mode', () => {
-    const { model, nodeId } = createNode(emptyModel(), 'query', { x: 5, y: 6, featureId: 'smA' })
-    expect(model.layout.bySubmodel?.smA?.[nodeId]).toEqual({ x: 5, y: 6 })
-    // The global position is NOT set in feature mode.
-    expect(model.layout.nodePositions[nodeId]).toBeUndefined()
+  it('feature_create_assigns_slice_entity_without_override', () => {
+    const base: EventModel = {
+      ...emptyModel(),
+      slices: [{ id: 's1', name: 'S', chapterId: null, order: 0 }],
+      entities: [{ id: 'e1', name: 'E', order: 0 }],
+    }
+    const { model, nodeId } = createNode(base, 'event', {
+      x: 5,
+      y: 6,
+      sliceId: 's1',
+      entityId: 'e1',
+    })
+    const created = model.nodes.find((n) => n.id === nodeId)!
+    // The drop slice/entity are assigned …
+    expect(created.sliceId).toBe('s1')
+    expect(created.entityId).toBe('e1')
+    // … and the grid owns layout: NO per-feature override is written, but a
+    // global seed position is still recorded for the flat fallback / reflow.
+    expect(model.layout.bySubmodel).toBeUndefined()
+    expect(model.layout.nodePositions[nodeId]).toEqual({ x: 5, y: 6 })
   })
 })
 

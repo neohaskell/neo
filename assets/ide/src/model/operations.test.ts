@@ -16,7 +16,6 @@ import {
   removeChapter,
   reorderChapters,
   moveSliceToChapter,
-  setFeatureNodePosition,
   addSlice,
   removeSlice,
   reorderEventsInEntity,
@@ -687,40 +686,6 @@ describe('moveSliceToChapter', () => {
     expect(next.slices.map((s) => s.id)).toEqual(['s3', 's1', 's2'])
     expect(next.slices.map((s) => s.order)).toEqual([0, 1, 2])
     expect(next.slices.find((s) => s.id === 's3')?.chapterId).toBe('c1')
-  })
-})
-
-// ── setFeatureNodePosition ──────────────────────────────────
-
-describe('setFeatureNodePosition', () => {
-  it('writes a per-feature position override under layout.bySubmodel', () => {
-    const next = setFeatureNodePosition(createEventModel('T'), 'smA', 'n1', 12, 34)
-    expect(next.layout.bySubmodel).toEqual({ smA: { n1: { x: 12, y: 34 } } })
-  })
-
-  it('merges into existing feature + node overrides without clobbering', () => {
-    let m = createEventModel('T')
-    m = setFeatureNodePosition(m, 'smA', 'n1', 1, 1)
-    m = setFeatureNodePosition(m, 'smA', 'n2', 2, 2)
-    m = setFeatureNodePosition(m, 'smB', 'n3', 3, 3)
-    expect(m.layout.bySubmodel).toEqual({
-      smA: { n1: { x: 1, y: 1 }, n2: { x: 2, y: 2 } },
-      smB: { n3: { x: 3, y: 3 } },
-    })
-  })
-
-  it('overwrites the same node’s override', () => {
-    let m = createEventModel('T')
-    m = setFeatureNodePosition(m, 'smA', 'n1', 1, 1)
-    m = setFeatureNodePosition(m, 'smA', 'n1', 9, 9)
-    expect(m.layout.bySubmodel?.smA.n1).toEqual({ x: 9, y: 9 })
-  })
-
-  it('is immutable', () => {
-    const m = setFeatureNodePosition(createEventModel('T'), 'smA', 'n1', 1, 1)
-    const before = JSON.stringify(m)
-    setFeatureNodePosition(m, 'smA', 'n2', 2, 2)
-    expect(JSON.stringify(m)).toBe(before)
   })
 })
 

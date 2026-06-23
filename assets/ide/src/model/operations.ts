@@ -493,27 +493,6 @@ export function assignChapterToSubmodel(
   }
 }
 
-// ── Per-feature node position overrides ─────────────────────
-
-/**
- * Record a node's manually-dragged position WITHIN a feature (page), in that
- * feature's own origin-based coordinate space. The "Features as pages" canvas
- * prefers this over the deterministic grid position, so a drag sticks instead
- * of snapping back. Stored under `layout.bySubmodel[featureId][nodeId]`
- * (featureId = submodel id or the `__ungrouped__` sentinel). Immutable.
- */
-export function setFeatureNodePosition(
-  model: EventModel,
-  featureId: string,
-  nodeId: string,
-  x: number,
-  y: number,
-): EventModel {
-  const bySubmodel = { ...(model.layout.bySubmodel ?? {}) }
-  bySubmodel[featureId] = { ...(bySubmodel[featureId] ?? {}), [nodeId]: { x, y } }
-  return { ...model, layout: { ...model.layout, bySubmodel } }
-}
-
 // ── Slices ──────────────────────────────────────────────────
 
 export function addSlice(

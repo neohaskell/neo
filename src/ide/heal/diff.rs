@@ -722,6 +722,11 @@ fn reconcile_node_fields(model: &Value, inspection: &ProjectInspection, diff: &m
                 source.insert(("event", e.name.as_str()), &e.fields);
             }
         }
+        for q in &domain.queries {
+            if !q.fields.is_empty() {
+                source.insert(("query", q.name.as_str()), &q.fields);
+            }
+        }
     }
     if source.is_empty() {
         return;

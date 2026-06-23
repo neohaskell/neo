@@ -32,8 +32,6 @@ export interface CreatePlacement {
   y: number
   sliceId?: string | null
   entityId?: string | null
-  /** When set, position is stored as a per-feature override (feature/page mode). */
-  featureId?: string | null
 }
 
 function placeNode(
@@ -49,17 +47,11 @@ function placeNode(
   if (place.entityId != null && type === 'event') {
     next = reducer(next, { type: 'assignNodeToEntity', nodeId, entityId: place.entityId })
   }
-  if (place.featureId != null) {
-    next = reducer(next, {
-      type: 'setFeatureNodePosition',
-      featureId: place.featureId,
-      nodeId,
-      x: place.x,
-      y: place.y,
-    })
-  } else {
-    next = reducer(next, { type: 'updatePosition', nodeId, x: place.x, y: place.y })
-  }
+  // Seed a global position so the flat-timeline fallback / band reflow have a
+  // sensible starting point. In feature/page mode the deterministic grid owns
+  // x/y from the node's slice+entity, so this value is ignored on screen — no
+  // per-feature override is written (the grid is the single source of truth).
+  next = reducer(next, { type: 'updatePosition', nodeId, x: place.x, y: place.y })
   return next
 }
 

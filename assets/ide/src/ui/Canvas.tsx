@@ -58,16 +58,15 @@ interface CanvasProps {
   onSliceRename?: (sliceId: string, name: string) => void
   onAssignNodeToSlice?: (nodeId: string, sliceId: string | null, x: number, y: number) => void
   onAssignNodeToEntity?: (nodeId: string, entityId: string | null) => void
-  /** Feature-mode drop: persist a per-feature position override (so the drag
-   *  sticks instead of snapping to the grid) and (re)assign slice/entity.
-   *  `entityId === undefined` means the node is not an event. */
+  /** Feature-mode drop: (re)assign the node to the slice column / entity lane it
+   *  was dropped on. The deterministic grid then owns its x/y (it snaps into the
+   *  cell), so a node always follows its slice when a slice is pushed/resized.
+   *  `entityId === undefined` means leave the node's entity untouched (it isn't
+   *  an event, or it was dropped off any lane). */
   onFeatureNodeMove?: (
-    featureId: string,
     nodeId: string,
     sliceId: string | null,
     entityId: string | null | undefined,
-    x: number,
-    y: number,
   ) => void
   onSliceDelete?: (sliceId: string) => void
   onEntityDelete?: (entityId: string) => void
@@ -367,20 +366,14 @@ export function Canvas({
     return ids
   }, [featureMode, model.nodes, nodeSubmodel, featureFid])
 
-  // Feature-mode positions: the deterministic grid provides defaults, but a
-  // per-feature `bySubmodel` override (set when the user drags a node) wins —
-  // so a drag sticks instead of snapping back to the grid.
+  // Feature-mode positions come SOLELY from the deterministic grid — it is the
+  // single source of truth for node x/y, so every node always follows its slice
+  // column when a slice is pushed / resized / reordered. (Legacy per-feature
+  // `bySubmodel` overrides are intentionally ignored; see `handleFeatureNodeMove`.)
   const featurePositions = useMemo(() => {
     if (!featureMode || !featureGrid) return null
-    const merged = new Map(featureGrid.positions)
-    const overrides = model.layout.bySubmodel?.[activeFeature]
-    if (overrides) {
-      for (const [id, pos] of Object.entries(overrides)) {
-        if (!featureMemberIds || featureMemberIds.has(id)) merged.set(id, pos)
-      }
-    }
-    return merged
-  }, [featureMode, featureGrid, model.layout.bySubmodel, activeFeature, featureMemberIds])
+    return new Map(featureGrid.positions)
+  }, [featureMode, featureGrid])
 
   const domainNodes = useMemo(() => {
     if (featureMode && featurePositions && featureMemberIds) {
@@ -705,23 +698,25 @@ export function Canvas({
           }
         } else if (!change.dragging && change.position) {
           // Node was dropped.
-          const sliceId = getSliceAtX(sliceLayoutsHit, change.position.x)
           if (featureModeRef.current) {
-            // Feature mode: persist a per-feature position override (so the
-            // drag sticks) and (re)assign slice/entity from the drop location.
+            // Feature mode: re-assign the node to the slice column / entity lane
+            // it landed on; the deterministic grid then snaps it into that cell,
+            // so it stays glued to its slice. Clamp to the NEAREST slice (a
+            // feature member must live in a column) so a sloppy drop re-homes
+            // instead of floating off-grid.
             const nid = draggingNodeRef.current ?? change.id
+            const sliceId = nearestSliceAtX(sliceLayoutsHit, change.position.x)
             const nodeType = model.nodes.find((n) => n.id === nid)?.type ?? null
+            // Only reassign the entity when the drop is actually over a lane — a
+            // drop off any lane leaves an event on its current aggregate rather
+            // than orphaning it (`undefined` = leave entity untouched).
             const entityId =
-              nodeType === 'event' ? getEntityAtY(entityLayoutsHit, change.position.y) : undefined
-            onFeatureNodeMove?.(
-              activeFeatureRef.current,
-              nid,
-              sliceId,
-              entityId,
-              change.position.x,
-              change.position.y,
-            )
+              nodeType === 'event'
+                ? getEntityAtY(entityLayoutsHit, change.position.y) ?? undefined
+                : undefined
+            onFeatureNodeMove?.(nid, sliceId, entityId)
           } else if (draggingNodeRef.current) {
+            const sliceId = getSliceAtX(sliceLayoutsHit, change.position.x)
             onAssignNodeToSlice?.(draggingNodeRef.current, sliceId, change.position.x, change.position.y)
             // Assign event to entity on drop
             if (draggingNodeTypeRef.current === 'event') {
@@ -812,7 +807,6 @@ export function Canvas({
       y: fy,
       sliceId,
       entityId: getEntityAtY(entityHit, fy),
-      featureId: inFeature ? activeFeatureRef.current : null,
     }
   }, [])
 
