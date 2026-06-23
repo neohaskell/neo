@@ -15,6 +15,7 @@ mod lock;
 mod network;
 mod git;
 mod reconcile;
+mod skills;
 mod subprocess;
 mod test_utils;
 

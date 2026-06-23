@@ -1969,3 +1969,145 @@ mod ide_ws {
         );
     }
 }
+
+// =====================================================
+// `neo skills setup` (hermetic: NEO_SKIP_NETWORK stub, isolated NEO_HOME cache)
+// =====================================================
+//
+// Under NEO_SKIP_NETWORK the clone is replaced by a deterministic stub library
+// with one skill (`sample-skill`). Each test points NEO_HOME at its own tempdir
+// so the skills cache is isolated and the run is reproducible.
+
+/// `(project_dir, neo_home)` tempdirs — keep both alive for the command.
+fn skills_sandbox() -> (tempfile::TempDir, tempfile::TempDir) {
+    (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+}
+
+fn skills_cmd(project: &std::path::Path, neo_home: &std::path::Path) -> Command {
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project)
+        .env("NEO_SKIP_NETWORK", "1")
+        .env("NEO_HOME", neo_home)
+        .arg("skills")
+        .arg("setup")
+        .arg("--ci");
+    cmd
+}
+
+#[test]
+fn skills_setup_ci_all_tools_creates_dests() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .arg("--all-tools")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] installed"));
+
+    assert!(proj.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+    // Codex installs to `.agents/skills`, NOT `.codex/skills`.
+    assert!(proj.path().join(".agents/skills/sample-skill/SKILL.md").exists());
+    assert!(!proj.path().join(".codex/skills").exists());
+    assert!(proj.path().join(".kiro/skills/sample-skill/SKILL.md").exists());
+    assert!(proj.path().join(".cursor/rules/sample-skill.mdc").exists());
+    let agents = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
+    assert!(agents.contains("BEGIN neo skills"));
+    assert!(agents.contains("### sample-skill"));
+}
+
+#[test]
+fn skills_setup_idempotent_twice() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
+    // Second run: every destination is unchanged → all 5 plan items skipped.
+    skills_cmd(proj.path(), home.path())
+        .arg("--all-tools")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped 5"));
+}
+
+#[test]
+fn skills_setup_overwrite_without_force_refused() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
+    // Tamper with an installed destination so it no longer matches the source.
+    std::fs::write(proj.path().join(".claude/skills/sample-skill/SKILL.md"), "tampered").unwrap();
+    skills_cmd(proj.path(), home.path())
+        .arg("--all-tools")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exist"))
+        .stderr(predicate::str::contains("--force"));
+}
+
+#[test]
+fn skills_setup_overwrite_with_force() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
+    std::fs::write(proj.path().join(".claude/skills/sample-skill/SKILL.md"), "tampered").unwrap();
+    skills_cmd(proj.path(), home.path())
+        .args(["--all-tools", "--force"])
+        .assert()
+        .success();
+    let restored =
+        std::fs::read_to_string(proj.path().join(".claude/skills/sample-skill/SKILL.md")).unwrap();
+    assert!(restored.contains("name: sample-skill"), "force must restore from source");
+}
+
+#[test]
+fn skills_setup_dry_run_writes_nothing() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--all-tools", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("dry run"));
+    assert!(!proj.path().join(".claude").exists(), "dry run must not write");
+    assert!(!proj.path().join("AGENTS.md").exists(), "dry run must not write");
+}
+
+#[test]
+fn skills_setup_unknown_tool_errors() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--tool", "bogus"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bogus"))
+        .stderr(predicate::str::contains("not a supported tool"));
+}
+
+#[test]
+fn skills_setup_unknown_skill_errors() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--all-tools", "--skill", "does-not-exist"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does-not-exist"));
+}
+
+#[test]
+fn skills_setup_ci_no_tool_defaults_all() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("defaulting to --all-tools"));
+    assert!(proj.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+}
+
+#[test]
+fn skills_setup_skill_filter_and_single_tool() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--tool", "claude", "--skill", "sample-skill"])
+        .assert()
+        .success();
+    assert!(proj.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+    // Only the requested tool is installed.
+    assert!(!proj.path().join(".agents/skills").exists());
+    assert!(!proj.path().join(".cursor").exists());
+    assert!(!proj.path().join("AGENTS.md").exists());
+}

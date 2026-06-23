@@ -294,10 +294,118 @@ pub async fn fetch_starter_template(dest: &Path) -> miette::Result<()> {
     Ok(())
 }
 
+/// Clone (or reuse a cached clone of) `github.com/neohaskell/skills` and return
+/// the path to the local checkout, used by `neo skills setup`.
+///
+/// The cache lives under [`crate::errlog::log_dir`] (`$NEO_HOME` → `$HOME/.neo`)
+/// so it is shared across projects. `refresh` forces a fresh clone even when a
+/// cached checkout exists. Under `NEO_SKIP_NETWORK` a deterministic stub library
+/// (one `sample-skill`) is written into the cache so the copy pipeline runs
+/// offline (tests).
+pub async fn fetch_skills_repo(refresh: bool) -> miette::Result<std::path::PathBuf> {
+    let cache = crate::errlog::log_dir()
+        .ok_or_else(|| miette::miette!(
+            help = "Set `$HOME` (or `$NEO_HOME` to an explicit writable directory), then re-run `neo skills setup`. `neo` caches the cloned skills library under `$NEO_HOME` or `$HOME/.neo`.",
+            "cloning `neohaskell/skills`: cannot determine a cache directory — neither `$NEO_HOME` nor `$HOME` is set.",
+        ))?
+        .join("skills-cache");
+    let checkout = cache.join("neohaskell-skills");
+
+    if std::env::var("NEO_SKIP_NETWORK").is_ok() {
+        write_skills_stub(&checkout)?;
+        return Ok(checkout);
+    }
+
+    if checkout.is_dir() && !refresh {
+        return Ok(checkout);
+    }
+
+    std::fs::create_dir_all(&cache)
+        .map_err(|e| NeoError::io_at("creating the skills cache directory at", &cache, e))?;
+
+    // Clone into a temp dir *inside the cache* so the final rename stays on the
+    // same filesystem (a cross-device rename would fail with EXDEV).
+    let tmp = tempfile::Builder::new()
+        .prefix(".tmp-skills-clone-")
+        .tempdir_in(&cache)
+        .map_err(|e| NeoError::io_at("creating a temp dir for the skills clone under", &cache, e))?;
+    let clone_dest = tmp.path().join("checkout");
+
+    let url = "https://github.com/neohaskell/skills";
+    let output = tokio::process::Command::new("git")
+        .args(["clone", "--depth", "1", url])
+        .arg(&clone_dest)
+        .output()
+        .await
+        .map_err(|e| NeoError::SubprocessFailed {
+            operation: format!("spawning `git clone --depth 1 {}`", url),
+            cause: format!("could not run git: {}", e),
+            fix: "Ensure `git` is installed and on PATH (`which git`). If installed, open a new shell.".to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if let Some(i) = interpret::match_kind(Kind::Git, &stderr) {
+            return Err(NeoError::SubprocessFailed {
+                operation: format!("`git clone --depth 1 {}`", url),
+                cause: i.cause,
+                fix: i.fix,
+            }.into());
+        }
+        return Err(NeoError::SubprocessFailed {
+            operation: format!("`git clone --depth 1 {}`", url),
+            cause: format!("git exited non-zero: {}", stderr.trim()),
+            fix: format!("Check that `{url}` is reachable (try `git ls-remote {url}`). If you are offline or behind a proxy, set `NEO_SKIP_NETWORK=1` to use a local stub library (fine for tests, not for real installs)."),
+        }.into());
+    }
+
+    if checkout.exists() {
+        std::fs::remove_dir_all(&checkout)
+            .map_err(|e| NeoError::io_at("removing the stale skills checkout at", &checkout, e))?;
+    }
+    std::fs::rename(&clone_dest, &checkout)
+        .map_err(|e| NeoError::io_at("moving the freshly cloned skills checkout into the cache at", &checkout, e))?;
+    Ok(checkout)
+}
+
+/// Write a deterministic offline stub `neohaskell/skills` checkout (one sample
+/// skill in agentskills.io format) so `neo skills setup` can run without
+/// network. Used under `NEO_SKIP_NETWORK`.
+fn write_skills_stub(checkout: &Path) -> miette::Result<()> {
+    let skill_dir = checkout.join("skills").join("sample-skill");
+    std::fs::create_dir_all(&skill_dir)
+        .map_err(|e| NeoError::io_at("creating the offline-stub skill directory at", &skill_dir, e))?;
+    let skill_md = skill_dir.join("SKILL.md");
+    std::fs::write(
+        &skill_md,
+        "---\nname: sample-skill\ndescription: An offline stub skill used when NEO_SKIP_NETWORK is set.\n---\n\n# Sample skill\n\nThis is a placeholder skill body for offline runs.\n",
+    )
+    .map_err(|e| NeoError::io_at("writing the offline-stub `SKILL.md` to", &skill_md, e))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_fetch_skills_repo_skip_network_stub() {
+        let dir = tempdir().unwrap();
+        let prev_home = std::env::var("NEO_HOME").ok();
+        unsafe {
+            std::env::set_var("NEO_SKIP_NETWORK", "1");
+            std::env::set_var("NEO_HOME", dir.path());
+        }
+        let checkout = fetch_skills_repo(false).await.unwrap();
+        assert!(checkout.join("skills/sample-skill/SKILL.md").exists());
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("NEO_HOME", v),
+                None => std::env::remove_var("NEO_HOME"),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_check_for_updates() {

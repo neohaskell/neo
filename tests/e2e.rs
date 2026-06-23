@@ -97,7 +97,8 @@ fn surface_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("build"))
         .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("test"))
-        .stdout(predicate::str::contains("lock"));
+        .stdout(predicate::str::contains("lock"))
+        .stdout(predicate::str::contains("skills"));
 }
 
 #[test]
@@ -109,6 +110,24 @@ fn surface_help_subcommand_lock() {
         .assert()
         .success()
         .stdout(predicate::str::contains("install"));
+}
+
+#[test]
+#[ignore]
+fn surface_help_subcommand_skills() {
+    let sb = Sandbox::new("surface_help_subcommand_skills");
+    sb.neo(".")
+        .args(["skills", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("setup"));
+    sb.neo(".")
+        .args(["skills", "setup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--all-tools"))
+        .stdout(predicate::str::contains("--tool"))
+        .stdout(predicate::str::contains("--force"));
 }
 
 #[test]
@@ -1113,6 +1132,33 @@ async fn ide_initialize_against_release_binary() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+// =====================================================
+// Group M: `neo skills setup` (real clone of neohaskell/skills)
+// =====================================================
+
+#[test]
+#[ignore]
+fn skills_setup_real_clone_no_skills_yet() {
+    // The shipped binary must really clone github.com/neohaskell/skills into the
+    // per-user cache (under the sandbox HOME). The upstream repo is currently an
+    // empty scaffold (LICENSE + a bare README, no `skills/` tree), so the correct
+    // behavior is a clean "nothing to install" exit — not an error. This scenario
+    // auto-upgrades to a real install assertion once skills land upstream.
+    let sb = Sandbox::new("skills_setup_real_clone_no_skills_yet");
+    sb.neo("proj")
+        .args(["skills", "setup", "--ci", "--all-tools"])
+        .timeout(Duration::from_secs(120))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no skills found"));
+
+    // A real clone landed in the cache even though there were no skills to copy.
+    let checkout = sb.path("home/.neo/skills-cache/neohaskell-skills");
+    assert!(checkout.exists(), "expected the skills repo to be cloned into the cache");
+    // No tool folders were created in the project (nothing to install).
+    assert!(!sb.path("proj/.claude").exists());
 }
 
 // =====================================================
