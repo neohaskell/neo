@@ -38,11 +38,16 @@ describe('NodeShell record card', () => {
     expect(screen.getByText('UUID')).toBeInTheDocument()
   })
 
-  it('fields_render_always_read_only', () => {
-    wrap(<NodeShell variant="event" label="E" fields={fields} />)
-    // Read-only rows present, but NOT the editable FieldsEditor (no inputs).
+  it('node_renders_fields_read_only', () => {
+    // A node with fields and NO change-callback shows the field rows (name +
+    // type) and renders NO text inputs / no FieldsEditor.
+    const { container } = wrap(<NodeShell variant="event" label="E" fields={fields} />)
     expect(screen.getByText('orderId')).toBeInTheDocument()
+    expect(screen.getByText('UUID')).toBeInTheDocument()
+    expect(screen.getByText('total')).toBeInTheDocument()
+    expect(screen.getByText('Money')).toBeInTheDocument()
     expect(screen.queryByTestId('fields-editor')).toBeNull()
+    expect(container.querySelectorAll('input')).toHaveLength(0)
   })
 
   it('empty_node_shows_no_fields_state', () => {
@@ -50,23 +55,22 @@ describe('NodeShell record card', () => {
     expect(screen.getByText('no fields')).toBeInTheDocument()
   })
 
-  it('editable_fields_on_selection', () => {
-    wrap(
-      <NodeShell
-        variant="event"
-        label="E"
-        fields={fields}
-        selected
-        onFieldsChange={() => {}}
-      />,
-    )
-    expect(screen.getByTestId('fields-editor')).toBeInTheDocument()
-  })
-
-  it('not_editable_when_selected_without_callback', () => {
-    wrap(<NodeShell variant="event" label="E" fields={fields} selected />)
+  it('node_has_no_field_editor', () => {
+    // Fields are strictly read-only: the editor is never mounted regardless of
+    // selection or zoom level.
+    for (const sel of [false, true]) {
+      const { unmount } = wrap(
+        <NodeShell variant="event" label="E" fields={fields} selected={sel} />,
+      )
+      expect(screen.queryByTestId('fields-editor')).toBeNull()
+      expect(screen.getByText('orderId')).toBeInTheDocument()
+      unmount()
+    }
+    // …and at the close ("edit") zoom level too.
+    mockZoom = 2 // above the edit threshold
+    const { container } = wrap(<NodeShell variant="event" label="E" fields={fields} selected />)
     expect(screen.queryByTestId('fields-editor')).toBeNull()
-    expect(screen.getByText('orderId')).toBeInTheDocument()
+    expect(container.querySelectorAll('input')).toHaveLength(0)
   })
 
   it('header_only_when_zoomed_out', () => {

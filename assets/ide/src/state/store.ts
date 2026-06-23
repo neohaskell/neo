@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react'
-import type { EventModel, EdgeType, Field } from '../model/types'
+import type { EventModel, EdgeType } from '../model/types'
 import {
   addEvent,
   addCommand,
@@ -25,7 +25,6 @@ import {
   assignEventToEntity,
   renameChapter,
   updateNodeName,
-  setNodeFields,
   addSubmodel,
   renameSubmodel,
   removeSubmodel,
@@ -42,7 +41,6 @@ export type Action =
   | { type: 'addUIPlaceholder'; name: string }
   | { type: 'removeNode'; nodeId: string }
   | { type: 'updateNodeName'; nodeId: string; name: string }
-  | { type: 'setNodeFields'; nodeId: string; fields: readonly Field[] }
   | { type: 'addEdge'; edgeType: EdgeType; sourceId: string; targetId: string; sourceHandle?: string | null; targetHandle?: string | null }
   | { type: 'removeEdge'; edgeId: string }
   | { type: 'addEntity'; name: string }
@@ -90,8 +88,6 @@ export function reducer(model: EventModel, action: Action): EventModel {
       return removeNode(model, action.nodeId)
     case 'updateNodeName':
       return updateNodeName(model, action.nodeId, action.name)
-    case 'setNodeFields':
-      return setNodeFields(model, action.nodeId, action.fields)
     case 'addEdge':
       return addEdge(model, {
         id: edgeId(),

@@ -296,6 +296,20 @@ function App() {
     const client = new IdeClient()
     clientRef.current = client
     const unsubscribe = client.onState(setConn)
+    // The Rust background sync rewrites `event-model.json` whenever source code
+    // changes the schema, then broadcasts a `$/eventModelChanged` notification.
+    // Fields are source-owned/read-only, so the IDE adopts the on-disk model on
+    // every such push: re-read and replace the in-memory store (same load path
+    // as the initial read — parse → auto-layout → band reflow → loadModel).
+    const unsubscribeChanged = client.onNotification(
+      '$/eventModelChanged',
+      () => {
+        ;(async () => {
+          const reload = await readEventModel(client)
+          applyReadResult(reload)
+        })()
+      },
+    )
     ;(async () => {
       const initRes = await initialize(client, CLIENT_INFO)
       if (!initRes.ok) {
@@ -308,6 +322,7 @@ function App() {
     })()
     return () => {
       unsubscribe()
+      unsubscribeChanged()
       client.close()
       clientRef.current = null
     }
@@ -714,14 +729,6 @@ function App() {
     [markDirty],
   )
 
-  const handleNodeFieldsChange = useCallback(
-    (nodeId: string, fields: import('./model/types').Field[]) => {
-      dispatch({ type: 'setNodeFields', nodeId, fields })
-      markDirty()
-    },
-    [markDirty],
-  )
-
   const handleEntityRename = useCallback(
     (entityId: string, name: string) => {
       dispatch({ type: 'renameEntity', entityId, name })
@@ -957,7 +964,6 @@ function App() {
                         onAssignChapterToSubmodel={handleAssignChapterToSubmodel}
                         onCreateNode={handleCreateNodeAt}
                         onCreateSuccessor={handleCreateSuccessor}
-                        onNodeFieldsChange={handleNodeFieldsChange}
                         onAddEntity={handleAddEntity}
                         onAddSlice={handleAddSlice}
                         onAddSliceToChapter={handleAddSliceToChapter}

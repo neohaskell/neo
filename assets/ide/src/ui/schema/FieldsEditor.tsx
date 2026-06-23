@@ -8,10 +8,12 @@ interface FieldsEditorProps {
 }
 
 /**
- * Compact name:type field editor. Shown inside a node via semantic zoom and
- * (later) the Schema lens. Carries `nodrag` so editing inside a React Flow node
- * doesn't drag it; React Flow itself ignores key events from inputs (so
- * Backspace edits text rather than deleting the node).
+ * Compact name:type field editor. NOT mounted by NodeShell anymore — node
+ * fields are strictly READ-ONLY in the canvas (source code authors the schema
+ * via the Rust background sync). Kept here, importable but currently
+ * unreferenced, for the future editable Schema/Inspector lens. Carries `nodrag`
+ * so editing inside a React Flow node doesn't drag it; React Flow itself ignores
+ * key events from inputs (so Backspace edits text rather than deleting the node).
  */
 export function FieldsEditor({ fields, onChange }: FieldsEditorProps) {
   const update = (i: number, patch: Partial<Field>) =>

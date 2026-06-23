@@ -3,8 +3,9 @@
 // Pairs with `src/ide/server.rs` on the Rust side. Wire format defined by the
 // `MUST` invariants captured in /Users/nick/.claude/projects/-Users-nick-repos-neo/memory/project_ide_jsonrpc_architecture.md.
 //
-// Intentionally tiny: no reconnect, no notification handling, no cancellation.
-// Those land additively when the Rust side ships the corresponding methods.
+// Intentionally tiny: no reconnect, no cancellation. Notification handling is
+// supported (see `onNotification`) for server-pushed messages such as
+// `$/progress` (heal logs) and `$/eventModelChanged` (background-sync reload).
 
 export interface RpcSuccess<T> {
   ok: true

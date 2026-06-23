@@ -569,3 +569,42 @@ describe('App — submodel band reflow on load', () => {
     await waitFor(() => expect(ipcState.callLog).toContain('write'), { timeout: 3000 })
   })
 })
+
+describe('App — $/eventModelChanged push reload', () => {
+  // A model carrying a distinctly-named chapter so we can observe the store
+  // replace in the DOM (chapter rows render with data-testid chapter-row-<id>).
+  const MODEL_AFTER_SYNC = JSON.stringify({
+    id: 'm1',
+    name: 'Demo',
+    chapters: [{ id: 'synced1', name: 'FromSourceSync', order: 0 }],
+    entities: [],
+    slices: [],
+    nodes: [],
+    edges: [],
+    layout: { nodePositions: {}, viewport: { x: 0, y: 0, zoom: 1 } },
+  })
+
+  it('ws_event_model_changed_triggers_reread', async () => {
+    configureIpc({
+      readQueue: [
+        // Mount load: nothing on disk yet.
+        { ok: true, result: { content: null, validation: { status: 'notFound' } } },
+        // The re-read the notification handler must perform.
+        { ok: true, result: { content: MODEL_AFTER_SYNC, validation: { status: 'valid' } } },
+      ],
+    })
+    render(<App />)
+    // Mount read settles; the synced chapter is NOT present yet.
+    await waitFor(() => expect(ipcState.readCalls).toBe(1))
+    expect(screen.queryByTestId('chapter-row-synced1')).not.toBeInTheDocument()
+
+    // The Rust background sync rewrote event-model.json and pushed the
+    // notification (no params needed — the handler just re-reads from disk).
+    emitNotification('$/eventModelChanged', {})
+
+    // Handler re-reads (readCalls → 2) and replaces the in-memory model, so the
+    // newly-synced chapter row appears.
+    await waitFor(() => expect(ipcState.readCalls).toBe(2))
+    expect(await screen.findByTestId('chapter-row-synced1')).toBeInTheDocument()
+  })
+})

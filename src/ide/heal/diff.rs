@@ -96,6 +96,13 @@ pub struct HealDiff {
     /// Unresolved issues — things the diff identified but cannot fix
     /// deterministically. The LLM (or the user) needs to resolve these.
     pub residuals: Vec<Residual>,
+    /// Existing (or freshly-materialised) command/event nodes whose `fields`
+    /// array is (re)written from the parsed Haskell source. Pure DATA: applied
+    /// without any layout movement. Source is authoritative — fields are
+    /// overwritten wholesale, never merged. Only queued when the source yields
+    /// a NON-EMPTY field list that differs from the node's current fields, so a
+    /// parser miss (empty extraction) never clobbers what's already displayed.
+    pub set_node_fields: Vec<NodeFieldsSet>,
 }
 
 impl HealDiff {
@@ -113,12 +120,13 @@ impl HealDiff {
             + self.fix_integration_kinds.len()
             + self.fix_positions.len()
             + self.ensure_layout_entries.len()
+            + self.set_node_fields.len()
     }
 
     /// Short, human-readable one-line summary for logs and the heal overlay.
     pub fn summary(&self) -> String {
         format!(
-            "{} chapters, {} chapters removed, {} entities, {} slices, {} slices removed, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
+            "{} chapters, {} chapters removed, {} entities, {} slices, {} slices removed, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} field updates, {} residuals",
             self.add_chapters.len(),
             self.remove_chapters.len(),
             self.add_entities.len(),
@@ -131,6 +139,7 @@ impl HealDiff {
             self.fix_integration_kinds.len(),
             self.fix_positions.len(),
             self.ensure_layout_entries.len(),
+            self.set_node_fields.len(),
             self.residuals.len(),
         )
     }
@@ -257,6 +266,18 @@ pub struct LayoutEntry {
     pub y: f64,
 }
 
+/// A node whose `fields` array should be (re)written from parsed source. The
+/// `fields` reuse `crate::inspect::RecordField`, which serialises to the
+/// event-model schema's `{ name, type }` shape — so `apply` writes them verbatim.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeFieldsSet {
+    pub node_id: String,
+    pub node_name: String,
+    pub fields: Vec<crate::inspect::RecordField>,
+    pub reason: String,
+}
+
 /// Something the deterministic pass noticed but cannot fix on its own.
 /// The LLM uses this as its much-shorter input prompt.
 #[derive(Debug, Clone, Serialize)]
@@ -272,14 +293,24 @@ pub enum Residual {
     },
 }
 
-/// Which phases of `compute_diff` to run. Default = both (the heal flow).
-/// `layout_only` skips materialisation/orphan/kind-fix and runs ONLY the
-/// layout passes — used by `workspace/relayoutEventModel` so the user can
-/// clean up a model's positions without touching its structure.
+/// Which phases of `compute_diff` to run. Default = all three (the heal flow).
+///
+/// The three phases are independent toggles:
+///   * `structural` — materialise entities/slices/nodes/edges + kind fixes + orphan detection.
+///   * `layout`     — y-band fixes, wave ordering, slice-column rebalance, layout entries.
+///   * `fields`     — reconcile each existing/new command/event node's `fields`
+///     from the parsed source (data-only; never moves anything on the canvas).
+///
+/// `layout_only` (used by `workspace/relayoutEventModel`) runs ONLY layout —
+/// `fields` is OFF so a "clean up positions" pass never rewrites field content.
+/// `fields_only` (used by the code→model sync when no new node appeared) runs
+/// ONLY the field reconcile — zero structural materialisation, zero layout
+/// movement: exactly the "edit fields of an EXISTING node" data sync.
 #[derive(Debug, Clone, Copy)]
 pub struct ComputeOptions {
     pub structural: bool,
     pub layout: bool,
+    pub fields: bool,
 }
 
 impl Default for ComputeOptions {
@@ -290,13 +321,21 @@ impl Default for ComputeOptions {
 
 impl ComputeOptions {
     pub const fn full() -> Self {
-        Self { structural: true, layout: true }
+        Self { structural: true, layout: true, fields: true }
     }
     pub const fn layout_only() -> Self {
-        Self { structural: false, layout: true }
+        Self { structural: false, layout: true, fields: false }
     }
     pub const fn structural_only() -> Self {
-        Self { structural: true, layout: false }
+        Self { structural: true, layout: false, fields: true }
+    }
+    /// Pure field reconcile — no structural materialisation, no layout. The
+    /// sync engine prefers `structural_only` (a superset: also syncs new
+    /// edges/kind fixes on existing nodes without layout), so this primitive is
+    /// exercised only by the unit tests that isolate the `fields` phase.
+    #[allow(dead_code)]
+    pub const fn fields_only() -> Self {
+        Self { structural: false, layout: false, fields: true }
     }
 }
 
@@ -544,6 +583,17 @@ pub fn compute_diff_with_options(
         }
     }
 
+    // --- 3.5. Reconcile node fields from source (data-only) ------------
+    //
+    // Runs whenever `opts.fields` is set — independent of structural/layout —
+    // so the code→model sync can refresh fields with ZERO layout movement.
+    // Covers both EXISTING model nodes and the nodes just queued in
+    // `diff.add_nodes` (apply runs `apply_set_node_fields` after the node is
+    // materialised). Source is authoritative; fields are overwritten wholesale.
+    if opts.fields {
+        reconcile_node_fields(model, inspection, &mut diff);
+    }
+
     if !opts.layout {
         return diff;
     }
@@ -646,6 +696,95 @@ pub fn compute_diff_with_options(
     }
 
     diff
+}
+
+/// Reconcile each command/event node's `fields` against the parsed source
+/// (gated by `ComputeOptions::fields`). Queues a `set_node_fields` overwrite
+/// when the source yields a NON-EMPTY field list that differs from the node's
+/// current fields — both for existing model nodes and for nodes just queued in
+/// `diff.add_nodes`. An empty source extraction is treated as "no information"
+/// and never clears existing fields, so a dumb-parser miss can't erase what's
+/// already displayed. Source is authoritative: fields are overwritten wholesale,
+/// never merged, which keeps the sync idempotent (a second run finds no diff).
+fn reconcile_node_fields(model: &Value, inspection: &ProjectInspection, diff: &mut HealDiff) {
+    use crate::inspect::RecordField;
+
+    // (type, name) → source fields, for the field-bearing node kinds only.
+    let mut source: BTreeMap<(&str, &str), &Vec<RecordField>> = BTreeMap::new();
+    for domain in &inspection.domains {
+        for c in &domain.commands {
+            if !c.fields.is_empty() {
+                source.insert(("command", c.name.as_str()), &c.fields);
+            }
+        }
+        for e in &domain.events {
+            if !e.fields.is_empty() {
+                source.insert(("event", e.name.as_str()), &e.fields);
+            }
+        }
+    }
+    if source.is_empty() {
+        return;
+    }
+
+    let mut queued: Vec<NodeFieldsSet> = Vec::new();
+
+    // Existing model nodes whose fields drifted from source.
+    if let Some(arr) = model.get("nodes").and_then(|v| v.as_array()) {
+        for node in arr {
+            let (Some(id), Some(ty), Some(name)) = (
+                node.get("id").and_then(|v| v.as_str()),
+                node.get("type").and_then(|v| v.as_str()),
+                node.get("name").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let Some(src_fields) = source.get(&(ty, name)) else {
+                continue;
+            };
+            if node_fields_of(node) != **src_fields {
+                queued.push(NodeFieldsSet {
+                    node_id: id.to_string(),
+                    node_name: name.to_string(),
+                    fields: (*src_fields).clone(),
+                    reason: format!("{ty} {name}: fields reconciled from source"),
+                });
+            }
+        }
+    }
+
+    // Freshly-materialised nodes (structural pass) aren't in `model` yet —
+    // match them against the queued `NodeToAdd`s. `apply_set_node_fields` runs
+    // after `apply_add_nodes`, so the node exists by the time fields are written.
+    for n in &diff.add_nodes {
+        if let Some(src_fields) = source.get(&(n.node_type.as_str(), n.name.as_str())) {
+            queued.push(NodeFieldsSet {
+                node_id: n.id.clone(),
+                node_name: n.name.clone(),
+                fields: (*src_fields).clone(),
+                reason: format!("{} {}: fields set from source", n.node_type, n.name),
+            });
+        }
+    }
+
+    diff.set_node_fields.extend(queued);
+}
+
+/// Parse a model node's current `fields` JSON array into `RecordField`s for
+/// equality comparison. A missing/absent `fields` reads as empty.
+fn node_fields_of(node: &Value) -> Vec<crate::inspect::RecordField> {
+    node.get("fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let name = f.get("name").and_then(|v| v.as_str())?.to_string();
+                    let type_name = f.get("type").and_then(|v| v.as_str())?.to_string();
+                    Some(crate::inspect::RecordField { name, type_name })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Order every slice left-to-right by the event-modeling WAVE and group
@@ -1971,10 +2110,12 @@ mod tests {
                     EventInfo {
                         name: "OrderPlaced".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     },
                     EventInfo {
                         name: "OrderShipped".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     },
                 ],
                 commands: vec![
@@ -1983,12 +2124,14 @@ mod tests {
                         file: PathBuf::new(),
                         produces: vec!["OrderPlaced".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     },
                     CommandInfo {
                         name: "ShipOrder".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["OrderShipped".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     },
                 ],
                 queries: vec![QueryInfo {
@@ -2283,6 +2426,7 @@ mod tests {
         inspection.domains[0].events.push(EventInfo {
             name: "OrphanEvent".to_string(),
             file: PathBuf::new(),
+            fields: vec![],
         });
         let model = empty_model();
         let diff = compute_diff(&model, &inspection);
@@ -2407,6 +2551,7 @@ mod tests {
             file: PathBuf::new(),
             produces: vec![],
             via_web_transport: false,
+            fields: vec![],
         });
 
         let diff = compute_diff(&model, &inspection);
@@ -2462,12 +2607,14 @@ mod tests {
             file: PathBuf::new(),
             produces: vec![],
             via_web_transport: false,
+            fields: vec![],
         });
         inspection.domains[0].commands.push(CommandInfo {
             name: "AnnotateOrderTwice".to_string(),
             file: PathBuf::new(),
             produces: vec![],
             via_web_transport: false,
+            fields: vec![],
         });
 
         let mut model = empty_model();
@@ -2497,6 +2644,7 @@ mod tests {
                 file: PathBuf::new(),
                 produces: vec!["NoteAdded".to_string()],
                 via_web_transport: false,
+                fields: vec![],
             },
         ];
         // Two queries in the same slice would also stack. Add a second
@@ -2551,12 +2699,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "OrderPlaced".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "PlaceOrder".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["OrderPlaced".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2567,12 +2717,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "PaymentCaptured".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "CapturePayment".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["PaymentCaptured".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2632,12 +2784,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "OrderPlaced".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "PlaceOrder".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["OrderPlaced".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2648,12 +2802,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "PaymentCaptured".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "CapturePayment".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["PaymentCaptured".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2798,12 +2954,14 @@ mod tests {
                 events: vec![EventInfo {
                     name: "OrderPlaced".to_string(),
                     file: PathBuf::new(),
+                    fields: vec![],
                 }],
                 commands: vec![CommandInfo {
                     name: "PlaceOrder".to_string(),
                     file: PathBuf::new(),
                     produces: vec!["OrderPlaced".to_string()],
                     via_web_transport: false,
+                    fields: vec![],
                 }],
                 queries: vec![],
                 integrations: vec![],
@@ -3743,5 +3901,155 @@ mod tests {
             "second structural pass must be a fixed point; got summary: {}",
             diff2.summary(),
         );
+    }
+
+    // --- field reconcile (code→model data sync) --------------------------
+
+    fn rf(name: &str, ty: &str) -> crate::inspect::RecordField {
+        crate::inspect::RecordField { name: name.to_string(), type_name: ty.to_string() }
+    }
+
+    /// One Orders domain: command `PlaceOrder` + event `OrderPlaced`, both with
+    /// source-declared fields.
+    fn inspection_with_fields() -> ProjectInspection {
+        ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![DomainInspection {
+                name: "Orders".to_string(),
+                path: PathBuf::from("/Orders"),
+                events: vec![EventInfo {
+                    name: "OrderPlaced".to_string(),
+                    file: PathBuf::new(),
+                    fields: vec![rf("orderId", "Uuid"), rf("total", "Money")],
+                }],
+                commands: vec![CommandInfo {
+                    name: "PlaceOrder".to_string(),
+                    file: PathBuf::new(),
+                    produces: vec!["OrderPlaced".to_string()],
+                    via_web_transport: false,
+                    fields: vec![rf("orderId", "Uuid")],
+                }],
+                queries: vec![],
+                integrations: vec![],
+            }],
+        }
+    }
+
+    /// Model with the OrderPlaced event node already placed, no fields yet.
+    fn model_with_event_node() -> Value {
+        serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [], "entities": [{ "id": "e", "name": "Orders", "order": 0 }],
+            "slices": [{ "id": "s1", "name": "PlaceOrder", "chapterId": null, "order": 0 }],
+            "nodes": [
+                { "id": "ev1", "type": "event", "name": "OrderPlaced", "sliceId": "s1", "entityId": "e" }
+            ],
+            "edges": [],
+            "layout": { "nodePositions": { "ev1": { "x": 800, "y": 400 } }, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    #[test]
+    fn compute_options_fields_flag_matrix() {
+        let f = ComputeOptions::full();
+        assert!(f.structural && f.layout && f.fields);
+        let l = ComputeOptions::layout_only();
+        assert!(l.layout && !l.structural && !l.fields, "relayout must never rewrite fields");
+        let s = ComputeOptions::structural_only();
+        assert!(s.structural && !s.layout && s.fields);
+        let fo = ComputeOptions::fields_only();
+        assert!(fo.fields && !fo.structural && !fo.layout);
+    }
+
+    #[test]
+    fn fields_only_reconciles_existing_node() {
+        let model = model_with_event_node();
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert_eq!(diff.set_node_fields.len(), 1, "only the existing OrderPlaced node reconciles");
+        assert_eq!(diff.set_node_fields[0].node_id, "ev1");
+        assert_eq!(diff.set_node_fields[0].fields, vec![rf("orderId", "Uuid"), rf("total", "Money")]);
+
+        let mut model = model;
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let fields = model["nodes"][0]["fields"].as_array().expect("fields written");
+        assert_eq!(fields[0]["name"], "orderId");
+        assert_eq!(fields[0]["type"], "Uuid");
+        assert_eq!(fields[1]["name"], "total");
+    }
+
+    #[test]
+    fn fields_only_emits_no_structural_or_layout_ops() {
+        let model = model_with_event_node();
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert!(diff.add_nodes.is_empty(), "fields_only must not materialise nodes");
+        assert!(diff.add_slices.is_empty() && diff.add_entities.is_empty());
+        assert!(diff.fix_positions.is_empty() && diff.ensure_layout_entries.is_empty());
+        assert!(diff.update_slices.is_empty() && diff.add_edges.is_empty());
+    }
+
+    #[test]
+    fn fields_only_preserves_positions_and_is_idempotent() {
+        let mut model = model_with_event_node();
+        let insp = inspection_with_fields();
+        let before = model["layout"]["nodePositions"].clone();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        assert_eq!(model["layout"]["nodePositions"], before, "positions must not move");
+        let diff2 = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert_eq!(diff2.set_node_fields.len(), 0, "already-synced fields yield no diff");
+    }
+
+    #[test]
+    fn fields_only_overwrites_stale_fields_wholesale() {
+        let mut model = model_with_event_node();
+        model["nodes"][0]["fields"] = serde_json::json!([{ "name": "old", "type": "Bool" }]);
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let names: Vec<&str> = model["nodes"][0]["fields"]
+            .as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["orderId", "total"], "stale fields replaced, not merged");
+    }
+
+    #[test]
+    fn fields_only_empty_source_leaves_node_untouched() {
+        // A fieldless source extraction (parser miss or genuinely no fields)
+        // must not clear the node's existing fields.
+        let mut model = model_with_event_node();
+        model["nodes"][0]["fields"] = serde_json::json!([{ "name": "keep", "type": "Int" }]);
+        let insp = ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![DomainInspection {
+                name: "Orders".to_string(),
+                path: PathBuf::from("/Orders"),
+                events: vec![EventInfo {
+                    name: "OrderPlaced".to_string(),
+                    file: PathBuf::new(),
+                    fields: vec![],
+                }],
+                commands: vec![],
+                queries: vec![],
+                integrations: vec![],
+            }],
+        };
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert!(diff.set_node_fields.is_empty(), "empty source must not queue an overwrite");
+    }
+
+    #[test]
+    fn full_pass_materialises_new_node_with_fields() {
+        let mut model = empty_model();
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::full());
+        assert!(!diff.add_nodes.is_empty(), "full pass materialises nodes");
+        assert!(!diff.set_node_fields.is_empty(), "new field-bearing nodes get fields");
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let nodes = model["nodes"].as_array().unwrap();
+        let ev = nodes.iter().find(|n| n["name"] == "OrderPlaced").expect("OrderPlaced materialised");
+        let names: Vec<&str> = ev["fields"].as_array().expect("event has fields")
+            .iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["orderId", "total"]);
     }
 }

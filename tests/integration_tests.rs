@@ -881,6 +881,142 @@ fn test_neo_build_skip_lock_check_bypasses_check() {
 }
 
 // =====================================================================
+// `neo inspect sync` — code→model sync of event-model.json
+//
+// These need NO nix/network: the sync parses `.hs` text + reads/writes
+// event-model.json. So they run fast against a hand-written src/ tree.
+// =====================================================================
+
+/// Write a tiny Cart domain (one event with fields, one command) plus an EMPTY
+/// event-model.json, so the first `neo inspect sync` materialises + lays out the
+/// whole structure (the full-heal path).
+fn write_sync_fixture(root: &std::path::Path) {
+    let write = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(
+        "src/App/Cart/Core.hs",
+        "module App.Cart.Core where\n\
+         data CartEvent = ItemAdded { stockId :: Uuid, quantity :: Int } deriving (Generic)\n",
+    );
+    write(
+        "src/App/Cart/Commands/AddItem.hs",
+        "module App.Cart.Commands.AddItem where\n\
+         data AddItem = AddItem { stockId :: Uuid }\n\
+         decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+    );
+    let model = serde_json::json!({
+        "id": "m", "name": "demo", "chapters": [], "entities": [], "slices": [],
+        "nodes": [], "edges": [],
+        "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+    });
+    std::fs::write(
+        root.join("event-model.json"),
+        serde_json::to_string_pretty(&model).unwrap(),
+    )
+    .unwrap();
+}
+
+fn read_event_model(root: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(root.join("event-model.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn inspect_sync_updates_fields_from_source() {
+    let temp = tempfile::tempdir().unwrap();
+    write_sync_fixture(temp.path());
+
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] synced event-model.json"));
+
+    // The event + command were materialised and carry their source fields.
+    let model = read_event_model(temp.path());
+    let ev = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "ItemAdded").unwrap();
+    let ev_names: Vec<&str> = ev["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(ev_names, vec!["stockId", "quantity"], "event node fields synced from source");
+    let cmd = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "AddItem").expect("command materialised");
+    let cmd_names: Vec<&str> = cmd["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(cmd_names, vec!["stockId"], "command node fields synced from source");
+}
+
+#[test]
+fn inspect_sync_existing_node_field_edit_is_data_only() {
+    let temp = tempfile::tempdir().unwrap();
+    write_sync_fixture(temp.path());
+
+    // First sync materialises + lays out everything.
+    neo_cmd().args(["inspect", "sync"]).current_dir(temp.path()).assert().success();
+    let model = read_event_model(temp.path());
+    let ev_id = model["nodes"].as_array().unwrap().iter()
+        .find(|n| n["name"] == "ItemAdded").unwrap()["id"].as_str().unwrap().to_string();
+    let pos_before = model["layout"]["nodePositions"][&ev_id].clone();
+    assert!(pos_before.is_object(), "event node must be positioned after the first sync");
+
+    // Edit ONLY the existing event's fields in source (add `note :: Text`).
+    std::fs::write(
+        temp.path().join("src/App/Cart/Core.hs"),
+        "module App.Cart.Core where\n\
+         data CartEvent = ItemAdded { stockId :: Uuid, quantity :: Int, note :: Text } deriving (Generic)\n",
+    )
+    .unwrap();
+
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fields only"));
+
+    let model2 = read_event_model(temp.path());
+    let ev2 = model2["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "ItemAdded").unwrap();
+    let names: Vec<&str> = ev2["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["stockId", "quantity", "note"], "the new field synced");
+    assert_eq!(
+        model2["layout"]["nodePositions"][&ev_id], pos_before,
+        "editing fields of an EXISTING node must not move layout",
+    );
+}
+
+#[test]
+fn inspect_sync_idempotent_second_run() {
+    let temp = tempfile::tempdir().unwrap();
+    write_sync_fixture(temp.path());
+
+    neo_cmd().args(["inspect", "sync"]).current_dir(temp.path()).assert().success();
+    let after_first = std::fs::read_to_string(temp.path().join("event-model.json")).unwrap();
+
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already in sync"));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("event-model.json")).unwrap(),
+        after_first,
+        "second sync must leave event-model.json byte-identical",
+    );
+}
+
+#[test]
+fn inspect_sync_missing_event_model_errors() {
+    // No event-model.json in the workspace → actionable failure, nonzero exit.
+    let temp = tempfile::tempdir().unwrap();
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("event-model.json"));
+}
+
+// =====================================================================
 // `neo ide` — JSON-RPC over WebSocket
 //
 // Each test:

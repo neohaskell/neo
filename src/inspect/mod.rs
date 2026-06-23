@@ -54,6 +54,17 @@ pub struct DomainInspection {
     pub integrations: Vec<IntegrationInfo>,
 }
 
+/// One record field of an event/command payload — `name :: Type` in source.
+/// Serialises as `{ "name": ..., "type": ... }` so it drops straight into the
+/// event-model schema's `Field` shape (the IDE renders these read-only; source
+/// is their author). Extraction is best-effort/"dumb" — see `parse.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecordField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventInfo {
@@ -61,6 +72,11 @@ pub struct EventInfo {
     pub name: String,
     /// File where the constructor was found — usually `Core.hs` or `Event.hs`.
     pub file: PathBuf,
+    /// Record fields of this event constructor's payload, in source order.
+    /// Empty when the constructor has no inline record (e.g. a payload-module
+    /// arm `Foo Bar.Event`) or the dumb parser couldn't extract them.
+    #[serde(default)]
+    pub fields: Vec<RecordField>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +91,11 @@ pub struct CommandInfo {
     /// `true` if the command file has a `TransportsOf <Cmd> = '[WebTransport ...]`
     /// declaration — i.e. it can be invoked over HTTP.
     pub via_web_transport: bool,
+    /// Record fields of the command's payload (`data <Cmd> = <Cmd> { … }`), in
+    /// source order. Empty when there's no inline record or the dumb parser
+    /// couldn't extract them.
+    #[serde(default)]
+    pub fields: Vec<RecordField>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

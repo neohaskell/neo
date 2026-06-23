@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-use super::{CommandInfo, EventInfo, IntegrationInfo, IntegrationKind, QueryInfo};
+use super::{CommandInfo, EventInfo, IntegrationInfo, IntegrationKind, QueryInfo, RecordField};
 
 /// Parse `<dir>/Core.hs` and `<dir>/Event.hs` (whichever exists) for the
 /// event sum constructors. Returns them in source order so the heal
@@ -44,12 +44,15 @@ pub fn events_in_domain(dir: &Path) -> Vec<EventInfo> {
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
         };
+        let ctor_fields = extract_event_constructor_fields(&body);
         for name in extract_event_constructors(&body) {
             // Dedup across Core.hs + Event.hs without disturbing source order.
             if !out.iter().any(|e: &EventInfo| e.name == name) {
+                let fields = ctor_fields.get(&name).cloned().unwrap_or_default();
                 out.push(EventInfo {
                     name,
                     file: path.clone(),
+                    fields,
                 });
             }
         }
@@ -89,9 +92,16 @@ pub fn events_in_domain(dir: &Path) -> Vec<EventInfo> {
                 continue;
             }
             if !out.iter().any(|e| e.name == stem) {
+                // One-event-per-file layout: pull the fields from the file's own
+                // `data Event = Event { … }` declaration.
+                let fields = std::fs::read_to_string(&path)
+                    .ok()
+                    .map(|b| first_data_record_fields(&b))
+                    .unwrap_or_default();
                 out.push(EventInfo {
                     name: stem.to_string(),
                     file: path,
+                    fields,
                 });
             }
         }
@@ -308,11 +318,13 @@ fn parse_command_file(path: &Path, known_events: &[String]) -> Option<CommandInf
     let decide_body = extract_function_body(&body, "decide").unwrap_or_default();
     let produces = filter_present(&decide_body, known_events);
     let via_web_transport = body.contains("WebTransport");
+    let fields = data_type_record_fields(&body, &name);
     Some(CommandInfo {
         name,
         file: path.to_path_buf(),
         produces,
         via_web_transport,
+        fields,
     })
 }
 
@@ -920,6 +932,187 @@ fn extract_emitted_commands(src: &str, known_commands: &[String]) -> Vec<String>
     out
 }
 
+// ---------------------------------------------------------------------------
+// Record-field extraction (event/command payloads).
+//
+// Best-effort and intentionally "dumb" — robustness is future work. The
+// guarantees we DO hold: never panic, and on any uncertainty return EMPTY
+// fields rather than wrong ones (an incomplete read is safe; a wrong read is
+// not). Source-declaration order is preserved so output is deterministic.
+//
+// Known limitations (documented, tested where it matters):
+//   * Only INLINE records `{ f :: T, … }` are parsed. Payload-module arms
+//     (`Foo Bar.Event`) yield empty fields (the payload module isn't read).
+//   * Shared-type fields (`a, b :: T`) capture only `b` (the comma splits them).
+//   * `deriving (…)` and `-- line comments` are excluded.
+//   * Type strings are kept verbatim (`Maybe Text`, `(Int, Text)`), no resolution.
+// ---------------------------------------------------------------------------
+
+/// Map each event-sum constructor to the record fields of its inline payload.
+/// Mirrors `extract_event_constructors` (same block regex + `|` split) so the
+/// constructor keys line up exactly with the events we materialise.
+fn extract_event_constructor_fields(src: &str) -> BTreeMap<String, Vec<RecordField>> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(?m)^data\s+([A-Z]\w*Event)\b[^=]*=([\s\S]*?)(?:\n\S|\z)").unwrap()
+    });
+    let mut out: BTreeMap<String, Vec<RecordField>> = BTreeMap::new();
+    let Some(cap) = re.captures(src) else {
+        return out;
+    };
+    let block = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+    for raw in block.split('|') {
+        let cleaned = raw.trim_start();
+        let cleaned = cleaned.trim_start_matches(|c: char| c == '|' || c.is_whitespace());
+        let ident: String = cleaned
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let Some(first) = ident.chars().next() else {
+            continue;
+        };
+        if !first.is_ascii_uppercase() {
+            continue;
+        }
+        // The arm text after the constructor name; its first `{…}` (if any) is
+        // the inline record payload.
+        let fields = brace_body(cleaned)
+            .map(|b| parse_record_fields(&b))
+            .unwrap_or_default();
+        out.entry(ident).or_insert(fields);
+    }
+    out
+}
+
+/// Record fields of the `data <type_name> = <type_name> { … }` declaration in
+/// `src`. The `=` vs `::` distinction inside `parse_field_decl` means a record
+/// *update* (`X { f = v }`) in a `decide`/`handleEvent` body contributes no
+/// fields even if `brace_body` reaches it — so a fieldless command stays empty.
+fn data_type_record_fields(src: &str, type_name: &str) -> Vec<RecordField> {
+    let needle = format!("data {type_name}");
+    let mut search = 0;
+    while let Some(rel) = src[search..].find(&needle) {
+        let abs = search + rel;
+        let after = abs + needle.len();
+        let boundary_ok = src[after..]
+            .chars()
+            .next()
+            .map(|c| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(true);
+        if boundary_ok {
+            return brace_body(&src[abs..])
+                .map(|b| parse_record_fields(&b))
+                .unwrap_or_default();
+        }
+        search = after;
+    }
+    Vec::new()
+}
+
+/// Record fields of the FIRST `data <Type>` declaration in `src` (one-event-
+/// per-file layout, where the type is usually `Event`). Anchored at a line
+/// start so `Metadata`-style substrings don't false-match.
+fn first_data_record_fields(src: &str) -> Vec<RecordField> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?m)^\s*data\s+[A-Z]\w*\b").unwrap());
+    let Some(m) = re.find(src) else {
+        return Vec::new();
+    };
+    brace_body(&src[m.start()..])
+        .map(|b| parse_record_fields(&b))
+        .unwrap_or_default()
+}
+
+/// Inner text of the FIRST brace-balanced `{ … }` in `src` (excluding the outer
+/// braces). `None` if there's no `{`. Brace depth is tracked so nested records
+/// don't terminate early. Operates on byte offsets at ASCII `{`/`}` boundaries,
+/// which is safe regardless of multibyte content in between.
+fn brace_body(src: &str) -> Option<String> {
+    let start = src.find('{')?;
+    let bytes = src.as_bytes();
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(src[start + 1..i].to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Split a record body on TOP-LEVEL commas (depth 0), so commas inside tuple /
+/// list / nested-record types (`(Int, Text)`, `[a]`) don't split a field.
+fn split_top_level_commas(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for c in inner.chars() {
+        match c {
+            '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            ',' if depth == 0 => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Parse every `name :: Type` field from a record body, in source order.
+fn parse_record_fields(inner: &str) -> Vec<RecordField> {
+    split_top_level_commas(inner)
+        .iter()
+        .filter_map(|p| parse_field_decl(p))
+        .collect()
+}
+
+/// Parse one `name :: Type` field declaration. Returns `None` for anything that
+/// isn't a single lowercase-led field name bound by `::` (e.g. a record-update
+/// `f = v`, a blank piece, or a multi-name `a, b` remnant).
+fn parse_field_decl(piece: &str) -> Option<RecordField> {
+    // Drop a trailing line comment.
+    let piece = piece.split("--").next().unwrap_or(piece);
+    let (name, ty) = piece.split_once("::")?;
+    let name = name.trim();
+    let type_name = collapse_ws(ty.trim());
+    if name.is_empty() || type_name.is_empty() {
+        return None;
+    }
+    let first = name.chars().next()?;
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return None;
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '\'') {
+        return None;
+    }
+    Some(RecordField {
+        name: name.to_string(),
+        type_name,
+    })
+}
+
+/// Collapse internal whitespace runs (incl. newlines) to single spaces so a
+/// type spread across lines reads as one token.
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1267,5 +1460,157 @@ data CartEvent
         std::fs::write(root.join("Events/ThingHappened.hs"), "module X where\ndata Event = Event {}\n").unwrap();
         let events: Vec<String> = events_in_domain(root).into_iter().map(|e| e.name).collect();
         assert_eq!(events, vec!["ThingHappened".to_string()]);
+    }
+
+    // --- record-field extraction -----------------------------------------
+
+    fn rf(name: &str, ty: &str) -> RecordField {
+        RecordField {
+            name: name.to_string(),
+            type_name: ty.to_string(),
+        }
+    }
+
+    #[test]
+    fn parse_record_fields_single() {
+        assert_eq!(parse_record_fields("entityId :: Uuid"), vec![rf("entityId", "Uuid")]);
+    }
+
+    #[test]
+    fn parse_record_fields_multiple_in_source_order() {
+        assert_eq!(
+            parse_record_fields("cartId :: Uuid, stockId :: Uuid, quantity :: Int"),
+            vec![rf("cartId", "Uuid"), rf("stockId", "Uuid"), rf("quantity", "Int")],
+        );
+    }
+
+    #[test]
+    fn parse_record_fields_multiline_and_leading_comma() {
+        let inner = "\n    ownerId :: Text\n  , itemCount :: Int\n  ";
+        assert_eq!(
+            parse_record_fields(inner),
+            vec![rf("ownerId", "Text"), rf("itemCount", "Int")],
+        );
+    }
+
+    #[test]
+    fn parse_record_fields_qualified_and_applied_types_kept_verbatim() {
+        assert_eq!(
+            parse_record_fields("a :: Maybe Text, b :: Map Text Int, c :: Payload.Thing"),
+            vec![rf("a", "Maybe Text"), rf("b", "Map Text Int"), rf("c", "Payload.Thing")],
+        );
+    }
+
+    #[test]
+    fn parse_record_fields_tuple_type_not_split_on_inner_comma() {
+        assert_eq!(parse_record_fields("pair :: (Int, Text)"), vec![rf("pair", "(Int, Text)")]);
+    }
+
+    #[test]
+    fn parse_record_fields_strips_trailing_line_comment() {
+        assert_eq!(parse_record_fields("a :: Int -- the count"), vec![rf("a", "Int")]);
+    }
+
+    #[test]
+    fn parse_record_fields_ignores_record_update_equals() {
+        // A record UPDATE uses `=`, not `::`, so it contributes no fields —
+        // this is what keeps a fieldless command from absorbing its `decide`
+        // body's record updates.
+        assert!(parse_record_fields("entityId = cart.cartId, quantity = cmd.quantity").is_empty());
+    }
+
+    #[test]
+    fn parse_field_decl_rejects_non_fields() {
+        assert!(parse_field_decl("not a field").is_none());
+        assert!(parse_field_decl("Uppercase :: Int").is_none());
+        assert!(parse_field_decl("   ").is_none());
+        assert!(parse_field_decl("x ::").is_none());
+    }
+
+    #[test]
+    fn brace_body_balances_nested_braces() {
+        assert_eq!(
+            brace_body("X { a :: Rec { y :: Int } }").as_deref(),
+            Some(" a :: Rec { y :: Int } "),
+        );
+        assert!(brace_body("no braces here").is_none());
+    }
+
+    #[test]
+    fn data_type_record_fields_extracts_command_payload_only() {
+        // The `decide` body builds a record by UPDATE (`=`) — those must not
+        // leak into the command's own declared fields.
+        let src = "module M where\n\
+                   data AddItem = AddItem { cartId :: Uuid, quantity :: Int }\n\
+                   decide cmd _ _ = Decider.acceptExisting [ItemAdded { entityId = cmd.cartId }]\n";
+        assert_eq!(
+            data_type_record_fields(src, "AddItem"),
+            vec![rf("cartId", "Uuid"), rf("quantity", "Int")],
+        );
+    }
+
+    #[test]
+    fn data_type_record_fields_empty_for_recordless_and_excludes_deriving() {
+        assert!(data_type_record_fields("data Ping = Ping\n", "Ping").is_empty());
+        assert_eq!(
+            data_type_record_fields("data Foo = Foo { x :: Int } deriving (Show, Eq)\n", "Foo"),
+            vec![rf("x", "Int")],
+        );
+    }
+
+    #[test]
+    fn extract_event_constructor_fields_per_constructor() {
+        let src = "data CartEvent\n  \
+                     = CartCreated { entityId :: Uuid, ownerId :: Text }\n  \
+                     | ItemAdded { entityId :: Uuid, quantity :: Int }\n  \
+                     deriving (Generic)\n";
+        let map = extract_event_constructor_fields(src);
+        assert_eq!(
+            map.get("CartCreated").unwrap(),
+            &vec![rf("entityId", "Uuid"), rf("ownerId", "Text")],
+        );
+        assert_eq!(
+            map.get("ItemAdded").unwrap(),
+            &vec![rf("entityId", "Uuid"), rf("quantity", "Int")],
+        );
+    }
+
+    #[test]
+    fn extract_event_constructor_fields_empty_for_payload_module_arm() {
+        let src = "data ProposalEvent\n  \
+                     = ProposalPdfUploaded PdfUploaded.Event\n  \
+                     | EvaluationTriggered EvaluationTriggered.Event\n  \
+                     deriving (Generic)\n";
+        let map = extract_event_constructor_fields(src);
+        assert!(map.get("ProposalPdfUploaded").unwrap().is_empty());
+    }
+
+    #[test]
+    fn extract_event_constructor_fields_deterministic_under_reparse() {
+        let src = "data E = A { x :: Int, y :: Text } | B { z :: Bool }\n  deriving (Generic)\n";
+        assert_eq!(
+            extract_event_constructor_fields(src),
+            extract_event_constructor_fields(src),
+        );
+    }
+
+    #[test]
+    fn events_in_domain_attaches_inline_record_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Core.hs"),
+            "module App.Cart.Core where\n\
+             data CartEvent\n  \
+               = CartCreated { entityId :: Uuid, ownerId :: Text }\n  \
+               | ItemAdded { quantity :: Int }\n  \
+               deriving (Generic)\n",
+        )
+        .unwrap();
+        let events = events_in_domain(root);
+        let created = events.iter().find(|e| e.name == "CartCreated").unwrap();
+        assert_eq!(created.fields, vec![rf("entityId", "Uuid"), rf("ownerId", "Text")]);
+        let added = events.iter().find(|e| e.name == "ItemAdded").unwrap();
+        assert_eq!(added.fields, vec![rf("quantity", "Int")]);
     }
 }

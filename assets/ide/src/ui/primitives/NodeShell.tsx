@@ -2,7 +2,6 @@ import type { ReactNode } from 'react'
 import { useStore } from '@xyflow/react'
 import { EditableLabel } from '../nodes/EditableLabel'
 import { NodeHandles } from '../nodes/NodeHandles'
-import { FieldsEditor } from '../schema/FieldsEditor'
 import { FIELD_CAP } from '../nodes/nodeDimensions'
 import { nodeDetailLevel } from '../canvas/semanticZoom'
 import type { Field } from '../../model/types'
@@ -22,19 +21,19 @@ interface NodeShellProps {
   onRename?: (name: string) => void
   /** Leading glyph (e.g. the integration gear). */
   icon?: ReactNode
-  /** Schema fields — rendered inline in the body (read-only). */
+  /** Schema fields — rendered inline in the body (always read-only). */
   fields?: readonly Field[]
-  onFieldsChange?: (fields: Field[]) => void
 }
 
 /**
  * The shared record-card chrome for the five domain node types. Two zones: a
  * colored HEADER carrying the type name (the event-modeling identity color,
  * darkened for AA — see --node-header-* in src/theme.ts) and a neutral BODY
- * listing the data type's `fields` inline. Fields render ALWAYS (read-only),
- * swapping to the editable FieldsEditor only when the node is selected and an
- * edit callback is wired. Single source of the node palette, selection ring,
- * dimensions, and the mandatory 4-side source+target handle set (see
+ * listing the data type's `fields` inline. Fields are STRICTLY READ-ONLY in the
+ * IDE — source code is the author of schema (a Rust background sync rewrites
+ * `event-model.json`); the canvas only displays the `name : Type` ledger and
+ * never mounts an inline editor. Single source of the node palette, selection
+ * ring, dimensions, and the mandatory 4-side source+target handle set (see
  * NodeHandles — React Flow drops edges whose handle id is absent, so every node
  * MUST carry the full set). Per-variant color lives in NodeShell.module.css via
  * theme tokens; nothing is styled in-place here.
@@ -46,12 +45,8 @@ export function NodeShell({
   onRename,
   icon,
   fields,
-  onFieldsChange,
 }: NodeShellProps) {
   const rows = fields ?? []
-  // Editing is opt-in: only when the node is selected AND an edit callback is
-  // wired. Otherwise the body is a read-only `name : Type` ledger.
-  const editable = !!selected && !!onFieldsChange
   // Level-of-detail: far-zoomed-out nodes collapse to their header only so the
   // whole board reads as a wall of type headers (the causal flow). Re-renders
   // only when the level CHANGES (selector returns a stable string), not on pan.
@@ -71,9 +66,7 @@ export function NodeShell({
       </div>
       {detail !== 'header' && (
       <div className={classes.body}>
-        {editable ? (
-          <FieldsEditor fields={rows} onChange={onFieldsChange} />
-        ) : rows.length > 0 ? (
+        {rows.length > 0 ? (
           <div className={classes.fields}>
             {rows.slice(0, FIELD_CAP).map((f, i) => (
               <div className={classes.fieldRow} key={i}>

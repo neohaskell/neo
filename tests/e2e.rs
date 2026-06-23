@@ -39,6 +39,53 @@ fn surface_version() {
 
 #[test]
 #[ignore]
+fn e2e_inspect_sync_force_from_cli() {
+    // The shipped binary must sync node fields from source into
+    // event-model.json. No nix/cabal build is needed — the sync only parses
+    // `.hs` text + reads/writes JSON — so this is a fast CLI-surface scenario.
+    let sb = Sandbox::new("e2e_inspect_sync_force_from_cli");
+    let proj = sb.path("proj");
+    let write = |rel: &str, body: &str| {
+        let p = proj.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(
+        "src/App/Cart/Core.hs",
+        "module App.Cart.Core where\n\
+         data CartEvent = ItemAdded { stockId :: Uuid, quantity :: Int } deriving (Generic)\n",
+    );
+    write(
+        "src/App/Cart/Commands/AddItem.hs",
+        "module App.Cart.Commands.AddItem where\n\
+         data AddItem = AddItem { stockId :: Uuid }\n\
+         decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+    );
+    write(
+        "event-model.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "id": "m", "name": "demo", "chapters": [], "entities": [], "slices": [],
+            "nodes": [], "edges": [],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        }))
+        .unwrap(),
+    );
+
+    sb.neo("proj")
+        .args(["inspect", "sync"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] synced event-model.json"));
+
+    let model: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(proj.join("event-model.json")).unwrap()).unwrap();
+    let ev = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "ItemAdded").expect("ItemAdded node");
+    let names: Vec<&str> = ev["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["stockId", "quantity"], "shipped binary syncs fields from source");
+}
+
+#[test]
+#[ignore]
 fn surface_help_lists_all_subcommands() {
     let sb = Sandbox::new("surface_help_lists_all_subcommands");
     sb.neo(".")

@@ -81,8 +81,6 @@ interface CanvasProps {
   onCreateNode?: (type: NodeType, place: CreatePlacement) => void
   /** Create the valid successor of a node + the typed edge (drag-to-empty / menu). */
   onCreateSuccessor?: (sourceId: string, targetType: NodeType, place: CreatePlacement) => void
-  /** Edit a node's schema fields (semantic zoom). */
-  onNodeFieldsChange?: (nodeId: string, fields: import('../model/types').Field[]) => void
   /** Structural adds from the pane menu (no position). */
   onAddEntity?: () => void
   onAddSlice?: () => void
@@ -260,7 +258,6 @@ export function Canvas({
   onAssignChapterToSubmodel,
   onCreateNode,
   onCreateSuccessor,
-  onNodeFieldsChange,
   onAddEntity,
   onAddSlice,
   onAddSliceToChapter,
@@ -390,11 +387,10 @@ export function Canvas({
       return toReactFlowNodes(model, onNodeRename, {
         positions: featurePositions,
         includeIds: featureMemberIds,
-        onFieldsChange: onNodeFieldsChange,
       })
     }
-    return toReactFlowNodes(model, onNodeRename, { onFieldsChange: onNodeFieldsChange })
-  }, [featureMode, featurePositions, featureMemberIds, model, onNodeRename, onNodeFieldsChange])
+    return toReactFlowNodes(model, onNodeRename)
+  }, [featureMode, featurePositions, featureMemberIds, model, onNodeRename])
 
   const entityNames = useMemo(
     () => new Map(model.entities.map((e) => [e.id, e.name])),

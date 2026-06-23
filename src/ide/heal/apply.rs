@@ -19,6 +19,7 @@ pub fn apply_diff(model: &mut Value, diff: &HealDiff) -> usize {
     applied += apply_remove_slices(model, diff);
     applied += apply_add_slices(model, diff);
     applied += apply_add_nodes(model, diff);
+    applied += apply_set_node_fields(model, diff);
     applied += apply_slice_updates(model, diff);
     applied += apply_kind_fixes(model, diff);
     applied += apply_position_fixes(model, diff);
@@ -235,6 +236,37 @@ fn apply_add_nodes(model: &mut Value, diff: &HealDiff) -> usize {
         }
         nodes.push(Value::Object(obj));
         applied += 1;
+    }
+    applied
+}
+
+/// Overwrite each targeted node's `fields` array from the parsed source. Runs
+/// AFTER `apply_add_nodes` so freshly-materialised nodes already exist. Pure
+/// data — touches only `node.fields`, never positions/slices/edges.
+fn apply_set_node_fields(model: &mut Value, diff: &HealDiff) -> usize {
+    if diff.set_node_fields.is_empty() {
+        return 0;
+    }
+    let Some(nodes) = model.get_mut("nodes").and_then(|v| v.as_array_mut()) else {
+        return 0;
+    };
+    let mut applied = 0;
+    for set in &diff.set_node_fields {
+        for node in nodes.iter_mut() {
+            if node.get("id").and_then(|v| v.as_str()) != Some(set.node_id.as_str()) {
+                continue;
+            }
+            if let Some(obj) = node.as_object_mut() {
+                let fields: Vec<Value> = set
+                    .fields
+                    .iter()
+                    .map(|f| json!({ "name": f.name, "type": f.type_name }))
+                    .collect();
+                obj.insert("fields".to_string(), Value::Array(fields));
+                applied += 1;
+            }
+            break;
+        }
     }
     applied
 }
@@ -464,12 +496,14 @@ mod tests {
                 events: vec![EventInfo {
                     name: "OrderPlaced".to_string(),
                     file: PathBuf::new(),
+                    fields: vec![],
                 }],
                 commands: vec![CommandInfo {
                     name: "PlaceOrder".to_string(),
                     file: PathBuf::new(),
                     produces: vec!["OrderPlaced".to_string()],
                     via_web_transport: false,
+                    fields: vec![],
                 }],
                 queries: vec![QueryInfo {
                     name: "OrderSummary".to_string(),
@@ -828,12 +862,14 @@ mod tests {
                 events: vec![EventInfo {
                     name: "OrderPlaced".to_string(),
                     file: PathBuf::new(),
+                    fields: vec![],
                 }],
                 commands: vec![CommandInfo {
                     name: "PlaceOrder".to_string(),
                     file: PathBuf::new(),
                     produces: vec!["OrderPlaced".to_string()],
                     via_web_transport: false,
+                    fields: vec![],
                 }],
                 queries: vec![],
                 integrations: vec![],

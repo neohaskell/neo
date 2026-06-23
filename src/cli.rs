@@ -103,6 +103,11 @@ pub enum InspectSubcommand {
     Integrations,
     /// Derived wiring: which command produces which event, which integration listens to it, etc.
     Wiring,
+    /// Force a code→model sync: refresh `event-model.json` from the project
+    /// source (record fields, plus new nodes/edges). Editing fields of existing
+    /// nodes is a data-only update with no layout change; a new node triggers a
+    /// full re-layout. The `neo ide` background watcher runs the same sync.
+    Sync,
 }
 
 #[derive(clap::Args)]
@@ -204,6 +209,15 @@ mod tests {
         match cli.command {
             Some(Commands::Test { watch }) => assert!(!watch),
             _ => panic!("Expected Test command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_inspect_sync() {
+        let cli = Cli::try_parse_from(["neo", "inspect", "sync"]).unwrap();
+        match cli.command {
+            Some(Commands::Inspect { subcommand: Some(InspectSubcommand::Sync) }) => {}
+            other => panic!("Expected Inspect Sync, got {:?}", other.is_some()),
         }
     }
 

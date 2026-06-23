@@ -14,7 +14,6 @@ const EMPTY_FIELDS: readonly Field[] = []
 function nodeData(
   node: ModelNode,
   onRename?: (nodeId: string, name: string) => void,
-  onFieldsChange?: (nodeId: string, fields: Field[]) => void,
 ): Record<string, unknown> {
   const data: Record<string, unknown> = { label: node.name, fields: node.fields ?? EMPTY_FIELDS }
   if (node.type === 'integration') {
@@ -22,9 +21,6 @@ function nodeData(
   }
   if (onRename) {
     data.onRename = (name: string) => onRename(node.id, name)
-  }
-  if (onFieldsChange) {
-    data.onFieldsChange = (fields: Field[]) => onFieldsChange(node.id, fields)
   }
   return data
 }
@@ -34,8 +30,6 @@ export interface ToReactFlowNodeOptions {
   positions?: Map<string, { x: number; y: number }>
   /** Only emit nodes whose id is in this set (e.g. one feature's members). */
   includeIds?: Set<string>
-  /** Edit a node's schema fields (semantic zoom). */
-  onFieldsChange?: (nodeId: string, fields: Field[]) => void
 }
 
 export function toReactFlowNodes(
@@ -51,7 +45,7 @@ export function toReactFlowNodes(
     type: node.type,
     position:
       opts?.positions?.get(node.id) ?? model.layout.nodePositions[node.id] ?? { x: 0, y: 0 },
-    data: nodeData(node, onRename, opts?.onFieldsChange),
+    data: nodeData(node, onRename),
   }))
 }
 

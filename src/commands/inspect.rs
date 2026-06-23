@@ -25,6 +25,12 @@ pub fn run(sub: Option<InspectSubcommand>) -> miette::Result<()> {
             e,
         )
     })?;
+    // `sync` is an ACTION, not a JSON view — it mutates event-model.json and
+    // reports status, so it short-circuits before the view dispatch below.
+    if matches!(sub, Some(InspectSubcommand::Sync)) {
+        return run_sync(&cwd);
+    }
+
     let project = inspect_project(&cwd);
 
     let value = match sub {
@@ -35,6 +41,8 @@ pub fn run(sub: Option<InspectSubcommand>) -> miette::Result<()> {
         Some(InspectSubcommand::Queries) => queries_view(&project),
         Some(InspectSubcommand::Integrations) => integrations_view(&project),
         Some(InspectSubcommand::Wiring) => wiring_view(&project),
+        // Handled above (short-circuit). Listed so the match stays exhaustive.
+        Some(InspectSubcommand::Sync) => unreachable!("inspect sync handled before view dispatch"),
     };
 
     let s = serde_json::to_string_pretty(&value).map_err(|e| {
@@ -44,6 +52,28 @@ pub fn run(sub: Option<InspectSubcommand>) -> miette::Result<()> {
         }
     })?;
     println!("{s}");
+    Ok(())
+}
+
+/// `neo inspect sync` — force a code→model sync of `event-model.json` and print
+/// status. Delegates to the shared `crate::ide::sync` engine that the `neo ide`
+/// background watcher also drives, so the CLI and IDE can never diverge.
+fn run_sync(cwd: &std::path::Path) -> miette::Result<()> {
+    println!("[info] syncing event-model.json from source");
+    let outcome = crate::ide::sync::sync_event_model(cwd)?;
+    if outcome.applied == 0 {
+        println!("[ok] event-model.json already in sync");
+    } else {
+        let mode = if outcome.ran_full_heal {
+            "structural + layout"
+        } else {
+            "fields only, no layout change"
+        };
+        println!(
+            "[ok] synced event-model.json — {} change(s) applied, {} node field-set(s) updated ({mode})",
+            outcome.applied, outcome.fields_updated,
+        );
+    }
     Ok(())
 }
 

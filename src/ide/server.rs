@@ -58,6 +58,10 @@ async fn connection_loop(socket: WebSocket, session: crate::ide::session::Sessio
         tokio::sync::mpsc::unbounded_channel::<crate::ide::session::OutboundMessage>();
     let session = session.with_outbound(outbound_tx.clone());
 
+    // Subscribe to the background source-watcher's model-changed broadcast so
+    // this client re-reads `event-model.json` after a code→model sync.
+    let mut model_changed_rx = state.model_changed_tx.subscribe();
+
     loop {
         tokio::select! {
             biased;
@@ -121,6 +125,23 @@ async fn connection_loop(socket: WebSocket, session: crate::ide::session::Sessio
                     }
                 });
             }
+
+            // The source watcher re-synced event-model.json — tell the client
+            // to re-read. `session.notify` queues onto `outbound_tx`, which the
+            // top (biased) arm drains on the next poll.
+            changed = model_changed_rx.recv() => {
+                use tokio::sync::broadcast::error::RecvError;
+                match changed {
+                    Ok(()) | Err(RecvError::Lagged(_)) => {
+                        session.notify(
+                            "$/eventModelChanged",
+                            serde_json::json!({ "reason": "source files changed" }),
+                        );
+                    }
+                    // Sender dropped (server shutting down) — stop this connection.
+                    Err(RecvError::Closed) => break,
+                }
+            }
         }
     }
 }
@@ -181,7 +202,8 @@ mod tests {
         let transport = LocalTransport::new(ws);
         let session = transport.accept().unwrap();
         let registry = register_all(MethodRegistry::new());
-        let state = AppState { registry, transport: Arc::new(transport) };
+        let (model_changed_tx, _) = tokio::sync::broadcast::channel(16);
+        let state = AppState { registry, transport: Arc::new(transport), model_changed_tx };
         (state, session)
     }
 
@@ -222,5 +244,26 @@ mod tests {
         let frame = r#"{"jsonrpc":"2.0","method":"$/someEventClientSentUs"}"#;
         let resp = handle_text_frame(frame, &session, &state).await;
         assert!(resp.is_none(), "notifications do not get responses: {resp:?}");
+    }
+
+    #[tokio::test]
+    async fn model_changed_emits_event_model_changed_notification() {
+        // The connection loop forwards a model-changed broadcast by calling
+        // `session.notify("$/eventModelChanged", …)`. Pin the exact method
+        // string the frontend's reload handler subscribes to.
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::ide::session::OutboundMessage>();
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::from_root(dir.path()).unwrap();
+        let session = Session::new(Arc::new(ws)).with_outbound(tx);
+
+        session.notify("$/eventModelChanged", serde_json::json!({ "reason": "source files changed" }));
+
+        match rx.recv().await.expect("notification queued") {
+            crate::ide::session::OutboundMessage::Notification(n) => {
+                assert_eq!(n.method, "$/eventModelChanged");
+            }
+            other => panic!("expected a notification, got {other:?}"),
+        }
     }
 }
