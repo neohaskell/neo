@@ -74,6 +74,15 @@ pub struct HealDiff {
     /// minted. `apply_remove_edges` double-gates on the `edge-heal-` prefix
     /// so a user-drawn edge is never removed even if field-overlap disagrees.
     pub remove_edges: Vec<EdgeRef>,
+    /// Heal-created slices (`slice-heal-` prefix) to remove because no node
+    /// references them any more. A prior heal can leave a named slice behind
+    /// when its node ends up homed in a different slice (e.g. an integration
+    /// materialised into its triggering command's slice) — the orphan slice
+    /// then renders as an empty column and the wave pass mints a dead chapter
+    /// for it. `apply_remove_slices` double-gates on the `slice-heal-` prefix
+    /// so a user-authored slice is never removed even if it is momentarily
+    /// empty.
+    pub remove_slices: Vec<String>,
     /// Existing slices whose `chapterId` / `order` need updating to group
     /// them into their entity's chapter.
     pub update_slices: Vec<SliceUpdate>,
@@ -87,6 +96,13 @@ pub struct HealDiff {
     /// Unresolved issues — things the diff identified but cannot fix
     /// deterministically. The LLM (or the user) needs to resolve these.
     pub residuals: Vec<Residual>,
+    /// Existing (or freshly-materialised) command/event nodes whose `fields`
+    /// array is (re)written from the parsed Haskell source. Pure DATA: applied
+    /// without any layout movement. Source is authoritative — fields are
+    /// overwritten wholesale, never merged. Only queued when the source yields
+    /// a NON-EMPTY field list that differs from the node's current fields, so a
+    /// parser miss (empty extraction) never clobbers what's already displayed.
+    pub set_node_fields: Vec<NodeFieldsSet>,
 }
 
 impl HealDiff {
@@ -99,20 +115,23 @@ impl HealDiff {
             + self.add_nodes.len()
             + self.add_edges.len()
             + self.remove_edges.len()
+            + self.remove_slices.len()
             + self.update_slices.len()
             + self.fix_integration_kinds.len()
             + self.fix_positions.len()
             + self.ensure_layout_entries.len()
+            + self.set_node_fields.len()
     }
 
     /// Short, human-readable one-line summary for logs and the heal overlay.
     pub fn summary(&self) -> String {
         format!(
-            "{} chapters, {} chapters removed, {} entities, {} slices, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} residuals",
+            "{} chapters, {} chapters removed, {} entities, {} slices, {} slices removed, {} nodes, {} edges, {} edges removed, {} slice updates, {} kind fixes, {} position fixes, {} layout entries, {} field updates, {} residuals",
             self.add_chapters.len(),
             self.remove_chapters.len(),
             self.add_entities.len(),
             self.add_slices.len(),
+            self.remove_slices.len(),
             self.add_nodes.len(),
             self.add_edges.len(),
             self.remove_edges.len(),
@@ -120,6 +139,7 @@ impl HealDiff {
             self.fix_integration_kinds.len(),
             self.fix_positions.len(),
             self.ensure_layout_entries.len(),
+            self.set_node_fields.len(),
             self.residuals.len(),
         )
     }
@@ -246,6 +266,18 @@ pub struct LayoutEntry {
     pub y: f64,
 }
 
+/// A node whose `fields` array should be (re)written from parsed source. The
+/// `fields` reuse `crate::inspect::RecordField`, which serialises to the
+/// event-model schema's `{ name, type }` shape — so `apply` writes them verbatim.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeFieldsSet {
+    pub node_id: String,
+    pub node_name: String,
+    pub fields: Vec<crate::inspect::RecordField>,
+    pub reason: String,
+}
+
 /// Something the deterministic pass noticed but cannot fix on its own.
 /// The LLM uses this as its much-shorter input prompt.
 #[derive(Debug, Clone, Serialize)]
@@ -261,14 +293,24 @@ pub enum Residual {
     },
 }
 
-/// Which phases of `compute_diff` to run. Default = both (the heal flow).
-/// `layout_only` skips materialisation/orphan/kind-fix and runs ONLY the
-/// layout passes — used by `workspace/relayoutEventModel` so the user can
-/// clean up a model's positions without touching its structure.
+/// Which phases of `compute_diff` to run. Default = all three (the heal flow).
+///
+/// The three phases are independent toggles:
+///   * `structural` — materialise entities/slices/nodes/edges + kind fixes + orphan detection.
+///   * `layout`     — y-band fixes, wave ordering, slice-column rebalance, layout entries.
+///   * `fields`     — reconcile each existing/new command/event node's `fields`
+///     from the parsed source (data-only; never moves anything on the canvas).
+///
+/// `layout_only` (used by `workspace/relayoutEventModel`) runs ONLY layout —
+/// `fields` is OFF so a "clean up positions" pass never rewrites field content.
+/// `fields_only` (used by the code→model sync when no new node appeared) runs
+/// ONLY the field reconcile — zero structural materialisation, zero layout
+/// movement: exactly the "edit fields of an EXISTING node" data sync.
 #[derive(Debug, Clone, Copy)]
 pub struct ComputeOptions {
     pub structural: bool,
     pub layout: bool,
+    pub fields: bool,
 }
 
 impl Default for ComputeOptions {
@@ -279,13 +321,21 @@ impl Default for ComputeOptions {
 
 impl ComputeOptions {
     pub const fn full() -> Self {
-        Self { structural: true, layout: true }
+        Self { structural: true, layout: true, fields: true }
     }
     pub const fn layout_only() -> Self {
-        Self { structural: false, layout: true }
+        Self { structural: false, layout: true, fields: false }
     }
     pub const fn structural_only() -> Self {
-        Self { structural: true, layout: false }
+        Self { structural: true, layout: false, fields: true }
+    }
+    /// Pure field reconcile — no structural materialisation, no layout. The
+    /// sync engine prefers `structural_only` (a superset: also syncs new
+    /// edges/kind fixes on existing nodes without layout), so this primitive is
+    /// exercised only by the unit tests that isolate the `fields` phase.
+    #[allow(dead_code)]
+    pub const fn fields_only() -> Self {
+        Self { structural: false, layout: false, fields: true }
     }
 }
 
@@ -533,6 +583,17 @@ pub fn compute_diff_with_options(
         }
     }
 
+    // --- 3.5. Reconcile node fields from source (data-only) ------------
+    //
+    // Runs whenever `opts.fields` is set — independent of structural/layout —
+    // so the code→model sync can refresh fields with ZERO layout movement.
+    // Covers both EXISTING model nodes and the nodes just queued in
+    // `diff.add_nodes` (apply runs `apply_set_node_fields` after the node is
+    // materialised). Source is authoritative; fields are overwritten wholesale.
+    if opts.fields {
+        reconcile_node_fields(model, inspection, &mut diff);
+    }
+
     if !opts.layout {
         return diff;
     }
@@ -637,6 +698,100 @@ pub fn compute_diff_with_options(
     diff
 }
 
+/// Reconcile each command/event node's `fields` against the parsed source
+/// (gated by `ComputeOptions::fields`). Queues a `set_node_fields` overwrite
+/// when the source yields a NON-EMPTY field list that differs from the node's
+/// current fields — both for existing model nodes and for nodes just queued in
+/// `diff.add_nodes`. An empty source extraction is treated as "no information"
+/// and never clears existing fields, so a dumb-parser miss can't erase what's
+/// already displayed. Source is authoritative: fields are overwritten wholesale,
+/// never merged, which keeps the sync idempotent (a second run finds no diff).
+fn reconcile_node_fields(model: &Value, inspection: &ProjectInspection, diff: &mut HealDiff) {
+    use crate::inspect::RecordField;
+
+    // (type, name) → source fields, for the field-bearing node kinds only.
+    let mut source: BTreeMap<(&str, &str), &Vec<RecordField>> = BTreeMap::new();
+    for domain in &inspection.domains {
+        for c in &domain.commands {
+            if !c.fields.is_empty() {
+                source.insert(("command", c.name.as_str()), &c.fields);
+            }
+        }
+        for e in &domain.events {
+            if !e.fields.is_empty() {
+                source.insert(("event", e.name.as_str()), &e.fields);
+            }
+        }
+        for q in &domain.queries {
+            if !q.fields.is_empty() {
+                source.insert(("query", q.name.as_str()), &q.fields);
+            }
+        }
+    }
+    if source.is_empty() {
+        return;
+    }
+
+    let mut queued: Vec<NodeFieldsSet> = Vec::new();
+
+    // Existing model nodes whose fields drifted from source.
+    if let Some(arr) = model.get("nodes").and_then(|v| v.as_array()) {
+        for node in arr {
+            let (Some(id), Some(ty), Some(name)) = (
+                node.get("id").and_then(|v| v.as_str()),
+                node.get("type").and_then(|v| v.as_str()),
+                node.get("name").and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let Some(src_fields) = source.get(&(ty, name)) else {
+                continue;
+            };
+            if node_fields_of(node) != **src_fields {
+                queued.push(NodeFieldsSet {
+                    node_id: id.to_string(),
+                    node_name: name.to_string(),
+                    fields: (*src_fields).clone(),
+                    reason: format!("{ty} {name}: fields reconciled from source"),
+                });
+            }
+        }
+    }
+
+    // Freshly-materialised nodes (structural pass) aren't in `model` yet —
+    // match them against the queued `NodeToAdd`s. `apply_set_node_fields` runs
+    // after `apply_add_nodes`, so the node exists by the time fields are written.
+    for n in &diff.add_nodes {
+        if let Some(src_fields) = source.get(&(n.node_type.as_str(), n.name.as_str())) {
+            queued.push(NodeFieldsSet {
+                node_id: n.id.clone(),
+                node_name: n.name.clone(),
+                fields: (*src_fields).clone(),
+                reason: format!("{} {}: fields set from source", n.node_type, n.name),
+            });
+        }
+    }
+
+    diff.set_node_fields.extend(queued);
+}
+
+/// Parse a model node's current `fields` JSON array into `RecordField`s for
+/// equality comparison. A missing/absent `fields` reads as empty.
+fn node_fields_of(node: &Value) -> Vec<crate::inspect::RecordField> {
+    node.get("fields")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|f| {
+                    let name = f.get("name").and_then(|v| v.as_str())?.to_string();
+                    let type_name = f.get("type").and_then(|v| v.as_str())?.to_string();
+                    Some(crate::inspect::RecordField { name, type_name })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Order every slice left-to-right by the event-modeling WAVE and group
 /// heal-owned slices into one chapter per causal flow.
 ///
@@ -714,10 +869,18 @@ fn order_slices_by_wave(model: &Value, plan: &MaterializePlan, diff: &mut HealDi
                 id.clone()
             } else {
                 let id = synth_id("chapter", &root_name);
+                // Persist the SAME order the flow was ranked by, so a re-run
+                // reads it back and produces an empty diff (fixed point). New
+                // flows land after any user-ordered chapters.
+                let order = wave
+                    .flow_synth_order
+                    .get(&root_name)
+                    .copied()
+                    .unwrap_or(rank as f64);
                 diff.add_chapters.push(ChapterToAdd {
                     id: id.clone(),
                     name: root_name.clone(),
-                    order: rank as f64,
+                    order,
                     reason: format!("chapter for causal flow starting at {root_name}"),
                 });
                 resolved_chapter.insert(root_name.clone(), id.clone());
@@ -769,6 +932,22 @@ fn order_slices_by_wave(model: &Value, plan: &MaterializePlan, diff: &mut HealDi
         });
     }
 
+    // Remove heal-created slices that hold no node — orphans a prior heal left
+    // behind when the node ended up homed in a different slice. They are
+    // excluded from `wave.slice_order` above (so they got no order/chapter),
+    // and dropping them lets the chapter cleanup below reclaim their dedicated
+    // chapter. Only `slice-heal-` ids are removed; a user-authored empty slice
+    // is left alone.
+    let slices_with_nodes: BTreeSet<String> = plan
+        .iter_all_nodes()
+        .filter_map(|n| n.slice_id.clone())
+        .collect();
+    for sid in model_slice_chapter.keys() {
+        if sid.starts_with("slice-heal-") && !slices_with_nodes.contains(sid) {
+            diff.remove_slices.push(sid.clone());
+        }
+    }
+
     // Remove heal-created chapters no longer referenced by any slice.
     let mut live: BTreeSet<String> = BTreeSet::new();
     for ch in final_chapter.values().filter_map(|o| o.as_ref()) {
@@ -790,6 +969,12 @@ struct WaveOrder {
     /// connected component of the slice-precedence graph; the root is the
     /// flow's initializer (or, lacking one, its left-most slice).
     slice_flow: BTreeMap<String, (String, usize)>,
+    /// flow root slice name -> the `order` value to persist when SYNTHESIZING a
+    /// brand-new chapter for that flow. Equals the `eff_order` the flow was
+    /// ranked by, so the synthesized chapter's stored order matches the value
+    /// that produced its column — making a re-run a fixed point. (User-set
+    /// chapter orders are never overwritten; see `order_slices_by_wave`.)
+    flow_synth_order: BTreeMap<String, f64>,
 }
 
 /// `(name, id)` total-order key for a slice — the single source of
@@ -870,7 +1055,17 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
             .entry(s.id.clone())
             .or_insert_with(|| s.name.clone());
     }
-    let all_slices: BTreeSet<String> = slice_name.keys().cloned().collect();
+    // Only rank slices that actually hold a node. A nodeless slice has no
+    // edges, so it would form its own weakly-connected component and the wave
+    // pass would mint a dedicated chapter for an empty column. `order_slices_
+    // by_wave` removes such heal-owned orphans instead; user-authored empty
+    // slices are simply left untouched (no order/chapter churn).
+    let slices_with_nodes: BTreeSet<String> = node_slice.values().cloned().collect();
+    let all_slices: BTreeSet<String> = slice_name
+        .keys()
+        .filter(|s| slices_with_nodes.contains(*s))
+        .cloned()
+        .collect();
 
     // 2. slice-precedence arcs + the integration-triggered command set.
     let mut succ: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
@@ -990,12 +1185,55 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
         comp_members.entry(r).or_default().push(s.clone());
     }
 
+    // `chapter.order` is the user-authoritative axis for horizontal flow
+    // ordering. Build chapter-order lookups (by id + by name) and each slice's
+    // chapterId from the model. The wave pass only READS these — it NEVER
+    // rewrites an existing chapter's order (see `order_slices_by_wave`) — so a
+    // manual drag-reorder in the Chapters panel resequences the timeline and
+    // survives "Tidy by flow" / heal.
+    let mut chapter_order_by_id: BTreeMap<String, f64> = BTreeMap::new();
+    let mut chapter_order_by_name: BTreeMap<String, f64> = BTreeMap::new();
+    if let Some(arr) = model.get("chapters").and_then(|v| v.as_array()) {
+        for c in arr {
+            let order = c.get("order").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if let Some(id) = c.get("id").and_then(|v| v.as_str()) {
+                chapter_order_by_id.insert(id.to_string(), order);
+            }
+            if let Some(name) = c.get("name").and_then(|v| v.as_str()) {
+                chapter_order_by_name.insert(name.to_string(), order);
+            }
+        }
+    }
+    let mut slice_chapter: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
+        for s in arr {
+            if let (Some(id), Some(ch)) = (
+                s.get("id").and_then(|v| v.as_str()),
+                s.get("chapterId")
+                    .and_then(|v| if v.is_null() { None } else { v.as_str() }),
+            ) {
+                slice_chapter.insert(id.to_string(), ch.to_string());
+            }
+        }
+    }
+    let max_existing_order = chapter_order_by_id
+        .values()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+
     // Component root (initializer-first, then smallest (layer, name_key)) +
-    // min layer, then rank components by (min_layer, name_key(root)).
+    // min layer + the flow's effective chapter order. Components (flows) are
+    // ranked by `(eff_order, min_layer, name_key(root))`: chapter order first,
+    // the original deterministic wave tiebreak second.
     struct Comp {
         members: Vec<String>,
         root: String,
         min_layer: usize,
+        /// The flow's existing chapter order, if it already has one (via a
+        /// member slice's chapterId, else the chapter named after the root).
+        /// `None` for a brand-new flow — assigned a trailing order below.
+        existing_order: Option<f64>,
+        eff_order: f64,
     }
     let mut comps: Vec<Comp> = Vec::new();
     for (_r, members) in comp_members {
@@ -1019,20 +1257,69 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
             }
         }
         let root = root.unwrap_or_default();
+        let root_name = slice_name.get(&root).cloned().unwrap_or_default();
+        // Prefer a member slice's chapterId; fall back to the chapter named
+        // after the flow root (the heal-by-name convention). The min across
+        // members keeps a multi-chapter flow adjacent to its lowest chapter.
+        let existing_order = members
+            .iter()
+            .filter_map(|m| slice_chapter.get(m))
+            .filter_map(|cid| chapter_order_by_id.get(cid).copied())
+            .fold(None, |acc: Option<f64>, o| {
+                Some(acc.map_or(o, |a: f64| a.min(o)))
+            })
+            .or_else(|| chapter_order_by_name.get(&root_name).copied());
         comps.push(Comp {
             members,
             root,
             min_layer,
+            existing_order,
+            eff_order: 0.0,
         });
     }
+    // Brand-new flows (no chapter yet) append AFTER all existing chapters,
+    // ordered among themselves by their natural `(min_layer, nkey(root))` wave
+    // position. With no chapters at all, `base = -1` so they get `0,1,2,…` —
+    // byte-identical to the pre-feature ranking (all wave tests stay green).
+    let base = if max_existing_order.is_finite() {
+        max_existing_order
+    } else {
+        -1.0
+    };
+    let mut new_idx: Vec<usize> = comps
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.existing_order.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    new_idx.sort_by(|&a, &b| {
+        (comps[a].min_layer, nkey(&slice_name, &comps[a].root))
+            .cmp(&(comps[b].min_layer, nkey(&slice_name, &comps[b].root)))
+    });
+    for (k, &i) in new_idx.iter().enumerate() {
+        comps[i].eff_order = base + 1.0 + k as f64;
+    }
+    for c in comps.iter_mut() {
+        if let Some(o) = c.existing_order {
+            c.eff_order = o;
+        }
+    }
     comps.sort_by(|a, b| {
-        (a.min_layer, nkey(&slice_name, &a.root))
-            .cmp(&(b.min_layer, nkey(&slice_name, &b.root)))
+        a.eff_order
+            .partial_cmp(&b.eff_order)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                (a.min_layer, nkey(&slice_name, &a.root))
+                    .cmp(&(b.min_layer, nkey(&slice_name, &b.root)))
+            })
     });
     let mut comp_rank: BTreeMap<String, usize> = BTreeMap::new();
     let mut flow_root: BTreeMap<String, String> = BTreeMap::new();
+    // root name -> the order to persist if this flow's chapter is synthesized.
+    let mut flow_synth_order: BTreeMap<String, f64> = BTreeMap::new();
     for (rank, c) in comps.iter().enumerate() {
         let root_name = slice_name.get(&c.root).cloned().unwrap_or_default();
+        flow_synth_order.insert(root_name.clone(), c.eff_order);
         for m in &c.members {
             comp_rank.insert(m.clone(), rank);
             flow_root.insert(m.clone(), root_name.clone());
@@ -1115,6 +1402,7 @@ fn compute_wave_order(model: &Value, plan: &MaterializePlan, diff: &HealDiff) ->
     WaveOrder {
         slice_order: final_order,
         slice_flow,
+        flow_synth_order,
     }
 }
 
@@ -1140,12 +1428,22 @@ fn wave_slice_columns(model: &Value, diff: &HealDiff) -> BTreeMap<String, f64> {
         }
     }
 
+    // Slices queued for removal this pass must NOT reserve a column — they
+    // are about to vanish from the model. Counting them would leave a gap in
+    // the dense left-anchored grid, so the next relayout (with the slices now
+    // gone) would re-tighten every column and the layout would need a second
+    // pass to settle. Excluding them makes a single relayout a fixed point.
+    let removed: BTreeSet<&str> = diff.remove_slices.iter().map(|s| s.as_str()).collect();
+
     let mut all_slices: Vec<(String, f64)> = Vec::new();
     if let Some(arr) = model.get("slices").and_then(|v| v.as_array()) {
         for s in arr {
             let Some(id) = s.get("id").and_then(|v| v.as_str()) else {
                 continue;
             };
+            if removed.contains(id) {
+                continue;
+            }
             let order = order_override
                 .get(id)
                 .copied()
@@ -1817,10 +2115,12 @@ mod tests {
                     EventInfo {
                         name: "OrderPlaced".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     },
                     EventInfo {
                         name: "OrderShipped".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     },
                 ],
                 commands: vec![
@@ -1829,12 +2129,14 @@ mod tests {
                         file: PathBuf::new(),
                         produces: vec!["OrderPlaced".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     },
                     CommandInfo {
                         name: "ShipOrder".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["OrderShipped".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     },
                 ],
                 queries: vec![QueryInfo {
@@ -2129,6 +2431,7 @@ mod tests {
         inspection.domains[0].events.push(EventInfo {
             name: "OrphanEvent".to_string(),
             file: PathBuf::new(),
+            fields: vec![],
         });
         let model = empty_model();
         let diff = compute_diff(&model, &inspection);
@@ -2253,6 +2556,7 @@ mod tests {
             file: PathBuf::new(),
             produces: vec![],
             via_web_transport: false,
+            fields: vec![],
         });
 
         let diff = compute_diff(&model, &inspection);
@@ -2308,12 +2612,14 @@ mod tests {
             file: PathBuf::new(),
             produces: vec![],
             via_web_transport: false,
+            fields: vec![],
         });
         inspection.domains[0].commands.push(CommandInfo {
             name: "AnnotateOrderTwice".to_string(),
             file: PathBuf::new(),
             produces: vec![],
             via_web_transport: false,
+            fields: vec![],
         });
 
         let mut model = empty_model();
@@ -2343,6 +2649,7 @@ mod tests {
                 file: PathBuf::new(),
                 produces: vec!["NoteAdded".to_string()],
                 via_web_transport: false,
+                fields: vec![],
             },
         ];
         // Two queries in the same slice would also stack. Add a second
@@ -2397,12 +2704,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "OrderPlaced".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "PlaceOrder".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["OrderPlaced".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2413,12 +2722,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "PaymentCaptured".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "CapturePayment".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["PaymentCaptured".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2478,12 +2789,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "OrderPlaced".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "PlaceOrder".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["OrderPlaced".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2494,12 +2807,14 @@ mod tests {
                     events: vec![EventInfo {
                         name: "PaymentCaptured".to_string(),
                         file: PathBuf::new(),
+                        fields: vec![],
                     }],
                     commands: vec![CommandInfo {
                         name: "CapturePayment".to_string(),
                         file: PathBuf::new(),
                         produces: vec!["PaymentCaptured".to_string()],
                         via_web_transport: false,
+                        fields: vec![],
                     }],
                     queries: vec![],
                     integrations: vec![],
@@ -2644,12 +2959,14 @@ mod tests {
                 events: vec![EventInfo {
                     name: "OrderPlaced".to_string(),
                     file: PathBuf::new(),
+                    fields: vec![],
                 }],
                 commands: vec![CommandInfo {
                     name: "PlaceOrder".to_string(),
                     file: PathBuf::new(),
                     produces: vec!["OrderPlaced".to_string()],
                     via_web_transport: false,
+                    fields: vec![],
                 }],
                 queries: vec![],
                 integrations: vec![],
@@ -2943,6 +3260,204 @@ mod tests {
             );
         }
         out
+    }
+
+    /// Two independent single-entity flows for the chapter-ordering tests:
+    /// flow A = `Aone`(cmd CA → evt EA) → `Atwo`(query QA); flow B likewise
+    /// with `Bone`/`Btwo`. `chapters` is the chapters array verbatim; `ch_a`
+    /// / `ch_b` set each flow's slices' `chapterId` (None → null).
+    fn two_flows_model(chapters: Value, ch_a: Option<&str>, ch_b: Option<&str>) -> Value {
+        let cid_a = ch_a.map(Value::from).unwrap_or(Value::Null);
+        let cid_b = ch_b.map(Value::from).unwrap_or(Value::Null);
+        serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": chapters,
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "sA1", "name": "Aone", "chapterId": cid_a, "order": 0 },
+                { "id": "sA2", "name": "Atwo", "chapterId": cid_a, "order": 0 },
+                { "id": "sB1", "name": "Bone", "chapterId": cid_b, "order": 0 },
+                { "id": "sB2", "name": "Btwo", "chapterId": cid_b, "order": 0 }
+            ],
+            "nodes": [
+                { "id": "ca", "type": "command", "name": "CA", "sliceId": "sA1", "entityId": "e" },
+                { "id": "ea", "type": "event",   "name": "EA", "sliceId": "sA1", "entityId": "e" },
+                { "id": "qa", "type": "query",   "name": "QA", "sliceId": "sA2" },
+                { "id": "cb", "type": "command", "name": "CB", "sliceId": "sB1", "entityId": "e" },
+                { "id": "eb", "type": "event",   "name": "EB", "sliceId": "sB1", "entityId": "e" },
+                { "id": "qb", "type": "query",   "name": "QB", "sliceId": "sB2" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent", "sourceId": "ca", "targetId": "ea" },
+                { "id": "x2", "type": "eventFeedsQuery",      "sourceId": "ea", "targetId": "qa" },
+                { "id": "x3", "type": "commandProducesEvent", "sourceId": "cb", "targetId": "eb" },
+                { "id": "x4", "type": "eventFeedsQuery",      "sourceId": "eb", "targetId": "qb" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    fn no_inspection() -> ProjectInspection {
+        ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![],
+        }
+    }
+
+    #[test]
+    fn chapter_order_drives_slice_columns() {
+        // Two flows owned by two chapters. "ChB" has order 0, "ChA" order 1 —
+        // so flow B leads even though its root ("Bone") sorts AFTER "Aone"
+        // alphabetically. This is the feature: a manual chapter order overrides
+        // the natural wave tiebreak. (Contrast the baseline test below, where
+        // with no chapters the SAME graph orders Aone before Bone.)
+        let model = two_flows_model(
+            serde_json::json!([
+                { "id": "chA", "name": "ChA", "order": 1 },
+                { "id": "chB", "name": "ChB", "order": 0 }
+            ]),
+            Some("chA"),
+            Some("chB"),
+        );
+        let o = wave_orders(&model);
+        assert_eq!(o["Bone"], 0.0, "chapter order 0 wins the left edge; got {o:?}");
+        assert_eq!(o["Btwo"], 1.0, "{o:?}");
+        assert_eq!(o["Aone"], 2.0, "{o:?}");
+        assert_eq!(o["Atwo"], 3.0, "{o:?}");
+    }
+
+    #[test]
+    fn empty_chapters_model_is_byte_identical_to_baseline() {
+        // The SAME graph as chapter_order_drives_slice_columns but with NO
+        // chapters and un-chaptered slices: ranking falls back to the natural
+        // (min_layer, name) wave, so flow A precedes flow B. Proves chapter
+        // order is the ONLY thing that flipped them above, and that a
+        // chapterless model is unchanged from the pre-feature behaviour.
+        let model = two_flows_model(serde_json::json!([]), None, None);
+        let o = wave_orders(&model);
+        assert_eq!(o["Aone"], 0.0, "{o:?}");
+        assert_eq!(o["Atwo"], 1.0, "{o:?}");
+        assert_eq!(o["Bone"], 2.0, "{o:?}");
+        assert_eq!(o["Btwo"], 3.0, "{o:?}");
+    }
+
+    #[test]
+    fn chapter_reorder_keeps_flow_contiguous() {
+        // Chapter X (order 1) owns a 3-slice linear flow; chapter Y (order 0)
+        // owns a 1-slice flow. Y leads; X's three slices stay a contiguous
+        // 1,2,3 block in wave order — reordering never splits a flow.
+        let model = serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [
+                { "id": "chX", "name": "ChX", "order": 1 },
+                { "id": "chY", "name": "ChY", "order": 0 }
+            ],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "x1", "name": "Xone",   "chapterId": "chX", "order": 0 },
+                { "id": "x2", "name": "Xtwo",   "chapterId": "chX", "order": 0 },
+                { "id": "x3", "name": "Xthree", "chapterId": "chX", "order": 0 },
+                { "id": "y1", "name": "Yone",   "chapterId": "chY", "order": 0 }
+            ],
+            "nodes": [
+                { "id": "cx",  "type": "command", "name": "CX",  "sliceId": "x1", "entityId": "e" },
+                { "id": "ex",  "type": "event",   "name": "EX",  "sliceId": "x1", "entityId": "e" },
+                { "id": "ix",  "type": "integration", "name": "IX", "sliceId": "x2", "kind": "inbound" },
+                { "id": "cx2", "type": "command", "name": "CX2", "sliceId": "x3", "entityId": "e" },
+                { "id": "cy",  "type": "command", "name": "CY",  "sliceId": "y1", "entityId": "e" }
+            ],
+            "edges": [
+                { "id": "e1", "type": "commandProducesEvent",       "sourceId": "cx", "targetId": "ex" },
+                { "id": "e2", "type": "eventTriggersIntegration",   "sourceId": "ex", "targetId": "ix" },
+                { "id": "e3", "type": "integrationTriggersCommand", "sourceId": "ix", "targetId": "cx2" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        });
+        let o = wave_orders(&model);
+        assert_eq!(o["Yone"], 0.0, "chapter order 0 leads; got {o:?}");
+        assert_eq!(
+            [o["Xone"], o["Xtwo"], o["Xthree"]],
+            [1.0, 2.0, 3.0],
+            "X's flow stays a contiguous, wave-ordered block; got {o:?}",
+        );
+    }
+
+    #[test]
+    fn manual_chapter_reorder_is_fixed_point() {
+        // After relayout honours the manual chapter order, a SECOND relayout
+        // must produce no slice/chapter/position changes.
+        let mut m = two_flows_model(
+            serde_json::json!([
+                { "id": "chA", "name": "ChA", "order": 1 },
+                { "id": "chB", "name": "ChB", "order": 0 }
+            ]),
+            Some("chA"),
+            Some("chB"),
+        );
+        let insp = no_inspection();
+        let d1 = compute_diff(&m, &insp);
+        crate::ide::heal::apply::apply_diff(&mut m, &d1);
+        let d2 = compute_diff(&m, &insp);
+        assert!(
+            d2.update_slices.is_empty(),
+            "slice order must be stable on re-run; got {:?}",
+            d2.update_slices,
+        );
+        assert!(
+            d2.add_chapters.is_empty(),
+            "no new chapters on re-run; got {:?}",
+            d2.add_chapters,
+        );
+        assert!(
+            d2.fix_positions.is_empty(),
+            "node x must be a fixed point; got {:?}",
+            d2.fix_positions,
+        );
+    }
+
+    #[test]
+    fn reorder_then_new_flow_appends_and_is_idempotent() {
+        // Existing user chapters at order 0 and 1; a NEW heal-owned flow with
+        // no chapter must get a synthesized chapter ordered AFTER them
+        // (max 1 + 1 = 2), and a second relayout must be a fixed point.
+        let mut m = two_flows_model(
+            serde_json::json!([
+                { "id": "chA", "name": "ChA", "order": 1 },
+                { "id": "chB", "name": "ChB", "order": 0 }
+            ]),
+            Some("chA"),
+            Some("chB"),
+        );
+        m["slices"].as_array_mut().unwrap().push(serde_json::json!(
+            { "id": "slice-heal-gamma", "name": "GammaFlow", "chapterId": null, "order": 0 }
+        ));
+        m["nodes"].as_array_mut().unwrap().push(serde_json::json!(
+            { "id": "cg", "type": "command", "name": "CG", "sliceId": "slice-heal-gamma", "entityId": "e" }
+        ));
+        let insp = no_inspection();
+        let d1 = compute_diff(&m, &insp);
+        let gamma = d1
+            .add_chapters
+            .iter()
+            .find(|c| c.name == "GammaFlow")
+            .expect("a chapter is synthesized for the new flow");
+        assert_eq!(
+            gamma.order, 2.0,
+            "new flow appends after the user's chapters (max 1 + 1); got {:?}",
+            d1.add_chapters,
+        );
+        crate::ide::heal::apply::apply_diff(&mut m, &d1);
+        let d2 = compute_diff(&m, &insp);
+        assert!(
+            d2.add_chapters.is_empty(),
+            "persisted chapter is reused on re-run, not re-synthesized; got {:?}",
+            d2.add_chapters,
+        );
+        assert!(
+            d2.update_slices.is_empty(),
+            "orders are stable on re-run; got {:?}",
+            d2.update_slices,
+        );
     }
 
     #[test]
@@ -3294,6 +3809,81 @@ mod tests {
         );
     }
 
+    /// A model with one real flow (CA→EA→QA) plus two empty slices: a
+    /// heal-owned orphan (`slice-heal-orphan`, its own `chapter-heal-orphan`)
+    /// and a user-authored empty slice (`slice-user-empty`). Mirrors the
+    /// real-world breakage where a prior heal left integration slices behind
+    /// whose nodes homed elsewhere.
+    fn model_with_empty_slices() -> Value {
+        serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [
+                { "id": "chapter-heal-real",   "name": "Aone",   "order": 0 },
+                { "id": "chapter-heal-orphan", "name": "Orphan", "order": 1 }
+            ],
+            "entities": [{ "id": "e", "name": "E", "order": 0 }],
+            "slices": [
+                { "id": "slice-heal-real",   "name": "Aone",   "chapterId": "chapter-heal-real",   "order": 0 },
+                { "id": "slice-heal-orphan", "name": "Orphan", "chapterId": "chapter-heal-orphan", "order": 1 },
+                { "id": "slice-user-empty",  "name": "UserEmpty", "chapterId": null, "order": 2 }
+            ],
+            "nodes": [
+                { "id": "ca", "type": "command", "name": "CA", "sliceId": "slice-heal-real", "entityId": "e" },
+                { "id": "ea", "type": "event",   "name": "EA", "sliceId": "slice-heal-real", "entityId": "e" },
+                { "id": "qa", "type": "query",   "name": "QA", "sliceId": "slice-heal-real" }
+            ],
+            "edges": [
+                { "id": "x1", "type": "commandProducesEvent", "sourceId": "ca", "targetId": "ea" },
+                { "id": "x2", "type": "eventFeedsQuery",      "sourceId": "ea", "targetId": "qa" }
+            ],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    #[test]
+    fn relayout_prunes_empty_heal_slices_and_their_chapters() {
+        let mut model = model_with_empty_slices();
+        let diff = compute_diff_with_options(&model, &no_inspection(), ComputeOptions::layout_only());
+        assert!(
+            diff.remove_slices.contains(&"slice-heal-orphan".to_string()),
+            "nodeless heal slice must be queued for removal; got {:?}",
+            diff.remove_slices,
+        );
+        assert!(
+            !diff.remove_slices.contains(&"slice-user-empty".to_string()),
+            "user-authored empty slice must NEVER be removed; got {:?}",
+            diff.remove_slices,
+        );
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let slice_ids: BTreeSet<String> = model["slices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(slice_ids.contains("slice-heal-real"), "node-bearing slice must survive");
+        assert!(slice_ids.contains("slice-user-empty"), "user empty slice must survive");
+        assert!(!slice_ids.contains("slice-heal-orphan"), "empty heal slice must be gone");
+        let chapter_ids: BTreeSet<String> = model["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !chapter_ids.contains("chapter-heal-orphan"),
+            "the orphan slice's dedicated heal chapter must be reclaimed; got {chapter_ids:?}",
+        );
+
+        // Re-running must be a fixed point: nothing left to prune.
+        let diff2 = compute_diff_with_options(&model, &no_inspection(), ComputeOptions::layout_only());
+        assert!(
+            diff2.remove_slices.is_empty(),
+            "second relayout must not re-propose slice removals; got {:?}",
+            diff2.remove_slices,
+        );
+    }
+
     #[test]
     fn heal_structural_is_fixed_point_after_narrowing_and_removal() {
         // Isolate the structural phase (the edge narrowing + removal this
@@ -3316,5 +3906,155 @@ mod tests {
             "second structural pass must be a fixed point; got summary: {}",
             diff2.summary(),
         );
+    }
+
+    // --- field reconcile (code→model data sync) --------------------------
+
+    fn rf(name: &str, ty: &str) -> crate::inspect::RecordField {
+        crate::inspect::RecordField { name: name.to_string(), type_name: ty.to_string() }
+    }
+
+    /// One Orders domain: command `PlaceOrder` + event `OrderPlaced`, both with
+    /// source-declared fields.
+    fn inspection_with_fields() -> ProjectInspection {
+        ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![DomainInspection {
+                name: "Orders".to_string(),
+                path: PathBuf::from("/Orders"),
+                events: vec![EventInfo {
+                    name: "OrderPlaced".to_string(),
+                    file: PathBuf::new(),
+                    fields: vec![rf("orderId", "Uuid"), rf("total", "Money")],
+                }],
+                commands: vec![CommandInfo {
+                    name: "PlaceOrder".to_string(),
+                    file: PathBuf::new(),
+                    produces: vec!["OrderPlaced".to_string()],
+                    via_web_transport: false,
+                    fields: vec![rf("orderId", "Uuid")],
+                }],
+                queries: vec![],
+                integrations: vec![],
+            }],
+        }
+    }
+
+    /// Model with the OrderPlaced event node already placed, no fields yet.
+    fn model_with_event_node() -> Value {
+        serde_json::json!({
+            "id": "m", "name": "demo",
+            "chapters": [], "entities": [{ "id": "e", "name": "Orders", "order": 0 }],
+            "slices": [{ "id": "s1", "name": "PlaceOrder", "chapterId": null, "order": 0 }],
+            "nodes": [
+                { "id": "ev1", "type": "event", "name": "OrderPlaced", "sliceId": "s1", "entityId": "e" }
+            ],
+            "edges": [],
+            "layout": { "nodePositions": { "ev1": { "x": 800, "y": 400 } }, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        })
+    }
+
+    #[test]
+    fn compute_options_fields_flag_matrix() {
+        let f = ComputeOptions::full();
+        assert!(f.structural && f.layout && f.fields);
+        let l = ComputeOptions::layout_only();
+        assert!(l.layout && !l.structural && !l.fields, "relayout must never rewrite fields");
+        let s = ComputeOptions::structural_only();
+        assert!(s.structural && !s.layout && s.fields);
+        let fo = ComputeOptions::fields_only();
+        assert!(fo.fields && !fo.structural && !fo.layout);
+    }
+
+    #[test]
+    fn fields_only_reconciles_existing_node() {
+        let model = model_with_event_node();
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert_eq!(diff.set_node_fields.len(), 1, "only the existing OrderPlaced node reconciles");
+        assert_eq!(diff.set_node_fields[0].node_id, "ev1");
+        assert_eq!(diff.set_node_fields[0].fields, vec![rf("orderId", "Uuid"), rf("total", "Money")]);
+
+        let mut model = model;
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let fields = model["nodes"][0]["fields"].as_array().expect("fields written");
+        assert_eq!(fields[0]["name"], "orderId");
+        assert_eq!(fields[0]["type"], "Uuid");
+        assert_eq!(fields[1]["name"], "total");
+    }
+
+    #[test]
+    fn fields_only_emits_no_structural_or_layout_ops() {
+        let model = model_with_event_node();
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert!(diff.add_nodes.is_empty(), "fields_only must not materialise nodes");
+        assert!(diff.add_slices.is_empty() && diff.add_entities.is_empty());
+        assert!(diff.fix_positions.is_empty() && diff.ensure_layout_entries.is_empty());
+        assert!(diff.update_slices.is_empty() && diff.add_edges.is_empty());
+    }
+
+    #[test]
+    fn fields_only_preserves_positions_and_is_idempotent() {
+        let mut model = model_with_event_node();
+        let insp = inspection_with_fields();
+        let before = model["layout"]["nodePositions"].clone();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        assert_eq!(model["layout"]["nodePositions"], before, "positions must not move");
+        let diff2 = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert_eq!(diff2.set_node_fields.len(), 0, "already-synced fields yield no diff");
+    }
+
+    #[test]
+    fn fields_only_overwrites_stale_fields_wholesale() {
+        let mut model = model_with_event_node();
+        model["nodes"][0]["fields"] = serde_json::json!([{ "name": "old", "type": "Bool" }]);
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let names: Vec<&str> = model["nodes"][0]["fields"]
+            .as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["orderId", "total"], "stale fields replaced, not merged");
+    }
+
+    #[test]
+    fn fields_only_empty_source_leaves_node_untouched() {
+        // A fieldless source extraction (parser miss or genuinely no fields)
+        // must not clear the node's existing fields.
+        let mut model = model_with_event_node();
+        model["nodes"][0]["fields"] = serde_json::json!([{ "name": "keep", "type": "Int" }]);
+        let insp = ProjectInspection {
+            root: PathBuf::from("/"),
+            domains: vec![DomainInspection {
+                name: "Orders".to_string(),
+                path: PathBuf::from("/Orders"),
+                events: vec![EventInfo {
+                    name: "OrderPlaced".to_string(),
+                    file: PathBuf::new(),
+                    fields: vec![],
+                }],
+                commands: vec![],
+                queries: vec![],
+                integrations: vec![],
+            }],
+        };
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::fields_only());
+        assert!(diff.set_node_fields.is_empty(), "empty source must not queue an overwrite");
+    }
+
+    #[test]
+    fn full_pass_materialises_new_node_with_fields() {
+        let mut model = empty_model();
+        let insp = inspection_with_fields();
+        let diff = compute_diff_with_options(&model, &insp, ComputeOptions::full());
+        assert!(!diff.add_nodes.is_empty(), "full pass materialises nodes");
+        assert!(!diff.set_node_fields.is_empty(), "new field-bearing nodes get fields");
+        crate::ide::heal::apply::apply_diff(&mut model, &diff);
+        let nodes = model["nodes"].as_array().unwrap();
+        let ev = nodes.iter().find(|n| n["name"] == "OrderPlaced").expect("OrderPlaced materialised");
+        let names: Vec<&str> = ev["fields"].as_array().expect("event has fields")
+            .iter().map(|f| f["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["orderId", "total"]);
     }
 }

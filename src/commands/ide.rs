@@ -49,9 +49,18 @@ pub async fn run(host: IpAddr, port: u16, output_mode: &mut OutputMode) -> miett
     // explicit, not implicit-in-cwd-at-handler-call-time.
     let cwd = std::env::current_dir().map_err(|e| NeoError::IdeServe { source: e })?;
     let workspace = Workspace::from_root(&cwd)?;
+    let workspace_root = workspace.root.clone();
     let transport = Arc::new(LocalTransport::new(workspace));
     let registry = register_all(MethodRegistry::new());
-    let state = AppState { registry, transport };
+
+    // Background source watcher: on every `src/` change, re-sync
+    // `event-model.json` from the parsed source and broadcast so any open IDE
+    // client re-reads the model. Watching `src/` (not `event-model.json`) avoids
+    // a feedback loop with autosave.
+    let (model_changed_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+    spawn_source_watcher(workspace_root, model_changed_tx.clone());
+
+    let state = AppState { registry, transport, model_changed_tx };
 
     let app = Router::new()
         .route("/ws", get(crate::ide::server::ws_upgrade))
@@ -142,6 +151,63 @@ fn init_tracing() {
         .with_ansi(use_ansi)
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+/// Spawn a detached task that watches `<root>/src` and re-runs the code→model
+/// sync on every change, broadcasting on `changed_tx` whenever the sync actually
+/// rewrote `event-model.json` (so connected IDE clients re-read it). Best-effort:
+/// if the watcher can't start, log and disable live sync rather than fail boot.
+fn spawn_source_watcher(root: std::path::PathBuf, changed_tx: crate::ide::ModelChangedTx) {
+    use notify::{RecursiveMode, Watcher};
+
+    tokio::spawn(async move {
+        let src_dir = root.join("src");
+        // Bridge the notify callback (sync world) into async via an mpsc.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
+        let mut watcher = match notify::RecommendedWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                if let Ok(ev) = res {
+                    if ev.kind.is_modify() || ev.kind.is_create() || ev.kind.is_remove() {
+                        let _ = tx.blocking_send(());
+                    }
+                }
+            },
+            notify::Config::default(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e, "ide: source watcher init failed; live code→model sync disabled");
+                return;
+            }
+        };
+        if let Err(e) = watcher.watch(&src_dir, RecursiveMode::Recursive) {
+            tracing::warn!(
+                error = %e, dir = %src_dir.display(),
+                "ide: cannot watch src/; live code→model sync disabled",
+            );
+            return;
+        }
+        tracing::info!(dir = %src_dir.display(), "ide: watching source for code→model sync");
+        // Hold `watcher` alive for the task's lifetime — dropping it stops events.
+        let _watcher = watcher;
+        while rx.recv().await.is_some() {
+            // Coalesce a burst of filesystem events into a single sync.
+            while rx.try_recv().is_ok() {}
+            match crate::ide::sync::sync_event_model(&root) {
+                Ok(outcome) if outcome.applied > 0 => {
+                    tracing::info!(
+                        applied = outcome.applied,
+                        fields = outcome.fields_updated,
+                        full_heal = outcome.ran_full_heal,
+                        "ide: code→model sync applied; notifying clients",
+                    );
+                    let _ = changed_tx.send(());
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "ide: code→model sync failed"),
+            }
+        }
+    });
 }
 
 fn print_shutdown(output_mode: &OutputMode) {

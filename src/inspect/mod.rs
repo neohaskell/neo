@@ -54,6 +54,17 @@ pub struct DomainInspection {
     pub integrations: Vec<IntegrationInfo>,
 }
 
+/// One record field of an event/command payload — `name :: Type` in source.
+/// Serialises as `{ "name": ..., "type": ... }` so it drops straight into the
+/// event-model schema's `Field` shape (the IDE renders these read-only; source
+/// is their author). Extraction is best-effort/"dumb" — see `parse.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecordField {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EventInfo {
@@ -61,6 +72,11 @@ pub struct EventInfo {
     pub name: String,
     /// File where the constructor was found — usually `Core.hs` or `Event.hs`.
     pub file: PathBuf,
+    /// Record fields of this event constructor's payload, in source order.
+    /// Empty when the constructor has no inline record (e.g. a payload-module
+    /// arm `Foo Bar.Event`) or the dumb parser couldn't extract them.
+    #[serde(default)]
+    pub fields: Vec<RecordField>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,6 +91,11 @@ pub struct CommandInfo {
     /// `true` if the command file has a `TransportsOf <Cmd> = '[WebTransport ...]`
     /// declaration — i.e. it can be invoked over HTTP.
     pub via_web_transport: bool,
+    /// Record fields of the command's payload (`data <Cmd> = <Cmd> { … }`), in
+    /// source order. Empty when there's no inline record or the dumb parser
+    /// couldn't extract them.
+    #[serde(default)]
+    pub fields: Vec<RecordField>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -87,6 +108,10 @@ pub struct QueryInfo {
     /// `resolve_feeders`, else the all-local fallback. One `eventFeedsQuery`
     /// edge is drawn per entry.
     pub subscribes_to: Vec<String>,
+    /// Record fields of the query's read-model (`data <Query> = <Query> { … }`),
+    /// in source order. Empty when the parser couldn't extract them.
+    #[serde(default)]
+    pub fields: Vec<RecordField>,
     /// Entity fields the `combine` reads (`entity.<field>`). The read model's
     /// true data dependency on the aggregate. Not serialised — internal to
     /// inspection (no `neo inspect` consumer needs it).
@@ -171,9 +196,25 @@ pub fn inspect_project(root: &Path) -> ProjectInspection {
         }
     }
 
+    // Build a GLOBAL command name set too, so the integration parser can
+    // recognise emitted commands — including cross-domain ones (e.g.
+    // `NotifyProposalOfMetricCompletion` emits the Proposal `RecordMetricScore`)
+    // — by their record construction.
+    let mut cmd_seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut global_command_names: Vec<String> = Vec::new();
+    for (dir, _) in &with_events {
+        for name in parse::command_names_in_domain(dir) {
+            if cmd_seen.insert(name.clone()) {
+                global_command_names.push(name);
+            }
+        }
+    }
+
     let domains = with_events
         .into_iter()
-        .map(|(dir, events)| inspect_domain(dir, events, &global_event_names))
+        .map(|(dir, events)| {
+            inspect_domain(dir, events, &global_event_names, &global_command_names)
+        })
         .collect();
     ProjectInspection {
         root: root.to_path_buf(),
@@ -210,6 +251,7 @@ fn inspect_domain(
     dir: PathBuf,
     events: Vec<EventInfo>,
     global_event_names: &[String],
+    global_command_names: &[String],
 ) -> DomainInspection {
     let name = dir
         .file_name()
@@ -224,7 +266,8 @@ fn inspect_domain(
     // Queries + integrations get the GLOBAL event set so they catch
     // cross-domain wiring.
     let mut queries = parse::queries_in_domain(&dir, global_event_names);
-    let mut integrations = parse::integrations_in_domain(&dir, global_event_names);
+    let mut integrations =
+        parse::integrations_in_domain(&dir, global_event_names, global_command_names);
 
     // Infer subscriptions for queries that name no event constructor in
     // source. A NeoHaskell read model reads ENTITY FIELDS in its `combine`
@@ -434,6 +477,59 @@ mod tests {
         assert_eq!(intg.kind, IntegrationKind::Reactive);
         assert_eq!(intg.handles_events, vec!["ItemAdded".to_string()]);
         assert_eq!(intg.emits_commands, vec!["ReserveStockOnAdded".to_string()]);
+    }
+
+    /// CIOS callback idiom: the command is built as a record literal in an
+    /// `onSuccess` handler whose return type is the command — NO
+    /// `Command.Emit`/`emitCommand` keyword. Detected via the known-command
+    /// record-construction scan (the command file makes it a known command).
+    const INTEGRATION_CALLBACK_EMIT: &str = r#"
+module App.Cart.Integrations.Evaluator where
+evaluate :: CartEntity -> CartEvent -> Integration.Outbound
+evaluate _entity event =
+  Integration.batch
+    [ OpenRouter.Request
+        { onSuccess = onSuccess event
+        , onError = onError event
+        }
+        |> Integration.outbound
+    ]
+
+onSuccess :: CartEvent -> Response -> RecordThing
+onSuccess event response =
+  RecordThing
+    { thingId = event.entityId
+    , value = 1
+    }
+"#;
+
+    #[test]
+    fn inspect_detects_callback_idiom_emitted_command_via_record_construction() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/App/Cart/Core.hs", CORE_HS);
+        // The command file makes `RecordThing` a known command name.
+        write(
+            dir.path(),
+            "src/App/Cart/Commands/RecordThing.hs",
+            "module App.Cart.Commands.RecordThing where\ndata RecordThing = RecordThing { thingId :: Uuid, value :: Int }\n",
+        );
+        write(
+            dir.path(),
+            "src/App/Cart/Integrations/Evaluator.hs",
+            INTEGRATION_CALLBACK_EMIT,
+        );
+        let out = inspect_project(dir.path());
+        let intg = out.domains[0]
+            .integrations
+            .iter()
+            .find(|i| i.name == "Evaluator")
+            .expect("Evaluator integration must survive (it emits a command)");
+        assert_eq!(intg.kind, IntegrationKind::Reactive);
+        assert_eq!(
+            intg.emits_commands,
+            vec!["RecordThing".to_string()],
+            "callback-idiom command built as a record must be detected",
+        );
     }
 
     #[test]

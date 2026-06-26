@@ -20,8 +20,7 @@ describe('EventNodeComponent', () => {
 
   it('has orange background styling', () => {
     const { container } = render(<EventNodeComponent data={{ label: 'E' }} />, { wrapper })
-    const node = container.firstChild as HTMLElement
-    expect(node.className).toContain('bg-orange')
+    expect(container.querySelector('[data-variant="event"]')).not.toBeNull()
   })
 })
 
@@ -33,8 +32,7 @@ describe('CommandNodeComponent', () => {
 
   it('has blue background styling', () => {
     const { container } = render(<CommandNodeComponent data={{ label: 'C' }} />, { wrapper })
-    const node = container.firstChild as HTMLElement
-    expect(node.className).toContain('bg-blue')
+    expect(container.querySelector('[data-variant="command"]')).not.toBeNull()
   })
 })
 
@@ -46,8 +44,7 @@ describe('QueryNodeComponent', () => {
 
   it('has green background styling', () => {
     const { container } = render(<QueryNodeComponent data={{ label: 'Q' }} />, { wrapper })
-    const node = container.firstChild as HTMLElement
-    expect(node.className).toContain('bg-green')
+    expect(container.querySelector('[data-variant="query"]')).not.toBeNull()
   })
 })
 
@@ -59,7 +56,7 @@ describe('IntegrationNodeComponent', () => {
 
   it('renders a cogwheel icon', () => {
     render(<IntegrationNodeComponent data={{ label: 'I', kind: 'outbound' }} />, { wrapper })
-    expect(screen.getByText('\u2699')).toBeInTheDocument()
+    expect(screen.getByLabelText('integration')).toBeInTheDocument()
   })
 
   it('has gray background styling', () => {
@@ -67,8 +64,7 @@ describe('IntegrationNodeComponent', () => {
       <IntegrationNodeComponent data={{ label: 'I', kind: 'inbound' }} />,
       { wrapper },
     )
-    const node = container.firstChild as HTMLElement
-    expect(node.className).toContain('bg-gray')
+    expect(container.querySelector('[data-variant="integration"]')).not.toBeNull()
   })
 })
 
@@ -83,7 +79,6 @@ describe('UIPlaceholderNodeComponent', () => {
       <UIPlaceholderNodeComponent data={{ label: 'UI' }} />,
       { wrapper },
     )
-    const node = container.firstChild as HTMLElement
-    expect(node.className).toContain('border-dashed')
+    expect(container.querySelector('[data-variant="uiPlaceholder"]')).not.toBeNull()
   })
 })

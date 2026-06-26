@@ -1,4 +1,5 @@
 import { EditableLabel } from './EditableLabel'
+import classes from './SliceColumnNode.module.css'
 
 interface Props {
   data: {
@@ -12,31 +13,24 @@ interface Props {
 }
 
 export function SliceColumnNodeComponent({ data }: Props) {
+  const columnCls = [
+    classes.column,
+    data.highlighted ? classes.columnHighlighted : '',
+    data.flashing ? 'em-flash' : '',
+  ].join(' ')
+  const headerCls = [
+    classes.header,
+    data.highlighted ? classes.headerHighlighted : '',
+    data.flashing ? 'em-flash' : '',
+  ].join(' ')
+  const labelCls = [
+    classes.label,
+    data.highlighted ? classes.labelHighlighted : '',
+  ].join(' ')
   return (
-    <div
-      className={`w-full h-full border relative pointer-events-none transition-colors duration-150 ${
-        data.flashing
-          ? 'animate-flash-red'
-          : data.highlighted
-            ? 'border-blue-400 bg-blue-50/40'
-            : 'border-gray-200'
-      }`}
-    >
-      <div
-        className={`absolute top-0 left-0 right-0 h-10 flex items-center justify-center border-b pointer-events-auto z-10 transition-colors duration-150 cursor-pointer ${
-          data.flashing
-            ? 'animate-flash-red'
-            : data.highlighted
-              ? 'border-blue-400 bg-blue-100'
-              : 'border-gray-200 bg-white'
-        }`}
-        onClick={data.onSelect}
-      >
-        <span
-          className={`text-xs font-semibold truncate px-2 ${
-            data.highlighted ? 'text-blue-700' : 'text-gray-600'
-          }`}
-        >
+    <div className={columnCls}>
+      <div className={`${headerCls} em-pointer-auto`} onClick={data.onSelect}>
+        <span className={labelCls}>
           {data.onRename ? (
             <EditableLabel label={data.label} onRename={data.onRename} />
           ) : (

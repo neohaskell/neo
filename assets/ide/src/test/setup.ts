@@ -1,10 +1,38 @@
 import '@testing-library/jest-dom/vitest'
+import { vi } from 'vitest'
 
 // Polyfill ResizeObserver for ReactFlow in jsdom
 global.ResizeObserver = class ResizeObserver {
   observe() {}
   unobserve() {}
   disconnect() {}
+}
+
+// Mantine components query matchMedia (color scheme, responsive props) and call
+// scrollIntoView / read document.fonts — jsdom provides none of these.
+if (!window.matchMedia) {
+  Object.defineProperty(window, 'matchMedia', {
+    writable: true,
+    value: (query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }),
+  })
+}
+
+window.HTMLElement.prototype.scrollIntoView = () => {}
+
+if (!('fonts' in document)) {
+  Object.defineProperty(document, 'fonts', {
+    writable: true,
+    value: { addEventListener: vi.fn(), removeEventListener: vi.fn(), ready: Promise.resolve() },
+  })
 }
 
 // Polyfill localStorage for jsdom

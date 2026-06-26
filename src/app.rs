@@ -76,6 +76,9 @@ pub async fn dispatch(
         Some(Commands::Inspect { subcommand }) => {
             commands::inspect::run(subcommand)?;
         }
+        Some(Commands::Skills { subcommand }) => {
+            commands::skills::run(subcommand, output_mode).await?;
+        }
         None => {
             let _ = output_mode;
             println!("The NeoHaskell CLI. Run `neo --help` for commands.");
@@ -239,6 +242,46 @@ mod tests {
         );
 
         drop(probe);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_skills() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp.path()).unwrap();
+
+        let prev_home = std::env::var("NEO_HOME").ok();
+        unsafe {
+            std::env::set_var("NEO_SKIP_NETWORK", "1");
+            std::env::set_var("NEO_HOME", home.path());
+        }
+
+        let command = Some(Commands::Skills {
+            subcommand: Some(crate::cli::SkillsSubcommand::Setup {
+                tools: vec![],
+                all_tools: true,
+                skills: vec![],
+                force: false,
+                dry_run: false,
+                refresh: false,
+            }),
+        });
+        let mut output_mode = OutputMode::Ci;
+        let update_status = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result = dispatch(command, &mut output_mode, update_status).await;
+
+        std::env::set_current_dir(original_dir).unwrap();
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("NEO_HOME", v),
+                None => std::env::remove_var("NEO_HOME"),
+            }
+        }
+
+        assert!(result.is_ok(), "dispatch skills failed: {result:?}");
+        assert!(temp.path().join(".claude/skills/sample-skill/SKILL.md").exists());
     }
 
     #[tokio::test]

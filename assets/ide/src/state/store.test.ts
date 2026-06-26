@@ -80,6 +80,24 @@ describe('reducer', () => {
     expect(result.chapters).toHaveLength(0)
   })
 
+  it('handles reorderChapters and renormalizes order', () => {
+    let model = createEventModel('T')
+    model = reducer(model, { type: 'addChapter', name: 'A' })
+    model = reducer(model, { type: 'addChapter', name: 'B' })
+    model = reducer(model, { type: 'addChapter', name: 'C' })
+    const [a, b, c] = model.chapters.map((ch) => ch.id)
+    const result = reducer(model, {
+      type: 'reorderChapters',
+      orderedChapterIds: [c, a, b],
+    })
+    expect(result.chapters.map((ch) => ch.name)).toEqual(['C', 'A', 'B'])
+    expect(result.chapters.map((ch) => ch.order)).toEqual([0, 1, 2])
+    // Reorder touches only chapters — other model fields are untouched.
+    expect(result.nodes).toBe(model.nodes)
+    expect(result.slices).toBe(model.slices)
+    expect(result.entities).toBe(model.entities)
+  })
+
   it('handles addSlice', () => {
     const model = createEventModel('T')
     const result = reducer(model, { type: 'addSlice', name: 'S1' })

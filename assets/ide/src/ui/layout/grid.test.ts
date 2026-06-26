@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { buildGridNodes, computeSliceLayouts, computeEntityLaneLayouts } from './grid'
+import { MIN_NODE_WIDTH } from '../nodes/nodeDimensions'
 import type { EventModel } from '../../model/types'
 import {
   createEventModel,
@@ -118,9 +119,11 @@ describe('computeSliceLayouts — anchor to actual node positions', () => {
       edges: [],
       layout: {
         nodePositions: {
+          // Spaced for record-card columns (≥180px wide + padding); the old
+          // 220px spacing predates the wider cards.
           n1: { x: 270, y: 400 },
-          n2: { x: 490, y: 400 },
-          n3: { x: 710, y: 400 },
+          n2: { x: 580, y: 400 },
+          n3: { x: 890, y: 400 },
         },
         viewport: { x: 0, y: 0, zoom: 1 },
       },
@@ -129,13 +132,13 @@ describe('computeSliceLayouts — anchor to actual node positions', () => {
 
   it('xStart of each slice tracks its leftmost node (minus padding + breathing room)', () => {
     const layouts = computeSliceLayouts(fixture())
-    // node x=270, padding=40, breathing_room=16 → xStart ≈ 214
-    expect(layouts[0].xStart).toBeLessThanOrEqual(270)
-    expect(layouts[0].xStart).toBeGreaterThanOrEqual(200)
-    expect(layouts[1].xStart).toBeLessThanOrEqual(490)
-    expect(layouts[1].xStart).toBeGreaterThanOrEqual(420)
-    expect(layouts[2].xStart).toBeLessThanOrEqual(710)
-    expect(layouts[2].xStart).toBeGreaterThanOrEqual(640)
+    // Each column anchors near its node's x minus (SLICE_PADDING 40 + breathing
+    // 16 = 56), clamped right so columns never overlap. node x=270 → ≈214.
+    for (let i = 0; i < layouts.length; i++) {
+      const nodeX = [270, 580, 890][i]
+      expect(layouts[i].xStart).toBeLessThanOrEqual(nodeX)
+      expect(layouts[i].xStart).toBeGreaterThanOrEqual(nodeX - 90)
+    }
   })
 
   it('every node renders inside its slice column horizontally', () => {
@@ -146,7 +149,7 @@ describe('computeSliceLayouts — anchor to actual node positions', () => {
       const layout = layouts.find((l) => l.sliceId === node.sliceId)!
       const right = layout.xStart + layout.width
       expect(pos.x).toBeGreaterThanOrEqual(layout.xStart)
-      expect(pos.x + 120 /* NODE_WIDTH */).toBeLessThanOrEqual(right)
+      expect(pos.x + MIN_NODE_WIDTH).toBeLessThanOrEqual(right)
     }
   })
 
@@ -186,7 +189,7 @@ describe('computeSliceLayouts — anchor to actual node positions', () => {
     const layout = layouts[0]
     const leftGap = model.layout.nodePositions.left.x - layout.xStart
     // Right edge is `xStart + width`; right node's right edge is x + estimated node width.
-    const rightNodeRight = model.layout.nodePositions.right.x + 120 /* min node width for "R" */
+    const rightNodeRight = model.layout.nodePositions.right.x + MIN_NODE_WIDTH
     const rightGap = layout.xStart + layout.width - rightNodeRight
     expect(leftGap).toEqual(rightGap)
   })

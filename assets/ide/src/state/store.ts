@@ -14,6 +14,8 @@ import {
   renameEntity,
   addChapter,
   removeChapter,
+  reorderChapters,
+  moveSliceToChapter,
   addSlice,
   removeSlice,
   renameSlice,
@@ -43,9 +45,11 @@ export type Action =
   | { type: 'addEntity'; name: string }
   | { type: 'removeEntity'; entityId: string }
   | { type: 'renameEntity'; entityId: string; name: string }
-  | { type: 'addChapter'; name: string }
+  | { type: 'addChapter'; name: string; submodelId?: string | null }
   | { type: 'removeChapter'; chapterId: string }
   | { type: 'renameChapter'; chapterId: string; name: string }
+  | { type: 'reorderChapters'; orderedChapterIds: string[] }
+  | { type: 'moveSliceToChapter'; sliceId: string; chapterId: string | null; orderedSliceIds: string[] }
   | { type: 'addSubmodel'; name: string }
   | { type: 'removeSubmodel'; submodelId: string }
   | { type: 'renameSubmodel'; submodelId: string; name: string }
@@ -100,11 +104,15 @@ export function reducer(model: EventModel, action: Action): EventModel {
     case 'renameEntity':
       return renameEntity(model, action.entityId, action.name)
     case 'addChapter':
-      return addChapter(model, { name: action.name })
+      return addChapter(model, { name: action.name, submodelId: action.submodelId })
     case 'removeChapter':
       return removeChapter(model, action.chapterId)
     case 'renameChapter':
       return renameChapter(model, action.chapterId, action.name)
+    case 'reorderChapters':
+      return reorderChapters(model, action.orderedChapterIds)
+    case 'moveSliceToChapter':
+      return moveSliceToChapter(model, action.sliceId, action.chapterId, action.orderedSliceIds)
     case 'addSubmodel':
       return addSubmodel(model, { name: action.name })
     case 'removeSubmodel':

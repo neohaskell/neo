@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { render, screen, waitFor, within, fireEvent } from './test/render'
 import userEvent from '@testing-library/user-event'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
@@ -19,7 +19,13 @@ interface IpcStubConfig {
   healDelayMs?: number
 }
 
-const ipcState: { config: IpcStubConfig; readCalls: number; healCalls: number } = {
+const ipcState: {
+  config: IpcStubConfig
+  readCalls: number
+  healCalls: number
+  relayoutCalls: number
+  callLog: string[]
+} = {
   config: {
     initialize: {
       ok: true,
@@ -35,6 +41,8 @@ const ipcState: { config: IpcStubConfig; readCalls: number; healCalls: number } 
   },
   readCalls: 0,
   healCalls: 0,
+  relayoutCalls: 0,
+  callLog: [],
 }
 
 function nextResponse<T>(queue: T[], label: string): T {
@@ -80,9 +88,18 @@ vi.mock('./ipc/initialize', () => ({
 vi.mock('./ipc/eventModel', () => ({
   readEventModel: vi.fn(async () => {
     ipcState.readCalls += 1
+    ipcState.callLog.push('read')
     return nextResponse(ipcState.config.readQueue, 'readEventModel')
   }),
-  writeEventModel: vi.fn(async () => ({ ok: true, result: { path: '/tmp/ws/event-model.json' } })),
+  writeEventModel: vi.fn(async () => {
+    ipcState.callLog.push('write')
+    return { ok: true, result: { path: '/tmp/ws/event-model.json' } }
+  }),
+  relayoutEventModel: vi.fn(async () => {
+    ipcState.relayoutCalls += 1
+    ipcState.callLog.push('relayout')
+    return { ok: true, result: { applied: 1 } }
+  }),
   healEventModel: vi.fn(async () => {
     ipcState.healCalls += 1
     if (ipcState.config.healDelayMs) {
@@ -103,6 +120,8 @@ function configureIpc(patch: Partial<IpcStubConfig>) {
   }
   ipcState.readCalls = 0
   ipcState.healCalls = 0
+  ipcState.relayoutCalls = 0
+  ipcState.callLog = []
 }
 
 const VALID_MODEL_JSON = JSON.stringify({
@@ -127,10 +146,14 @@ beforeEach(() => {
 describe('App — base render', () => {
   it('renders without crashing', () => {
     render(<App />)
-    expect(screen.getByRole('button', { name: /event/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /command/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /new/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument()
+    // The shell chrome: header actions + the activity rail + canvas. Node
+    // creation is gesture/palette-driven now (no toolbar buttons).
+    expect(screen.getByRole('button', { name: /^new$/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /heal with ai/i })).toBeInTheDocument()
+    expect(screen.getByTestId('activity-rail')).toBeInTheDocument()
+    expect(screen.getByTestId('canvas')).toBeInTheDocument()
+    // No Save button — changes autosave.
+    expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument()
   })
 
   it('renders the canvas area', () => {
@@ -138,31 +161,28 @@ describe('App — base render', () => {
     expect(screen.getByTestId('canvas')).toBeInTheDocument()
   })
 
-  it('shows toolbar buttons for all node types', () => {
+  it('has no node-creation toolbar (creation is gesture/palette-driven)', () => {
     render(<App />)
-    expect(screen.getByRole('button', { name: /\+ event/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /\+ command/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /\+ query/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /\+ integration/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /\+ ui placeholder/i })).toBeInTheDocument()
-    expect(screen.getAllByRole('button', { name: /entity/i }).length).toBeGreaterThanOrEqual(1)
-    expect(screen.getAllByRole('button', { name: /slice/i }).length).toBeGreaterThanOrEqual(1)
-    expect(screen.getAllByRole('button', { name: /chapter/i }).length).toBeGreaterThanOrEqual(1)
+    // The old "+ Event" etc. toolbar buttons are gone.
+    expect(screen.queryByRole('button', { name: /\+ event/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /\+ command/i })).not.toBeInTheDocument()
   })
 
-  it('shows file menu buttons', () => {
+  it('shows file/model actions in the header', () => {
     render(<App />)
-    expect(screen.getByRole('button', { name: /new/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^new$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /open/i })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /save/i })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /tidy by flow/i })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^save$/i })).not.toBeInTheDocument()
   })
 
-  it('marks dirty after adding a node', async () => {
+  it('autosaves to disk after a model change (no Save button)', async () => {
     const user = userEvent.setup()
     render(<App />)
-    expect(screen.queryByText('•')).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: /\+ event/i }))
-    expect(screen.getByText('•')).toBeInTheDocument()
+    // Any model mutation triggers the debounced autosave; use the feature
+    // navigator's "+ Feature" (stable, in the model lens) as the trigger.
+    await user.click(screen.getByTestId('add-feature'))
+    await waitFor(() => expect(ipcState.callLog).toContain('write'), { timeout: 3000 })
   })
 })
 
@@ -425,6 +445,10 @@ describe('App — event-model load + heal flow', () => {
     })
     expect(screen.getByTestId('heal-log').textContent).not.toContain('WRONG_TOKEN_LINE')
     expect(screen.getByTestId('heal-log').textContent).not.toContain('noise')
+
+    // Let the in-flight heal (healDelayMs) finish + reload so its async tail
+    // doesn't leak into the next test's reset IPC queue.
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
   })
 
   it('manual Heal button (FileMenu) triggers heal even when the file is valid', async () => {
@@ -448,5 +472,139 @@ describe('App — event-model load + heal flow', () => {
     await waitFor(() => expect(ipcState.healCalls).toBe(1))
     // Reload fired after heal.
     await waitFor(() => expect(ipcState.readCalls).toBe(2))
+  })
+})
+
+describe('App — chapter reorder', () => {
+  const MODEL_WITH_CHAPTERS = JSON.stringify({
+    id: 'm1',
+    name: 'Demo',
+    chapters: [
+      { id: 'c1', name: 'First', order: 0 },
+      { id: 'c2', name: 'Second', order: 1 },
+    ],
+    entities: [],
+    slices: [],
+    nodes: [],
+    edges: [],
+    layout: { nodePositions: {}, viewport: { x: 0, y: 0, zoom: 1 } },
+  })
+
+  function dataTransfer(): DataTransfer {
+    const store: Record<string, string> = {}
+    return {
+      effectAllowed: 'none',
+      dropEffect: 'none',
+      setData: (t: string, v: string) => {
+        store[t] = v
+      },
+      getData: (t: string) => store[t] ?? '',
+    } as unknown as DataTransfer
+  }
+
+  it('drag-reorder runs write → relayout → read (reload) in that order', async () => {
+    configureIpc({
+      readQueue: [
+        // mount load
+        { ok: true, result: { content: MODEL_WITH_CHAPTERS, validation: { status: 'valid' } } },
+        // post-reorder relayout reload
+        { ok: true, result: { content: MODEL_WITH_CHAPTERS, validation: { status: 'valid' } } },
+      ],
+    })
+    render(<App />)
+    const c1 = await screen.findByTestId('chapter-row-c1')
+    const c2 = screen.getByTestId('chapter-row-c2')
+
+    const dt = dataTransfer()
+    fireEvent.dragStart(c1, { dataTransfer: dt })
+    fireEvent.drop(c2, { dataTransfer: dt })
+
+    await waitFor(() => expect(ipcState.relayoutCalls).toBe(1))
+    await waitFor(() => expect(ipcState.readCalls).toBe(2))
+
+    // The three reorder RPCs must fire in order: write the new chapter.order,
+    // relayout (which now honours it), then reload the relaid-out file.
+    const writeIdx = ipcState.callLog.indexOf('write')
+    const relayoutIdx = ipcState.callLog.indexOf('relayout')
+    const reloadIdx = ipcState.callLog.lastIndexOf('read')
+    expect(writeIdx).toBeGreaterThanOrEqual(0)
+    expect(relayoutIdx).toBeGreaterThan(writeIdx)
+    expect(reloadIdx).toBeGreaterThan(relayoutIdx)
+  })
+})
+
+describe('App — submodel band reflow on load', () => {
+  // A submodel model whose saved node positions are NOT band-aligned. Both
+  // nodes are in the submodel, so autoLayout leaves them untouched; the only
+  // thing that can move them is the band reflow in applyReadResult.
+  const MODEL_WITH_SUBMODEL = JSON.stringify({
+    id: 'm',
+    name: 'Demo',
+    entities: [{ id: 'e1', name: 'User', order: 0 }],
+    submodels: [{ id: 'sm1', name: 'Onboarding', order: 0 }],
+    chapters: [{ id: 'ch1', name: 'Onb', order: 0, submodelId: 'sm1' }],
+    slices: [{ id: 's1', name: 'Signup', chapterId: 'ch1', order: 0 }],
+    nodes: [
+      { id: 'c1', type: 'command', name: 'Signup', entityId: 'e1', sliceId: 's1' },
+      { id: 'ev1', type: 'event', name: 'SignedUp', entityId: 'e1', sliceId: 's1' },
+    ],
+    edges: [],
+    layout: {
+      nodePositions: { c1: { x: 999, y: 999 }, ev1: { x: 999, y: 1200 } },
+      viewport: { x: 0, y: 0, zoom: 1 },
+    },
+  })
+
+  it('reload_with_submodels_applies_band_reflow', async () => {
+    configureIpc({
+      readQueue: [
+        { ok: true, result: { content: MODEL_WITH_SUBMODEL, validation: { status: 'valid' } } },
+      ],
+    })
+    render(<App />)
+    await waitFor(() => expect(ipcState.readCalls).toBe(1))
+    // applyReadResult re-bands the model on load; the band positions differ
+    // from disk, so the model is dirty → autosave writes the reflowed model
+    // back (the observable proof the reflow ran).
+    await waitFor(() => expect(ipcState.callLog).toContain('write'), { timeout: 3000 })
+  })
+})
+
+describe('App — $/eventModelChanged push reload', () => {
+  // A model carrying a distinctly-named chapter so we can observe the store
+  // replace in the DOM (chapter rows render with data-testid chapter-row-<id>).
+  const MODEL_AFTER_SYNC = JSON.stringify({
+    id: 'm1',
+    name: 'Demo',
+    chapters: [{ id: 'synced1', name: 'FromSourceSync', order: 0 }],
+    entities: [],
+    slices: [],
+    nodes: [],
+    edges: [],
+    layout: { nodePositions: {}, viewport: { x: 0, y: 0, zoom: 1 } },
+  })
+
+  it('ws_event_model_changed_triggers_reread', async () => {
+    configureIpc({
+      readQueue: [
+        // Mount load: nothing on disk yet.
+        { ok: true, result: { content: null, validation: { status: 'notFound' } } },
+        // The re-read the notification handler must perform.
+        { ok: true, result: { content: MODEL_AFTER_SYNC, validation: { status: 'valid' } } },
+      ],
+    })
+    render(<App />)
+    // Mount read settles; the synced chapter is NOT present yet.
+    await waitFor(() => expect(ipcState.readCalls).toBe(1))
+    expect(screen.queryByTestId('chapter-row-synced1')).not.toBeInTheDocument()
+
+    // The Rust background sync rewrote event-model.json and pushed the
+    // notification (no params needed — the handler just re-reads from disk).
+    emitNotification('$/eventModelChanged', {})
+
+    // Handler re-reads (readCalls → 2) and replaces the in-memory model, so the
+    // newly-synced chapter row appears.
+    await waitFor(() => expect(ipcState.readCalls).toBe(2))
+    expect(await screen.findByTestId('chapter-row-synced1')).toBeInTheDocument()
   })
 })

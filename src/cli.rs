@@ -86,6 +86,16 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: Option<InspectSubcommand>,
     },
+    /// Install shared NeoHaskell skills into your AI coding tools
+    #[command(long_about = "Fetch the shared skill library from github.com/neohaskell/skills and \
+                            install the skills into the right project-root folders for the AI coding \
+                            agents you use (Claude Code, OpenAI Codex, Kiro, Cursor, and the universal \
+                            AGENTS.md). Run `neo skills setup` for an interactive tool picker; in --ci \
+                            mode it installs for every supported tool unless you pass `--tool <id>`.")]
+    Skills {
+        #[command(subcommand)]
+        subcommand: Option<SkillsSubcommand>,
+    },
 }
 
 /// Per-section views of the inspected project. `None` = dump the whole project.
@@ -103,6 +113,37 @@ pub enum InspectSubcommand {
     Integrations,
     /// Derived wiring: which command produces which event, which integration listens to it, etc.
     Wiring,
+    /// Force a code→model sync: refresh `event-model.json` from the project
+    /// source (record fields, plus new nodes/edges). Editing fields of existing
+    /// nodes is a data-only update with no layout change; a new node triggers a
+    /// full re-layout. The `neo ide` background watcher runs the same sync.
+    Sync,
+}
+
+/// `neo skills` actions. `None` runs `setup` with no flags.
+#[derive(Subcommand)]
+pub enum SkillsSubcommand {
+    /// Fetch neohaskell/skills and install skills into your tools' folders
+    Setup {
+        /// Install for this tool (repeatable): claude, codex, kiro, cursor, agents
+        #[arg(long = "tool")]
+        tools: Vec<String>,
+        /// Install for every supported tool
+        #[arg(long)]
+        all_tools: bool,
+        /// Install only this skill (repeatable); default installs every discovered skill
+        #[arg(long = "skill")]
+        skills: Vec<String>,
+        /// Overwrite existing destinations without confirmation
+        #[arg(long)]
+        force: bool,
+        /// Print the install plan without writing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-clone the skills library instead of reusing the cached copy
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -204,6 +245,62 @@ mod tests {
         match cli.command {
             Some(Commands::Test { watch }) => assert!(!watch),
             _ => panic!("Expected Test command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_inspect_sync() {
+        let cli = Cli::try_parse_from(["neo", "inspect", "sync"]).unwrap();
+        match cli.command {
+            Some(Commands::Inspect { subcommand: Some(InspectSubcommand::Sync) }) => {}
+            other => panic!("Expected Inspect Sync, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_parse_skills_setup() {
+        let cli = Cli::try_parse_from([
+            "neo", "skills", "setup",
+            "--tool", "claude", "--tool", "cursor",
+            "--skill", "foo",
+            "--force", "--dry-run", "--refresh",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Skills {
+                subcommand: Some(SkillsSubcommand::Setup { tools, all_tools, skills, force, dry_run, refresh }),
+            }) => {
+                assert_eq!(tools, vec!["claude".to_string(), "cursor".to_string()]);
+                assert!(!all_tools);
+                assert_eq!(skills, vec!["foo".to_string()]);
+                assert!(force);
+                assert!(dry_run);
+                assert!(refresh);
+            }
+            _ => panic!("Expected Skills Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_skills_setup_all_tools() {
+        let cli = Cli::try_parse_from(["neo", "skills", "setup", "--all-tools"]).unwrap();
+        match cli.command {
+            Some(Commands::Skills {
+                subcommand: Some(SkillsSubcommand::Setup { all_tools, tools, .. }),
+            }) => {
+                assert!(all_tools);
+                assert!(tools.is_empty());
+            }
+            _ => panic!("Expected Skills Setup --all-tools"),
+        }
+    }
+
+    #[test]
+    fn test_parse_skills_bare() {
+        let cli = Cli::try_parse_from(["neo", "skills"]).unwrap();
+        match cli.command {
+            Some(Commands::Skills { subcommand: None }) => {}
+            _ => panic!("Expected bare Skills command"),
         }
     }
 

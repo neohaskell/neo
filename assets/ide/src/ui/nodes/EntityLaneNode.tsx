@@ -1,4 +1,5 @@
 import { EditableLabel } from './EditableLabel'
+import classes from './EntityLaneNode.module.css'
 
 interface Props {
   data: {
@@ -11,28 +12,20 @@ interface Props {
 }
 
 export function EntityLaneNodeComponent({ data }: Props) {
+  const laneCls = [
+    classes.lane,
+    data.highlighted ? classes.laneHighlighted : '',
+    data.flashing ? 'em-flash' : '',
+  ].join(' ')
+  const labelCls = [
+    classes.label,
+    data.highlighted ? classes.labelHighlighted : '',
+  ].join(' ')
   return (
-    <div className={`w-full h-full border relative pointer-events-none transition-colors duration-150 ${
-      data.flashing
-        ? 'animate-flash-red'
-        : data.highlighted
-          ? 'border-orange-400 bg-orange-50/40'
-          : 'border-gray-200 bg-gray-50/50'
-    }`}>
-      {/* Clickable label column — the 100px strip before slices start */}
-      <div
-        className={`absolute left-0 top-0 w-[100px] h-full pointer-events-auto cursor-pointer z-10 flex items-start px-2 pt-2`}
-        onClick={data.onSelect}
-      >
-        <span
-          className={`text-xs font-bold uppercase tracking-wide ${
-            data.flashing
-              ? 'animate-flash-red'
-              : data.highlighted
-                ? 'text-orange-500'
-                : 'text-gray-400'
-          }`}
-        >
+    <div className={laneCls}>
+      {/* 100px clickable strip before the slices start. */}
+      <div className={`${classes.labelCol} em-pointer-auto`} onClick={data.onSelect}>
+        <span className={labelCls}>
           {data.onRename ? (
             <EditableLabel label={data.label} onRename={data.onRename} />
           ) : (

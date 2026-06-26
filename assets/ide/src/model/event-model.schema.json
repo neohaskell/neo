@@ -77,7 +77,8 @@
         "type": { "const": "event" },
         "name": { "type": "string" },
         "entityId": { "type": ["string", "null"] },
-        "sliceId": { "type": ["string", "null"] }
+        "sliceId": { "type": ["string", "null"] },
+        "fields": { "type": "array", "items": { "$ref": "#/$defs/Field" } }
       }
     },
     "CommandNode": {
@@ -89,7 +90,8 @@
         "type": { "const": "command" },
         "name": { "type": "string" },
         "entityId": { "type": ["string", "null"] },
-        "sliceId": { "type": ["string", "null"] }
+        "sliceId": { "type": ["string", "null"] },
+        "fields": { "type": "array", "items": { "$ref": "#/$defs/Field" } }
       }
     },
     "QueryNode": {
@@ -100,7 +102,8 @@
         "id": { "type": "string", "minLength": 1 },
         "type": { "const": "query" },
         "name": { "type": "string" },
-        "sliceId": { "type": ["string", "null"] }
+        "sliceId": { "type": ["string", "null"] },
+        "fields": { "type": "array", "items": { "$ref": "#/$defs/Field" } }
       }
     },
     "IntegrationNode": {
@@ -112,7 +115,8 @@
         "type": { "const": "integration" },
         "name": { "type": "string" },
         "kind": { "enum": ["inbound", "outbound"] },
-        "sliceId": { "type": ["string", "null"] }
+        "sliceId": { "type": ["string", "null"] },
+        "fields": { "type": "array", "items": { "$ref": "#/$defs/Field" } }
       }
     },
     "UIPlaceholderNode": {
@@ -123,7 +127,8 @@
         "id": { "type": "string", "minLength": 1 },
         "type": { "const": "uiPlaceholder" },
         "name": { "type": "string" },
-        "sliceId": { "type": ["string", "null"] }
+        "sliceId": { "type": ["string", "null"] },
+        "fields": { "type": "array", "items": { "$ref": "#/$defs/Field" } }
       }
     },
     "ModelEdge": {
@@ -223,7 +228,23 @@
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/NodePosition" }
         },
-        "viewport": { "$ref": "#/$defs/Viewport" }
+        "viewport": { "$ref": "#/$defs/Viewport" },
+        "bySubmodel": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/NodePosition" }
+          }
+        }
+      }
+    },
+    "Field": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string" },
+        "type": { "type": "string" }
       }
     },
     "NodePosition": {

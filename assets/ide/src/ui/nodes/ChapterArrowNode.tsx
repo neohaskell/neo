@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from 'react'
 import { useReactFlow, useNodeId } from '@xyflow/react'
 import { EditableLabel } from './EditableLabel'
+import classes from './ChapterArrowNode.module.css'
 
 interface Props {
   data: {
@@ -71,61 +72,34 @@ export function ChapterArrowNodeComponent({ data }: Props) {
   )
 
   return (
-    <div className="w-full h-full relative" style={{ overflow: 'visible' }} onClick={handleClick}>
+    <div className={classes.root} onClick={handleClick}>
       {/* Selection highlight */}
-      {data.selected && (
-        <div className="absolute -inset-1 rounded border-2 border-blue-400 bg-blue-100/40 pointer-events-none" style={{ overflow: 'visible' }} />
-      )}
+      {data.selected && <div className={classes.selection} />}
       {/* Arrow container — uses dragWidth override during resize, otherwise fills node */}
       <div
-        className="absolute top-0 left-0 h-full flex items-center"
+        className={classes.arrow}
         style={{ width: dragWidth != null ? dragWidth : '100%' }}
       >
         {/* Arrow line */}
-        <div className="absolute top-1/2 left-0 right-[14px] h-[3px] bg-blue-500 -translate-y-1/2" />
-        {/* Arrowhead — draggable end handle */}
+        <div className={classes.line} />
+        {/* Arrowhead. Draggable (range-resize) only when an end-handle drag
+            callback is wired; otherwise a static cap (feature-mode chapters
+            are display-only — range editing lives in the flat view). */}
         <div
-          className="absolute right-0 top-1/2 -translate-y-1/2 cursor-ew-resize z-10"
-          style={{
-            width: 0,
-            height: 0,
-            borderTop: '10px solid transparent',
-            borderBottom: '10px solid transparent',
-            borderLeft: '16px solid #3b82f6',
-          }}
-          onPointerDown={handleEndPointerDown}
-          onPointerMove={handleEndPointerMove}
-          onPointerUp={handleEndPointerUp}
+          className={`${classes.head} ${data.onEndHandleDrag ? classes.headDraggable : ''}`}
+          onPointerDown={data.onEndHandleDrag ? handleEndPointerDown : undefined}
+          onPointerMove={data.onEndHandleDrag ? handleEndPointerMove : undefined}
+          onPointerUp={data.onEndHandleDrag ? handleEndPointerUp : undefined}
         />
         {/* Label */}
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-auto flex flex-col items-center gap-0.5">
-          <span className="bg-white px-3 py-0.5 text-blue-600 font-semibold text-sm whitespace-nowrap">
+        <div className={classes.labelWrap}>
+          <span className={classes.label}>
             {data.onRename ? (
               <EditableLabel label={data.label} onRename={data.onRename} />
             ) : (
               data.label
             )}
           </span>
-          {data.submodels && data.submodels.length > 0 && data.onAssignSubmodel && (
-            <select
-              className="bg-white border border-indigo-200 rounded text-[10px] text-indigo-600 px-1 py-px nodrag"
-              value={data.currentSubmodelId ?? ''}
-              onClick={(e) => e.stopPropagation()}
-              onMouseDown={(e) => e.stopPropagation()}
-              onChange={(e) => {
-                e.stopPropagation()
-                data.onAssignSubmodel?.(e.target.value === '' ? null : e.target.value)
-              }}
-              title="Group this chapter under a submodel"
-            >
-              <option value="">— no submodel —</option>
-              {data.submodels.map((sm) => (
-                <option key={sm.id} value={sm.id}>
-                  {sm.name}
-                </option>
-              ))}
-            </select>
-          )}
         </div>
       </div>
     </div>

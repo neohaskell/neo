@@ -14,6 +14,8 @@ import {
   assignEventToEntity,
   addChapter,
   removeChapter,
+  reorderChapters,
+  moveSliceToChapter,
   addSlice,
   removeSlice,
   reorderEventsInEntity,
@@ -482,6 +484,26 @@ describe('addChapter', () => {
     expect(model.chapters[0].order).toBe(0)
     expect(model.chapters[1].order).toBe(1)
   })
+
+  it('defaults to ungrouped (null submodel) when none is given', () => {
+    let model = createEventModel('T')
+    model = addChapter(model, { name: 'A' })
+    expect(model.chapters[0].submodelId).toBeNull()
+  })
+
+  it('assigns the chapter to a given submodel', () => {
+    let model = createEventModel('T')
+    model = addSubmodel(model, { name: 'Checkout' })
+    const smId = model.submodels[0].id
+    model = addChapter(model, { name: 'Cart', submodelId: smId })
+    expect(model.chapters[0].submodelId).toBe(smId)
+  })
+
+  it('falls back to ungrouped for an unknown submodel id', () => {
+    let model = createEventModel('T')
+    model = addChapter(model, { name: 'A', submodelId: 'nope' })
+    expect(model.chapters[0].submodelId).toBeNull()
+  })
 })
 
 // ── removeChapter ───────────────────────────────────────────
@@ -502,6 +524,168 @@ describe('removeChapter', () => {
     model = addSlice(model, { name: 'S', chapterId: chId })
     model = removeChapter(model, chId)
     expect(model.slices[0].chapterId).toBeNull()
+  })
+})
+
+// ── reorderChapters ─────────────────────────────────────────
+
+describe('reorderChapters', () => {
+  function threeChapters(): EventModel {
+    let model = createEventModel('T')
+    model = addChapter(model, { name: 'A' })
+    model = addChapter(model, { name: 'B' })
+    model = addChapter(model, { name: 'C' })
+    return model // names A,B,C at orders 0,1,2
+  }
+
+  it('reorders to the given id order and renormalizes order to 0..n-1', () => {
+    const model = threeChapters()
+    const [a, b, c] = model.chapters.map((ch) => ch.id)
+    const next = reorderChapters(model, [c, a, b])
+    expect(next.chapters.map((ch) => ch.name)).toEqual(['C', 'A', 'B'])
+    expect(next.chapters.map((ch) => ch.order)).toEqual([0, 1, 2])
+  })
+
+  it('is immutable — does not mutate the input model', () => {
+    const model = threeChapters()
+    const before = JSON.stringify(model)
+    const [a, , c] = model.chapters.map((ch) => ch.id)
+    reorderChapters(model, [c, a])
+    expect(JSON.stringify(model)).toBe(before)
+  })
+
+  it('renormalizes legacy sparse/fractional orders to contiguous 0..n-1', () => {
+    const base = createEventModel('T')
+    const model: EventModel = {
+      ...base,
+      chapters: [
+        { id: 'x', name: 'X', order: 0.5 },
+        { id: 'y', name: 'Y', order: 2.5 },
+        { id: 'z', name: 'Z', order: 1.0 },
+      ],
+    }
+    const next = reorderChapters(model, ['x', 'y', 'z'])
+    expect(next.chapters.map((ch) => ch.name)).toEqual(['X', 'Y', 'Z'])
+    expect(next.chapters.map((ch) => ch.order)).toEqual([0, 1, 2])
+  })
+
+  it('ignores unknown ids', () => {
+    const model = threeChapters()
+    const [a, b, c] = model.chapters.map((ch) => ch.id)
+    const next = reorderChapters(model, [c, 'nope', a, b])
+    expect(next.chapters.map((ch) => ch.name)).toEqual(['C', 'A', 'B'])
+  })
+
+  it('appends chapters omitted from the list (by current order)', () => {
+    const model = threeChapters()
+    const [a, , c] = model.chapters.map((ch) => ch.id)
+    // only C then A given; B is omitted and appended after (B had order 1).
+    const next = reorderChapters(model, [c, a])
+    expect(next.chapters.map((ch) => ch.name)).toEqual(['C', 'A', 'B'])
+    expect(next.chapters.map((ch) => ch.order)).toEqual([0, 1, 2])
+  })
+
+  it('dedupes repeated ids (keeps first occurrence)', () => {
+    const model = threeChapters()
+    const [a, b, c] = model.chapters.map((ch) => ch.id)
+    const next = reorderChapters(model, [a, a, b, c])
+    expect(next.chapters.map((ch) => ch.name)).toEqual(['A', 'B', 'C'])
+  })
+
+  it('empty list returns chapters in current order, renormalized', () => {
+    const model = threeChapters()
+    const next = reorderChapters(model, [])
+    expect(next.chapters.map((ch) => ch.name)).toEqual(['A', 'B', 'C'])
+    expect(next.chapters.map((ch) => ch.order)).toEqual([0, 1, 2])
+  })
+
+  it('is idempotent — reordering twice with the same ids is stable', () => {
+    const model = threeChapters()
+    const [a, b, c] = model.chapters.map((ch) => ch.id)
+    const once = reorderChapters(model, [b, c, a])
+    const twice = reorderChapters(once, [b, c, a])
+    expect(twice.chapters).toEqual(once.chapters)
+  })
+
+  it('preserves submodelId and all slice.chapterId (changes only order)', () => {
+    const base = createEventModel('T')
+    const model: EventModel = {
+      ...base,
+      chapters: [
+        { id: 'c1', name: 'One', order: 0, submodelId: 'sm1' },
+        { id: 'c2', name: 'Two', order: 1, submodelId: null },
+      ],
+      slices: [
+        { id: 's1', name: 'S1', chapterId: 'c1', order: 0 },
+        { id: 's2', name: 'S2', chapterId: 'c2', order: 1 },
+      ],
+    }
+    const next = reorderChapters(model, ['c2', 'c1'])
+    expect(next.chapters.find((c) => c.id === 'c1')?.submodelId).toBe('sm1')
+    expect(next.chapters.find((c) => c.id === 'c2')?.submodelId).toBe(null)
+    expect(next.slices).toEqual(model.slices)
+  })
+})
+
+// ── moveSliceToChapter ──────────────────────────────────────
+
+describe('moveSliceToChapter', () => {
+  function model(): EventModel {
+    const base = createEventModel('T')
+    return {
+      ...base,
+      chapters: [
+        { id: 'c1', name: 'One', order: 0 },
+        { id: 'c2', name: 'Two', order: 1 },
+      ],
+      slices: [
+        { id: 's1', name: 'A', chapterId: 'c1', order: 0 },
+        { id: 's2', name: 'B', chapterId: 'c1', order: 1 },
+        { id: 's3', name: 'C', chapterId: 'c2', order: 2 },
+      ],
+    }
+  }
+
+  it('reorders within a chapter (chapterId unchanged), renormalizing order', () => {
+    const next = moveSliceToChapter(model(), 's2', 'c1', ['s2', 's1', 's3'])
+    expect(next.slices.map((s) => [s.id, s.order])).toEqual([['s2', 0], ['s1', 1], ['s3', 2]])
+    expect(next.slices.find((s) => s.id === 's2')?.chapterId).toBe('c1')
+  })
+
+  it('moves a slice across chapters (reassigns chapterId + reorders)', () => {
+    const next = moveSliceToChapter(model(), 's1', 'c2', ['s2', 's3', 's1'])
+    expect(next.slices.find((s) => s.id === 's1')?.chapterId).toBe('c2')
+    expect(next.slices.map((s) => s.id)).toEqual(['s2', 's3', 's1'])
+    expect(next.slices.map((s) => s.order)).toEqual([0, 1, 2])
+  })
+
+  it('detaches a slice when chapterId is null', () => {
+    const next = moveSliceToChapter(model(), 's1', null, ['s2', 's3', 's1'])
+    expect(next.slices.find((s) => s.id === 's1')?.chapterId).toBeNull()
+  })
+
+  it('is a no-op for an unknown chapter', () => {
+    const m = model()
+    expect(moveSliceToChapter(m, 's1', 'nope', ['s1', 's2', 's3'])).toBe(m)
+  })
+
+  it('is a no-op for an unknown slice', () => {
+    const m = model()
+    expect(moveSliceToChapter(m, 'nope', 'c1', ['s1'])).toBe(m)
+  })
+
+  it('is immutable', () => {
+    const m = model()
+    const before = JSON.stringify(m)
+    moveSliceToChapter(m, 's1', 'c2', ['s2', 's3', 's1'])
+    expect(JSON.stringify(m)).toBe(before)
+  })
+
+  it('appends omitted slices by current order and renormalizes', () => {
+    const next = moveSliceToChapter(model(), 's3', 'c1', ['s3'])
+    expect(next.slices.map((s) => s.id)).toEqual(['s3', 's1', 's2'])
+    expect(next.slices.map((s) => s.order)).toEqual([0, 1, 2])
+    expect(next.slices.find((s) => s.id === 's3')?.chapterId).toBe('c1')
   })
 })
 

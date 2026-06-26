@@ -13,3 +13,9 @@ npm-debug.log*
 #
 # Workflow: `pnpm build` (or `npm run build`) inside this dir before
 # committing — the diff in `dist/` is part of the PR.
+
+# Playwright e2e artifacts (harness drives Brave against `vite preview`).
+/test-results
+/playwright-report
+/blob-report
+/e2e-out

@@ -1,4 +1,6 @@
+import { Modal, Text, Stack, Box, Group, Button, ScrollArea } from '@mantine/core'
 import type { ValidationError } from '../ipc/eventModel'
+import classes from './InvalidModelModal.module.css'
 
 interface InvalidModelModalProps {
   errors: ValidationError[]
@@ -8,65 +10,37 @@ interface InvalidModelModalProps {
   onCancel: () => void
 }
 
-export function InvalidModelModal({
-  errors,
-  preamble,
-  onHeal,
-  onCancel,
-}: InvalidModelModalProps) {
+export function InvalidModelModal({ errors, preamble, onHeal, onCancel }: InvalidModelModalProps) {
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="invalid-model-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+    <Modal
+      opened
+      onClose={onCancel}
+      size="xl"
+      title={<Text fw={600} size="lg">event-model.json is invalid</Text>}
     >
-      <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 flex flex-col max-h-[80vh]">
-        <div className="px-6 py-4 border-b border-gray-200">
-          <h2
-            id="invalid-model-modal-title"
-            className="text-lg font-semibold text-gray-900"
-          >
-            event-model.json is invalid
-          </h2>
-          <p className="mt-1 text-sm text-gray-600">
-            {preamble ??
-              'The file on disk does not match the event-model schema. You can ask an AI agent to heal it, or cancel and keep your local copy.'}
-          </p>
-        </div>
-        <div className="px-6 py-4 overflow-y-auto flex-1">
-          <ul className="space-y-2 text-sm font-mono text-gray-800">
+      <Stack gap="md">
+        <Text size="sm" c="dimmed">
+          {preamble ??
+            'The file on disk does not match the event-model schema. You can ask an AI agent to heal it, or cancel and keep your local copy.'}
+        </Text>
+        <ScrollArea.Autosize mah="50vh">
+          <Stack gap="xs">
             {errors.map((e, i) => (
-              <li
-                key={`${e.pointer}-${i}`}
-                className="border-l-2 border-red-400 pl-3"
-              >
-                <div className="text-xs text-gray-500">
+              <Box key={`${e.pointer}-${i}`} pl="sm" className={classes.errorItem}>
+                <Text size="xs" c="dimmed" ff="monospace">
                   {e.pointer === '' ? '(whole document)' : e.pointer}{' '}
-                  <span className="ml-2 text-gray-400">[{e.kind}]</span>
-                </div>
-                <div>{e.message}</div>
-              </li>
+                  <Text span c="dimmed" opacity={0.7}>[{e.kind}]</Text>
+                </Text>
+                <Text size="sm" ff="monospace">{e.message}</Text>
+              </Box>
             ))}
-          </ul>
-        </div>
-        <div className="px-6 py-4 border-t border-gray-200 flex justify-end gap-2">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="px-4 py-2 text-sm rounded border border-gray-300 hover:bg-gray-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={onHeal}
-            className="px-4 py-2 text-sm rounded bg-indigo-600 text-white hover:bg-indigo-700"
-          >
-            Heal with AI
-          </button>
-        </div>
-      </div>
-    </div>
+          </Stack>
+        </ScrollArea.Autosize>
+        <Group justify="flex-end" gap="xs">
+          <Button variant="default" onClick={onCancel}>Cancel</Button>
+          <Button color="emFeature" variant="filled" onClick={onHeal}>Heal with AI</Button>
+        </Group>
+      </Stack>
+    </Modal>
   )
 }

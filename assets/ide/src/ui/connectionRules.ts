@@ -18,6 +18,16 @@ export function isConnectionValid(
   )
 }
 
+/**
+ * The node types a `sourceType` can validly flow INTO — drives "drag a wire
+ * into empty space → spawn the next node" (and the right-click "Add successor"
+ * menu). Derived from the same VALID_CONNECTIONS table so creation and
+ * connection never disagree. E.g. command → [event]; event → [query, integration].
+ */
+export function successorsFor(sourceType: NodeType): NodeType[] {
+  return VALID_CONNECTIONS.filter(([s]) => s === sourceType).map(([, t]) => t)
+}
+
 export function getEdgeTypeForConnection(
   sourceType: NodeType,
   targetType: NodeType,

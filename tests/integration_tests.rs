@@ -881,6 +881,197 @@ fn test_neo_build_skip_lock_check_bypasses_check() {
 }
 
 // =====================================================================
+// `neo inspect sync` — code→model sync of event-model.json
+//
+// These need NO nix/network: the sync parses `.hs` text + reads/writes
+// event-model.json. So they run fast against a hand-written src/ tree.
+// =====================================================================
+
+/// Write a tiny Cart domain (one event with fields, one command) plus an EMPTY
+/// event-model.json, so the first `neo inspect sync` materialises + lays out the
+/// whole structure (the full-heal path).
+fn write_sync_fixture(root: &std::path::Path) {
+    let write = |rel: &str, body: &str| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(
+        "src/App/Cart/Core.hs",
+        "module App.Cart.Core where\n\
+         data CartEvent = ItemAdded { stockId :: Uuid, quantity :: Int } deriving (Generic)\n",
+    );
+    write(
+        "src/App/Cart/Commands/AddItem.hs",
+        "module App.Cart.Commands.AddItem where\n\
+         data AddItem = AddItem { stockId :: Uuid }\n\
+         decide _ _ _ = Decider.acceptExisting [ItemAdded {}]\n",
+    );
+    write(
+        "src/App/Cart/Queries/CartView.hs",
+        "module App.Cart.Queries.CartView (CartView (..)) where\n\
+         data CartView = CartView { cartId :: Uuid, itemCount :: Int } deriving (Generic)\n",
+    );
+    let model = serde_json::json!({
+        "id": "m", "name": "demo", "chapters": [], "entities": [], "slices": [],
+        "nodes": [], "edges": [],
+        "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+    });
+    std::fs::write(
+        root.join("event-model.json"),
+        serde_json::to_string_pretty(&model).unwrap(),
+    )
+    .unwrap();
+}
+
+fn read_event_model(root: &std::path::Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(root.join("event-model.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn inspect_sync_updates_fields_from_source() {
+    let temp = tempfile::tempdir().unwrap();
+    write_sync_fixture(temp.path());
+
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] synced event-model.json"));
+
+    // The event + command were materialised and carry their source fields.
+    let model = read_event_model(temp.path());
+    let ev = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "ItemAdded").unwrap();
+    let ev_names: Vec<&str> = ev["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(ev_names, vec!["stockId", "quantity"], "event node fields synced from source");
+    let cmd = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "AddItem").expect("command materialised");
+    let cmd_names: Vec<&str> = cmd["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(cmd_names, vec!["stockId"], "command node fields synced from source");
+    // Query read-model fields sync too (the originally-missing case).
+    let q = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "CartView").expect("query materialised");
+    let q_names: Vec<&str> = q["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(q_names, vec!["cartId", "itemCount"], "query node fields synced from source");
+}
+
+#[test]
+fn inspect_sync_payload_module_event_fields() {
+    // The real starter event shape: a sum arm `Ctor Module.Event` whose fields
+    // live in `Events/<Module>.hs`. This was the originally-missing case —
+    // events showed no fields. Drive it through the shipped CLI path.
+    let temp = tempfile::tempdir().unwrap();
+    let write = |rel: &str, body: &str| {
+        let p = temp.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    };
+    write(
+        "src/App/Counter/Event.hs",
+        "module App.Counter.Event (CounterEvent (..)) where\n\
+         data CounterEvent = CounterCreated CounterCreated.Event deriving (Generic, Show)\n",
+    );
+    write(
+        "src/App/Counter/Events/CounterCreated.hs",
+        "module App.Counter.Events.CounterCreated (Event (..)) where\n\
+         data Event = Event { entityId :: Uuid, label :: Text } deriving (Generic, Show)\n",
+    );
+    // A command so the domain has a Commands/ dir and the event is reachable.
+    write(
+        "src/App/Counter/Commands/CreateCounter.hs",
+        "module App.Counter.Commands.CreateCounter where\n\
+         data CreateCounter = CreateCounter { label :: Text }\n\
+         decide _ _ _ = Decider.acceptExisting [CounterCreated {}]\n",
+    );
+    write(
+        "event-model.json",
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "id": "m", "name": "demo", "chapters": [], "entities": [], "slices": [],
+            "nodes": [], "edges": [],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        }))
+        .unwrap(),
+    );
+
+    neo_cmd().args(["inspect", "sync"]).current_dir(temp.path()).assert().success();
+
+    let model = read_event_model(temp.path());
+    let ev = model["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "CounterCreated").expect("event node");
+    let names: Vec<&str> = ev["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["entityId", "label"], "payload-module event fields synced from Events/<Module>.hs");
+}
+
+#[test]
+fn inspect_sync_existing_node_field_edit_is_data_only() {
+    let temp = tempfile::tempdir().unwrap();
+    write_sync_fixture(temp.path());
+
+    // First sync materialises + lays out everything.
+    neo_cmd().args(["inspect", "sync"]).current_dir(temp.path()).assert().success();
+    let model = read_event_model(temp.path());
+    let ev_id = model["nodes"].as_array().unwrap().iter()
+        .find(|n| n["name"] == "ItemAdded").unwrap()["id"].as_str().unwrap().to_string();
+    let pos_before = model["layout"]["nodePositions"][&ev_id].clone();
+    assert!(pos_before.is_object(), "event node must be positioned after the first sync");
+
+    // Edit ONLY the existing event's fields in source (add `note :: Text`).
+    std::fs::write(
+        temp.path().join("src/App/Cart/Core.hs"),
+        "module App.Cart.Core where\n\
+         data CartEvent = ItemAdded { stockId :: Uuid, quantity :: Int, note :: Text } deriving (Generic)\n",
+    )
+    .unwrap();
+
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fields only"));
+
+    let model2 = read_event_model(temp.path());
+    let ev2 = model2["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "ItemAdded").unwrap();
+    let names: Vec<&str> = ev2["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["stockId", "quantity", "note"], "the new field synced");
+    assert_eq!(
+        model2["layout"]["nodePositions"][&ev_id], pos_before,
+        "editing fields of an EXISTING node must not move layout",
+    );
+}
+
+#[test]
+fn inspect_sync_idempotent_second_run() {
+    let temp = tempfile::tempdir().unwrap();
+    write_sync_fixture(temp.path());
+
+    neo_cmd().args(["inspect", "sync"]).current_dir(temp.path()).assert().success();
+    let after_first = std::fs::read_to_string(temp.path().join("event-model.json")).unwrap();
+
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already in sync"));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("event-model.json")).unwrap(),
+        after_first,
+        "second sync must leave event-model.json byte-identical",
+    );
+}
+
+#[test]
+fn inspect_sync_missing_event_model_errors() {
+    // No event-model.json in the workspace → actionable failure, nonzero exit.
+    let temp = tempfile::tempdir().unwrap();
+    neo_cmd()
+        .args(["inspect", "sync"])
+        .current_dir(temp.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("event-model.json"));
+}
+
+// =====================================================================
 // `neo ide` — JSON-RPC over WebSocket
 //
 // Each test:
@@ -1777,4 +1968,146 @@ mod ide_ws {
             "expected a $/progress notification carrying the stub's stdout sentinel; got: {progress_log_lines:?}",
         );
     }
+}
+
+// =====================================================
+// `neo skills setup` (hermetic: NEO_SKIP_NETWORK stub, isolated NEO_HOME cache)
+// =====================================================
+//
+// Under NEO_SKIP_NETWORK the clone is replaced by a deterministic stub library
+// with one skill (`sample-skill`). Each test points NEO_HOME at its own tempdir
+// so the skills cache is isolated and the run is reproducible.
+
+/// `(project_dir, neo_home)` tempdirs — keep both alive for the command.
+fn skills_sandbox() -> (tempfile::TempDir, tempfile::TempDir) {
+    (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+}
+
+fn skills_cmd(project: &std::path::Path, neo_home: &std::path::Path) -> Command {
+    let mut cmd = neo_cmd();
+    cmd.current_dir(project)
+        .env("NEO_SKIP_NETWORK", "1")
+        .env("NEO_HOME", neo_home)
+        .arg("skills")
+        .arg("setup")
+        .arg("--ci");
+    cmd
+}
+
+#[test]
+fn skills_setup_ci_all_tools_creates_dests() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .arg("--all-tools")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] installed"));
+
+    assert!(proj.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+    // Codex installs to `.agents/skills`, NOT `.codex/skills`.
+    assert!(proj.path().join(".agents/skills/sample-skill/SKILL.md").exists());
+    assert!(!proj.path().join(".codex/skills").exists());
+    assert!(proj.path().join(".kiro/skills/sample-skill/SKILL.md").exists());
+    assert!(proj.path().join(".cursor/rules/sample-skill.mdc").exists());
+    let agents = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
+    assert!(agents.contains("BEGIN neo skills"));
+    assert!(agents.contains("### sample-skill"));
+}
+
+#[test]
+fn skills_setup_idempotent_twice() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
+    // Second run: every destination is unchanged → all 5 plan items skipped.
+    skills_cmd(proj.path(), home.path())
+        .arg("--all-tools")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped 5"));
+}
+
+#[test]
+fn skills_setup_overwrite_without_force_refused() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
+    // Tamper with an installed destination so it no longer matches the source.
+    std::fs::write(proj.path().join(".claude/skills/sample-skill/SKILL.md"), "tampered").unwrap();
+    skills_cmd(proj.path(), home.path())
+        .arg("--all-tools")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already exist"))
+        .stderr(predicate::str::contains("--force"));
+}
+
+#[test]
+fn skills_setup_overwrite_with_force() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
+    std::fs::write(proj.path().join(".claude/skills/sample-skill/SKILL.md"), "tampered").unwrap();
+    skills_cmd(proj.path(), home.path())
+        .args(["--all-tools", "--force"])
+        .assert()
+        .success();
+    let restored =
+        std::fs::read_to_string(proj.path().join(".claude/skills/sample-skill/SKILL.md")).unwrap();
+    assert!(restored.contains("name: sample-skill"), "force must restore from source");
+}
+
+#[test]
+fn skills_setup_dry_run_writes_nothing() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--all-tools", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("dry run"));
+    assert!(!proj.path().join(".claude").exists(), "dry run must not write");
+    assert!(!proj.path().join("AGENTS.md").exists(), "dry run must not write");
+}
+
+#[test]
+fn skills_setup_unknown_tool_errors() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--tool", "bogus"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("bogus"))
+        .stderr(predicate::str::contains("not a supported tool"));
+}
+
+#[test]
+fn skills_setup_unknown_skill_errors() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--all-tools", "--skill", "does-not-exist"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does-not-exist"));
+}
+
+#[test]
+fn skills_setup_ci_no_tool_defaults_all() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("defaulting to --all-tools"));
+    assert!(proj.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+}
+
+#[test]
+fn skills_setup_skill_filter_and_single_tool() {
+    let (proj, home) = skills_sandbox();
+    skills_cmd(proj.path(), home.path())
+        .args(["--tool", "claude", "--skill", "sample-skill"])
+        .assert()
+        .success();
+    assert!(proj.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+    // Only the requested tool is installed.
+    assert!(!proj.path().join(".agents/skills").exists());
+    assert!(!proj.path().join(".cursor").exists());
+    assert!(!proj.path().join("AGENTS.md").exists());
 }

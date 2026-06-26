@@ -11,6 +11,7 @@ import type {
   Chapter,
   Slice,
   Submodel,
+  Field,
 } from './types'
 
 let counter = 0
@@ -134,6 +135,19 @@ export function updateNodeName(
   }
 }
 
+/** Replace a node's schema `fields` (semantic zoom / Schema lens editor). */
+export function setNodeFields(
+  model: EventModel,
+  nodeId: string,
+  fields: readonly Field[],
+): EventModel {
+  if (!model.nodes.some((n) => n.id === nodeId)) return model
+  return {
+    ...model,
+    nodes: model.nodes.map((n) => (n.id === nodeId ? { ...n, fields } : n)),
+  }
+}
+
 // ── Edges ───────────────────────────────────────────────────
 
 const EDGE_RULES: Record<
@@ -246,12 +260,20 @@ export function assignEventToEntity(
 
 export function addChapter(
   model: EventModel,
-  params: { name: string },
+  params: { name: string; submodelId?: string | null },
 ): EventModel {
+  // A chapter created from a feature's sidebar lands IN that feature; an unknown
+  // submodel id (or null/undefined) falls back to ungrouped so the chapter is
+  // never orphaned to a band that doesn't exist.
+  const submodelId =
+    params.submodelId != null && model.submodels.some((s) => s.id === params.submodelId)
+      ? params.submodelId
+      : null
   const chapter: Chapter = {
     id: uid(),
     name: params.name,
     order: model.chapters.length,
+    submodelId,
   }
   return { ...model, chapters: [...model.chapters, chapter] }
 }
@@ -336,6 +358,81 @@ export function removeChapter(
     slices: model.slices.map((s) =>
       s.chapterId === chapterId ? { ...s, chapterId: null } : s,
     ),
+  }
+}
+
+/**
+ * Reorders chapters to match `orderedChapterIds` and renormalizes every
+ * chapter's `order` to a contiguous `0..n-1`. Unknown ids are ignored; any
+ * chapter omitted from the list is appended after (by ascending current
+ * order), so a partial list never drops a chapter. Immutable, and changes
+ * ONLY `chapter.order` — `submodelId` and every `slice.chapterId` are left
+ * untouched (reorder resequences the horizontal flow, it does not regroup).
+ * `chapter.order` is the user-authoritative horizontal axis; the Rust wave
+ * pass reads it and never overwrites it.
+ */
+export function reorderChapters(
+  model: EventModel,
+  orderedChapterIds: string[],
+): EventModel {
+  const byId = new Map(model.chapters.map((c) => [c.id, c]))
+  const seen = new Set<string>()
+  const ordered: Chapter[] = []
+  for (const id of orderedChapterIds) {
+    const c = byId.get(id)
+    if (c && !seen.has(id)) {
+      ordered.push(c)
+      seen.add(id)
+    }
+  }
+  for (const c of [...model.chapters].sort((a, b) => a.order - b.order)) {
+    if (!seen.has(c.id)) ordered.push(c)
+  }
+  return {
+    ...model,
+    chapters: ordered.map((c, i) => ({ ...c, order: i })),
+  }
+}
+
+/**
+ * Move a slice into `chapterId` (or detach with `chapterId = null`) AND
+ * resequence ALL slices to `orderedSliceIds`, in one pass. This is the single
+ * slice-mutation the navigator's drag-and-drop emits — it covers reordering
+ * WITHIN a chapter (chapterId unchanged) AND moving a slice ACROSS chapters
+ * (chapterId reassigned). `order` is renormalized to a contiguous `0..n-1`;
+ * unknown ids are ignored and any slice omitted from the list is appended (by
+ * ascending current order), so a partial list never drops a slice. Node
+ * `sliceId`s are untouched — a slice's nodes follow it. NOTE: "Tidy by flow"
+ * later re-derives slice order from the causal wave, overriding a manual one.
+ */
+export function moveSliceToChapter(
+  model: EventModel,
+  sliceId: string,
+  chapterId: string | null,
+  orderedSliceIds: string[],
+): EventModel {
+  if (!model.slices.some((s) => s.id === sliceId)) return model
+  if (chapterId !== null && !model.chapters.some((c) => c.id === chapterId)) return model
+  const byId = new Map(model.slices.map((s) => [s.id, s]))
+  const seen = new Set<string>()
+  const ordered: Slice[] = []
+  for (const id of orderedSliceIds) {
+    const s = byId.get(id)
+    if (s && !seen.has(id)) {
+      ordered.push(s)
+      seen.add(id)
+    }
+  }
+  for (const s of [...model.slices].sort((a, b) => a.order - b.order)) {
+    if (!seen.has(s.id)) ordered.push(s)
+  }
+  return {
+    ...model,
+    slices: ordered.map((s, i) => ({
+      ...s,
+      chapterId: s.id === sliceId ? chapterId : s.chapterId,
+      order: i,
+    })),
   }
 }
 

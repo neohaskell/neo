@@ -87,4 +87,33 @@ describe('serialize / deserialize', () => {
     const json = serialize(model)
     expect(() => JSON.parse(json)).not.toThrow()
   })
+
+  it('serialization_roundtrips_fields', () => {
+    // A node carrying schema `fields` must survive serialize → deserialize.
+    let model = createEventModel('WithFields')
+    model = addCommand(model, { name: 'PlaceOrder' })
+    const cmdId = model.nodes[0].id
+    model = {
+      ...model,
+      nodes: model.nodes.map((n) =>
+        n.id === cmdId ? { ...n, fields: [{ name: 'orderId', type: 'UUID' }, { name: 'total', type: 'Money' }] } : n,
+      ),
+    }
+    const restored = deserialize(serialize(model))
+    expect(restored).toEqual(model)
+    expect(restored.nodes[0].fields).toEqual([
+      { name: 'orderId', type: 'UUID' },
+      { name: 'total', type: 'Money' },
+    ])
+  })
+
+  it('defaults absent fields to undefined (back-compat, no fields key)', () => {
+    // A legacy node with no `fields` key deserializes unchanged.
+    const json = JSON.stringify({
+      ...createEventModel('Legacy'),
+      nodes: [{ id: 'n1', type: 'query', name: 'Q', sliceId: null }],
+    })
+    const restored = deserialize(json)
+    expect(restored.nodes[0]).not.toHaveProperty('fields')
+  })
 })

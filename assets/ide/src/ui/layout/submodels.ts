@@ -65,7 +65,7 @@ function boxOf(model: EventModel, nodeIds: string[]): Box | null {
     const pos = model.layout.nodePositions[node.id]
     if (!pos) continue
     found = true
-    const { width, height } = estimateNodeDimensions(node.name)
+    const { width, height } = estimateNodeDimensions(node.name, node.fields)
     minX = Math.min(minX, pos.x)
     minY = Math.min(minY, pos.y)
     maxX = Math.max(maxX, pos.x + width)

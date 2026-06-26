@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import classes from './EditableLabel.module.css'
 
 interface EditableLabelProps {
   label: string
@@ -43,7 +44,7 @@ export function EditableLabel({ label, onRename }: EditableLabelProps) {
     return (
       <input
         ref={inputRef}
-        className="bg-transparent text-inherit text-center w-full outline-none border-b border-current"
+        className={classes.input}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onBlur={commit}
@@ -59,7 +60,7 @@ export function EditableLabel({ label, onRename }: EditableLabelProps) {
         setValue(label)
         setEditing(true)
       }}
-      className="cursor-text select-none"
+      className={classes.label}
     >
       {label}
     </span>
