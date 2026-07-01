@@ -52,7 +52,11 @@ pub async fn kill_app(mut child: tokio::process::Child) {
 }
 
 pub async fn test(output_mode: &mut OutputMode) -> miette::Result<()> {
-    execute("cabal test all", output_mode).await
+    // `--test-show-details=direct` streams each suite's runner output (hspec's
+    // per-example results + `N examples, M failures` summary) instead of hiding it
+    // in a log file only shown on failure. Users see which tests ran, and CI output
+    // carries proof the suite actually executed rather than merely exiting 0.
+    execute("cabal test all --test-show-details=direct", output_mode).await
 }
 
 fn parse_cabal_progress(line: &str) -> Option<(usize, usize)> {

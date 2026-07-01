@@ -32,6 +32,7 @@ pub fn generate<P: AsRef<Path>>(
         git_dependencies => git_dependencies,
         file_dependencies => file_dependencies,
         neo_sha => config.neo_sha,
+        name => config.name,
     }).map_err(|e| NeoError::TemplateError { template: "cabal.project".to_string(), reason: e.to_string() })?;
 
     let out_path = project_dir.as_ref().join("cabal.project");
@@ -65,7 +66,7 @@ mod tests {
         let mut env = Environment::new();
         env.add_template(
             "cabal.project",
-            "packages:\n  *.cabal\nsha: {{ neo_sha }}\n{% for dep in git_dependencies %}source-repository-package\n    type: git\n    location: {{ dep.url }}\n    tag: {{ dep.rev }}\n{% endfor %}{% for dep in file_dependencies %}packages: {{ dep.path }}\n{% endfor %}",
+            "packages:\n  *.cabal\nsha: {{ neo_sha }}\n{% for dep in git_dependencies %}source-repository-package\n    type: git\n    location: {{ dep.url }}\n    tag: {{ dep.rev }}\n{% endfor %}{% for dep in file_dependencies %}packages: {{ dep.path }}\n{% endfor %}package {{ name }}\n  tests: True\n",
         )
         .unwrap();
         env
@@ -176,5 +177,21 @@ mod tests {
         let content = fs::read_to_string(dir.path().join("cabal.project")).unwrap();
         assert!(content.contains("sha: neo-sha"));
         assert!(!content.contains("source-repository-package"));
+        // Testing is built in by default → the per-package tests stanza is always present.
+        assert!(content.contains("tests: True"), "missing tests stanza:\n{}", content);
+    }
+
+    #[test]
+    fn cabal_project_always_enables_tests_for_app_package() {
+        // `package <name>\n tests: True` makes the (haskell.nix) plan include the
+        // app's test-suite; scoped to the app, not the source-repo-package deps.
+        let dir = tempdir().unwrap();
+        let env = stanza_env();
+        let mut config = rc(vec![]);
+        config.name = "my-app".to_string();
+        generate(dir.path(), &env, &config).unwrap();
+        let content = fs::read_to_string(dir.path().join("cabal.project")).unwrap();
+        assert!(content.contains("package my-app"), "missing per-package stanza:\n{}", content);
+        assert!(content.contains("tests: True"), "missing tests: True:\n{}", content);
     }
 }
