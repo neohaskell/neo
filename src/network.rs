@@ -294,6 +294,42 @@ pub async fn fetch_starter_template(dest: &Path) -> miette::Result<()> {
     Ok(())
 }
 
+/// The commit SHA that `<url>`'s default branch (HEAD) currently points at, or
+/// `None` if the remote could not be queried (offline, `git` missing, non-zero
+/// exit). A `None` here is treated as "keep the cache" by the caller, never a
+/// hard error.
+async fn remote_head_sha(url: &str) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .args(["ls-remote", url, "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // `git ls-remote <url> HEAD` prints `<sha>\tHEAD`; take the first field.
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// The commit SHA that the cached `<checkout>` is currently on, or `None` if it
+/// is not a readable git checkout (missing, corrupt).
+async fn cached_head_sha(checkout: &Path) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Clone (or reuse a cached clone of) `github.com/neohaskell/skills` and return
 /// the path to the local checkout, used by `neo skills setup`.
 ///
@@ -311,13 +347,29 @@ pub async fn fetch_skills_repo(refresh: bool) -> miette::Result<std::path::PathB
         .join("skills-cache");
     let checkout = cache.join("neohaskell-skills");
 
+    let url = "https://github.com/neohaskell/skills";
+
     if std::env::var("NEO_SKIP_NETWORK").is_ok() {
         write_skills_stub(&checkout)?;
         return Ok(checkout);
     }
 
+    // Reuse the cached checkout only when it already matches upstream HEAD.
+    // A cache captured before skills existed (or behind by any commit) is stale
+    // and would silently make `neo skills setup` report "no skills found" — so
+    // when the cached commit differs from upstream we fall through and re-clone.
+    // If upstream is unreachable (offline, git error) we keep whatever is cached
+    // rather than failing the whole command.
     if checkout.is_dir() && !refresh {
-        return Ok(checkout);
+        match remote_head_sha(url).await {
+            Some(upstream) if cached_head_sha(&checkout).await.as_deref() == Some(&upstream) => {
+                return Ok(checkout);
+            }
+            Some(_) => {
+                println!("Cached skills library is out of date — re-cloning…");
+            }
+            None => return Ok(checkout),
+        }
     }
 
     std::fs::create_dir_all(&cache)
@@ -331,7 +383,6 @@ pub async fn fetch_skills_repo(refresh: bool) -> miette::Result<std::path::PathB
         .map_err(|e| NeoError::io_at("creating a temp dir for the skills clone under", &cache, e))?;
     let clone_dest = tmp.path().join("checkout");
 
-    let url = "https://github.com/neohaskell/skills";
     let output = tokio::process::Command::new("git")
         .args(["clone", "--depth", "1", url])
         .arg(&clone_dest)
