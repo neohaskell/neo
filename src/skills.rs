@@ -31,9 +31,6 @@ pub enum Strategy {
     /// Render each skill to a single `<dir>/<name>.mdc` file with Cursor
     /// frontmatter. Bundled scripts cannot travel into a single file (warned).
     CursorRule { dir: &'static str },
-    /// Inline every selected skill's body into a managed block in a single
-    /// root file (e.g. `AGENTS.md`).
-    ManagedFile { path: &'static str },
 }
 
 /// How the always-on primer (`neohaskell.md`) reaches a tool.
@@ -77,22 +74,26 @@ impl Tool {
         match self.strategy {
             Strategy::FolderCopy { dir } => dir,
             Strategy::CursorRule { dir } => dir,
-            Strategy::ManagedFile { path } => path,
         }
     }
 }
 
 /// The v1 tool set: the three tools that natively read the `SKILL.md` format
-/// (folder-copied verbatim), plus Cursor and the universal `AGENTS.md`.
+/// (folder-copied verbatim), plus Cursor.
 ///
 /// The exact destination strings carry sharp collision traps — see the tests:
 ///   - Codex installs to `.agents/skills` (plural), NOT `.codex/skills`.
 ///   - `.agents/skills` (Codex) is one char from `.agent/rules` (Antigravity,
 ///     not yet supported) — do not "fix" it.
 ///
+/// There is deliberately no universal `AGENTS.md` "tool": inlining every skill's
+/// full body into one root file produced an unreadably large, incoherent file.
+/// Each tool gets its skills as discrete files instead.
+///
 /// The primer (`neohaskell.md`) is co-located with each tool's skills and wired
-/// into its instructions file: Claude imports it from `CLAUDE.md` via `@`; every
-/// other tool reads `AGENTS.md` wholesale, so the primer is inlined there.
+/// into its instructions file: Claude imports it from `CLAUDE.md` via `@`; Codex
+/// and Kiro read `AGENTS.md` wholesale, so the (single, small) primer is inlined
+/// there; Cursor gets a self-activating `.mdc` rule.
 pub const SUPPORTED_TOOLS: &[Tool] = &[
     Tool { id: "claude", display: "Claude Code", strategy: Strategy::FolderCopy { dir: ".claude/skills" },
            primer_dest: ".claude/neohaskell.md", instructions_file: "CLAUDE.md", primer_wiring: PrimerWiring::Import },
@@ -102,8 +103,6 @@ pub const SUPPORTED_TOOLS: &[Tool] = &[
            primer_dest: ".kiro/neohaskell.md", instructions_file: "AGENTS.md", primer_wiring: PrimerWiring::Inline },
     Tool { id: "cursor", display: "Cursor", strategy: Strategy::CursorRule { dir: ".cursor/rules" },
            primer_dest: ".cursor/rules/neohaskell.mdc", instructions_file: "", primer_wiring: PrimerWiring::CursorRule },
-    Tool { id: "agents", display: "AGENTS.md (universal)", strategy: Strategy::ManagedFile { path: "AGENTS.md" },
-           primer_dest: ".agents/neohaskell.md", instructions_file: "AGENTS.md", primer_wiring: PrimerWiring::Inline },
 ];
 
 /// Comma-separated list of valid `--tool` ids, for error help text.
@@ -351,7 +350,7 @@ pub fn filter_skills(all: Vec<Skill>, wanted: &[String]) -> miette::Result<Vec<S
 }
 
 // ---------------------------------------------------------------------------
-// Renderers (CursorRule + ManagedFile)
+// Renderers (CursorRule)
 // ---------------------------------------------------------------------------
 
 /// Render a skill as a Cursor `.mdc` rule file: Cursor frontmatter
@@ -362,66 +361,6 @@ pub fn render_cursor_mdc(skill: &Skill) -> String {
         desc = skill.description,
         body = skill.body.trim_end(),
     )
-}
-
-/// Sentinel delimiting the auto-managed region inside `AGENTS.md`. Content
-/// outside these markers is never touched.
-pub const AGENTS_BEGIN: &str =
-    "<!-- BEGIN neo skills (managed by `neo skills setup` — do not edit inside this block) -->";
-pub const AGENTS_END: &str = "<!-- END neo skills -->";
-
-/// Render the managed `AGENTS.md` block (markers included) that inlines every
-/// selected skill's description and body.
-pub fn render_agents_block(skills: &[Skill]) -> String {
-    let mut out = String::new();
-    out.push_str(AGENTS_BEGIN);
-    out.push('\n');
-    out.push_str("## NeoHaskell skills\n\n");
-    for skill in skills {
-        out.push_str(&format!("### {}\n\n", skill.name));
-        out.push_str(skill.description.trim());
-        out.push_str("\n\n");
-        let body = skill.body.trim();
-        if !body.is_empty() {
-            out.push_str(body);
-            out.push_str("\n\n");
-        }
-    }
-    out.push_str(AGENTS_END);
-    out.push('\n');
-    out
-}
-
-/// Insert or replace the managed skills block in an `AGENTS.md` document,
-/// preserving all content outside the markers. Idempotent: applying it to its
-/// own output yields the same string.
-pub fn upsert_managed_block(existing: &str, block: &str) -> String {
-    let block = block.trim_end_matches('\n');
-    if let (Some(start), Some(end_idx)) = (existing.find(AGENTS_BEGIN), existing.find(AGENTS_END)) {
-        let end = end_idx + AGENTS_END.len();
-        let before = &existing[..start];
-        let after = &existing[end..];
-        let mut out = String::new();
-        out.push_str(before);
-        out.push_str(block);
-        out.push_str(after);
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out
-    } else {
-        let mut out = String::new();
-        out.push_str(existing);
-        if !existing.is_empty() {
-            if !existing.ends_with('\n') {
-                out.push('\n');
-            }
-            out.push('\n');
-        }
-        out.push_str(block);
-        out.push('\n');
-        out
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -436,16 +375,15 @@ pub enum Action {
 }
 
 /// One unit of installation work: a (tool, skill) destination and what would
-/// happen to it. `ManagedFile` tools contribute a single aggregate item
-/// (`skill_name == "(all)"`) covering every skill.
+/// happen to it.
 #[derive(Debug, Clone)]
 pub struct PlanItem {
     pub tool_id: &'static str,
     pub skill_name: String,
     pub dest: PathBuf,
     pub action: Action,
-    /// Pre-rendered content for single-file strategies (CursorRule/ManagedFile);
-    /// `None` for FolderCopy (the source dir is copied at write time).
+    /// Pre-rendered content for the single-file CursorRule strategy; `None` for
+    /// FolderCopy (the source dir is copied at write time).
     pub rendered: Option<String>,
     /// Source skill dir for FolderCopy; `None` otherwise.
     pub src_dir: Option<PathBuf>,
@@ -494,26 +432,6 @@ pub fn build_plan(
                         warn_bundled: skill.has_bundled_files,
                     });
                 }
-            }
-            Strategy::ManagedFile { path } => {
-                let dest = project_root.join(path);
-                let existing = read_to_string_opt(&dest)?;
-                let block = render_agents_block(skills);
-                let new_content = upsert_managed_block(existing.as_deref().unwrap_or(""), &block);
-                let action = match &existing {
-                    None => Action::Create,
-                    Some(e) if *e == new_content => Action::Skip,
-                    Some(_) => Action::Overwrite,
-                };
-                plan.push(PlanItem {
-                    tool_id: tool.id,
-                    skill_name: "(all)".to_string(),
-                    dest,
-                    action,
-                    rendered: Some(new_content),
-                    src_dir: None,
-                    warn_bundled: false,
-                });
             }
         }
     }
@@ -646,9 +564,9 @@ fn walkdir_io(e: walkdir::Error, root: &Path) -> NeoError {
 /// Name of the primer file at the root of a `neohaskell/skills` checkout.
 pub const PRIMER_SOURCE: &str = "neohaskell.md";
 
-/// Sentinels delimiting the auto-managed primer block. Deliberately distinct
-/// from [`AGENTS_BEGIN`]/[`AGENTS_END`] so the primer block and the universal
-/// skills-inline block coexist in the same `AGENTS.md` without clobbering.
+/// Sentinels delimiting the auto-managed primer block in an instructions file.
+/// Content outside these markers (user-authored `AGENTS.md`/`CLAUDE.md` text) is
+/// never touched.
 pub const PRIMER_BEGIN: &str = "<!-- BEGIN neohaskell-skills -->";
 pub const PRIMER_END: &str = "<!-- END neohaskell-skills -->";
 
@@ -965,8 +883,10 @@ mod tests {
         assert_ne!(by("codex").dest_hint(), ".agent/rules");
         assert_eq!(by("kiro").dest_hint(), ".kiro/skills");
         assert_eq!(by("cursor").dest_hint(), ".cursor/rules");
-        assert_eq!(by("agents").dest_hint(), "AGENTS.md");
-        assert_eq!(SUPPORTED_TOOLS.len(), 5);
+        // There is no universal `AGENTS.md` "tool" — it was removed because
+        // inlining every skill body into one file produced an unusable blob.
+        assert!(SUPPORTED_TOOLS.iter().all(|t| t.id != "agents"));
+        assert_eq!(SUPPORTED_TOOLS.len(), 4);
     }
 
     #[test]
@@ -1073,56 +993,6 @@ mod tests {
         assert!(out.contains("do the thing"));
     }
 
-    #[test]
-    fn agents_block_inlines_bodies_and_upsert_is_idempotent() {
-        let skills = vec![Skill {
-            name: "foo".into(),
-            description: "Use when X".into(),
-            dir: PathBuf::from("/x"),
-            body: "Step one.".into(),
-            has_bundled_files: false,
-        }];
-        let block = render_agents_block(&skills);
-        assert!(block.contains("### foo"));
-        assert!(block.contains("Use when X"));
-        assert!(block.contains("Step one."));
-
-        let existing = "# My AGENTS\n\nProject rules.\n";
-        let once = upsert_managed_block(existing, &block);
-        assert!(once.contains("# My AGENTS"));
-        assert!(once.contains("Project rules."));
-        assert!(once.contains(AGENTS_BEGIN));
-        // Idempotent: re-applying to its own output is a fixed point.
-        let twice = upsert_managed_block(&once, &block);
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn upsert_replaces_block_and_preserves_surrounding_content() {
-        let block_v1 = render_agents_block(&[Skill {
-            name: "a".into(),
-            description: "first".into(),
-            dir: PathBuf::from("/"),
-            body: "one".into(),
-            has_bundled_files: false,
-        }]);
-        let block_v2 = render_agents_block(&[Skill {
-            name: "b".into(),
-            description: "second".into(),
-            dir: PathBuf::from("/"),
-            body: "two".into(),
-            has_bundled_files: false,
-        }]);
-        let base = "TOP\n";
-        let v1 = upsert_managed_block(base, &block_v1);
-        let tail = format!("{v1}\nBOTTOM\n");
-        let v2 = upsert_managed_block(&tail, &block_v2);
-        assert!(v2.starts_with("TOP\n"));
-        assert!(v2.contains("BOTTOM"));
-        assert!(v2.contains("### b"));
-        assert!(!v2.contains("### a"), "old block must be replaced: {v2}");
-    }
-
     // ---- plan + write ----
 
     #[test]
@@ -1130,7 +1000,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let c = checkout_with("foo", "d", false);
         let skills = discover_skills(c.path()).unwrap();
-        let tools = resolve_tools(&["claude".into(), "cursor".into(), "agents".into()]).unwrap();
+        let tools = resolve_tools(&["claude".into(), "cursor".into()]).unwrap();
 
         // First run: everything is Create.
         let plan = build_plan(root.path(), &tools, &skills).unwrap();
@@ -1140,7 +1010,6 @@ mod tests {
         }
         assert!(root.path().join(".claude/skills/foo/SKILL.md").exists());
         assert!(root.path().join(".cursor/rules/foo.mdc").exists());
-        assert!(root.path().join("AGENTS.md").exists());
 
         // Second run with identical inputs: everything is Skip (idempotent).
         let plan2 = build_plan(root.path(), &tools, &skills).unwrap();
@@ -1223,7 +1092,6 @@ mod tests {
         // rule there, NOT an AGENTS.md inline.
         assert_eq!(by("cursor").primer_dest, ".cursor/rules/neohaskell.mdc");
         assert_eq!(by("cursor").primer_wiring, PrimerWiring::CursorRule);
-        assert_eq!(by("agents").primer_dest, ".agents/neohaskell.md");
     }
 
     #[test]
@@ -1315,29 +1183,23 @@ mod tests {
     // ---- primer: plan + apply ----
 
     #[test]
-    fn build_primer_plan_create_skip_overwrite_and_coexists_with_skills_block() {
+    fn build_primer_plan_create_skip_overwrite_and_preserves_user_content() {
         let root = tempfile::tempdir().unwrap();
-        let tools = resolve_tools(&["claude".into(), "codex".into(), "agents".into()]).unwrap();
+        let tools = resolve_tools(&["claude".into(), "codex".into()]).unwrap();
         let body = "# Primer\nStart here.\n";
 
         // First run: primer file + wire are Create.
         let plan = build_primer_plan(root.path(), &tools, body).unwrap();
         assert!(plan.files.iter().all(|f| f.action == Action::Create));
         assert!(plan.wires.iter().all(|w| w.action == Action::Create));
-        // codex + agents share `.agents/neohaskell.md` → deduped to one file item;
-        // claude adds `.claude/neohaskell.md`. Two distinct files.
+        // claude → `.claude/neohaskell.md`, codex → `.agents/neohaskell.md`.
         assert_eq!(plan.files.len(), 2, "primer file installs deduped by dest");
-        // CLAUDE.md (claude) + AGENTS.md (codex+agents deduped) → two wires.
+        // CLAUDE.md (claude) + AGENTS.md (codex) → two wires.
         assert_eq!(plan.wires.len(), 2, "wires deduped by instructions file");
 
-        // Pre-seed AGENTS.md with the existing universal skills-inline block, then
-        // apply — the primer block must coexist, not clobber it.
-        let skills_block = render_agents_block(&[Skill {
-            name: "s".into(), description: "d".into(), dir: PathBuf::from("/"),
-            body: "b".into(), has_bundled_files: false,
-        }]);
-        let seeded = upsert_managed_block("", &skills_block);
-        std::fs::write(root.path().join("AGENTS.md"), &seeded).unwrap();
+        // Pre-seed AGENTS.md with user content and no managed block, then apply —
+        // the primer block must be appended without touching the user content.
+        std::fs::write(root.path().join("AGENTS.md"), "# House rules\n\nkeep me.\n").unwrap();
 
         let plan = build_primer_plan(root.path(), &tools, body).unwrap();
         for f in &plan.files { apply_primer_file(f).unwrap(); }
@@ -1348,7 +1210,8 @@ mod tests {
         let claude_md = std::fs::read_to_string(root.path().join("CLAUDE.md")).unwrap();
         assert!(claude_md.contains("@.claude/neohaskell.md"), "claude wires via @import: {claude_md}");
         let agents_md = std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap();
-        assert!(agents_md.contains(AGENTS_BEGIN), "existing skills block preserved");
+        assert!(agents_md.contains("# House rules"), "user content preserved");
+        assert!(agents_md.contains("keep me."), "user content preserved");
         assert!(agents_md.contains(PRIMER_BEGIN), "primer block added");
         assert!(agents_md.contains("Start here."), "AGENTS.md inlines the primer body");
 

@@ -2046,23 +2046,25 @@ fn skills_setup_ci_all_tools_creates_dests() {
     assert!(!proj.path().join(".codex/skills").exists());
     assert!(proj.path().join(".kiro/skills/sample-skill/SKILL.md").exists());
     assert!(proj.path().join(".cursor/rules/sample-skill.mdc").exists());
+    // There is no universal AGENTS.md skills dump. AGENTS.md exists only because
+    // codex/kiro inline the (single, small) primer into it — never the skill bodies.
     let agents = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
-    assert!(agents.contains("BEGIN neo skills"));
-    assert!(agents.contains("### sample-skill"));
+    assert!(!agents.contains("BEGIN neo skills"), "no universal skills block");
+    assert!(!agents.contains("### sample-skill"), "skill bodies not inlined into AGENTS.md");
+    assert!(agents.contains("<!-- BEGIN neohaskell-skills -->"), "primer inlined into AGENTS.md");
 }
 
 #[test]
 fn skills_setup_idempotent_twice() {
     let (proj, home) = skills_sandbox();
     skills_cmd(proj.path(), home.path()).arg("--all-tools").assert().success();
-    // Second run: everything is unchanged. 5 skill items + 4 deduped primer
-    // files (.agents/neohaskell.md is shared by codex+agents) + 2 deduped primer
-    // wires (CLAUDE.md, AGENTS.md) = 11 skipped.
+    // Second run: everything is unchanged. 4 skill items (one per tool) + 4
+    // distinct primer files + 2 deduped primer wires (CLAUDE.md, AGENTS.md) = 10.
     skills_cmd(proj.path(), home.path())
         .arg("--all-tools")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skipped 11"));
+        .stdout(predicate::str::contains("skipped 10"));
 }
 
 #[test]
@@ -2088,9 +2090,9 @@ fn skills_setup_installs_primer_file_and_wiring() {
     assert!(claude_md.contains("@.claude/neohaskell.md"));
     assert!(claude_md.contains("<!-- END neohaskell-skills -->"));
 
-    // AGENTS.md carries BOTH the universal skills block and the inlined primer.
+    // AGENTS.md carries only the inlined primer (no universal skills dump).
     let agents_md = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
-    assert!(agents_md.contains("BEGIN neo skills"), "skills block preserved");
+    assert!(!agents_md.contains("BEGIN neo skills"), "no universal skills block");
     assert!(agents_md.contains("<!-- BEGIN neohaskell-skills -->"), "primer block present");
     assert!(agents_md.contains("NeoHaskell primer"), "primer body inlined into AGENTS.md");
 }
@@ -2107,8 +2109,9 @@ fn skills_setup_no_primer_skips_primer() {
     // …but no primer file or CLAUDE.md wiring is written.
     assert!(!proj.path().join(".claude/neohaskell.md").exists());
     assert!(!proj.path().join("CLAUDE.md").exists());
-    let agents_md = std::fs::read_to_string(proj.path().join("AGENTS.md")).unwrap();
-    assert!(!agents_md.contains("neohaskell-skills"), "no primer block with --no-primer");
+    // AGENTS.md is only ever written to inline the primer; with `--no-primer`
+    // (and no universal AGENTS.md skills dump) nothing writes it at all.
+    assert!(!proj.path().join("AGENTS.md").exists(), "AGENTS.md not written with --no-primer");
 }
 
 #[test]
@@ -2226,4 +2229,190 @@ fn skills_setup_skill_filter_and_single_tool() {
     assert!(!proj.path().join(".agents/skills").exists());
     assert!(!proj.path().join(".cursor").exists());
     assert!(!proj.path().join("AGENTS.md").exists());
+}
+
+// ============================================================
+// `neo validate` — event-model.json linter (exit-code contract)
+//   0 valid · 1 IO failure · 2 invalid · 3 malformed JSON · 4 absent
+// ============================================================
+
+const VALID_MODEL: &str = r#"{
+  "id": "m1",
+  "name": "demo",
+  "chapters": [],
+  "entities": [],
+  "slices": [],
+  "nodes": [],
+  "edges": [],
+  "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}"#;
+
+fn write_model(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    let p = dir.join("event-model.json");
+    std::fs::write(&p, body).unwrap();
+    p
+}
+
+#[test]
+fn validate_valid_model_exits_0() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_model(temp.path(), VALID_MODEL);
+    neo_cmd()
+        .arg("validate")
+        .arg(&path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] event-model.json is valid"));
+}
+
+#[test]
+fn validate_invalid_model_exits_2() {
+    // Valid JSON, but the required root `id` is missing → schema error.
+    let temp = tempfile::tempdir().unwrap();
+    let bad = r#"{"name":"demo","chapters":[],"entities":[],"slices":[],"nodes":[],"edges":[],"layout":{"nodePositions":{},"viewport":{"x":0,"y":0,"zoom":1}}}"#;
+    let path = write_model(temp.path(), bad);
+    neo_cmd()
+        .arg("validate")
+        .arg(&path)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("[error]"))
+        .stdout(predicate::str::contains("[fail]"));
+}
+
+#[test]
+fn validate_orphan_edge_exits_2() {
+    // Schema-valid but an edge references a node id that is not in `nodes`.
+    let temp = tempfile::tempdir().unwrap();
+    let model = serde_json::json!({
+        "id": "m1", "name": "demo",
+        "chapters": [], "entities": [], "slices": [],
+        "nodes": [{"id": "n1", "type": "event", "name": "Ev", "entityId": null, "sliceId": null}],
+        "edges": [{"id": "ed1", "type": "commandProducesEvent", "sourceId": "missing", "targetId": "n1"}],
+        "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+    });
+    let path = write_model(temp.path(), &serde_json::to_string_pretty(&model).unwrap());
+    neo_cmd()
+        .arg("validate")
+        .arg(&path)
+        .assert()
+        .code(2)
+        // The referential message must carry the actionable fix recipe verbatim.
+        .stdout(predicate::str::contains("missing"))
+        .stdout(predicate::str::contains("delete this edge"));
+}
+
+#[test]
+fn validate_malformed_json_exits_3() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_model(temp.path(), "{not json");
+    neo_cmd()
+        .arg("validate")
+        .arg(&path)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("is not valid JSON"));
+}
+
+#[test]
+fn validate_missing_file_exits_4() {
+    // Empty dir, default path → <cwd>/event-model.json does not exist → exit 4.
+    let temp = tempfile::tempdir().unwrap();
+    neo_cmd()
+        .current_dir(temp.path())
+        .arg("validate")
+        .assert()
+        .code(4)
+        .stdout(predicate::str::contains("no event-model.json"))
+        .stdout(predicate::str::contains("neo ide"));
+}
+
+#[test]
+fn validate_directory_arg_exits_1() {
+    // Path points at a directory → genuine IO failure → miette Err → exit 1.
+    let temp = tempfile::tempdir().unwrap();
+    neo_cmd()
+        .arg("validate")
+        .arg(temp.path())
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("reading `event-model.json`"));
+}
+
+#[test]
+fn validate_default_path_uses_cwd() {
+    let temp = tempfile::tempdir().unwrap();
+    write_model(temp.path(), VALID_MODEL);
+    neo_cmd()
+        .current_dir(temp.path())
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok]"));
+}
+
+#[test]
+fn validate_json_flag_pure_json_and_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let bad = r#"{"name":"demo","chapters":[],"entities":[],"slices":[],"nodes":[],"edges":[],"layout":{"nodePositions":{},"viewport":{"x":0,"y":0,"zoom":1}}}"#;
+    let path = write_model(temp.path(), bad);
+    let assert = neo_cmd()
+        .args(["validate", "--json", "--ci"])
+        .arg(&path)
+        .assert()
+        .code(2);
+    let out = assert.get_output();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // stdout is PURE JSON — no human prefixes leaked in.
+    assert!(!stdout.contains("[error]"), "json stdout must not contain [error]: {stdout}");
+    assert!(!stdout.contains("[fail]"), "json stdout must not contain [fail]: {stdout}");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be a single pure-JSON document");
+    assert_eq!(v["status"], "invalid");
+    assert!(v["errors"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+}
+
+#[test]
+fn validate_json_valid_status_exit_0() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = write_model(temp.path(), VALID_MODEL);
+    let assert = neo_cmd()
+        .args(["validate", "--json", "--ci"])
+        .arg(&path)
+        .assert()
+        .success();
+    let out = assert.get_output();
+    let v: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(v["status"], "valid");
+}
+
+#[test]
+fn validate_is_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    let model = serde_json::json!({
+        "id": "m1", "name": "demo",
+        "chapters": [], "entities": [], "slices": [],
+        "nodes": [{"id": "n1", "type": "event", "name": "Ev", "entityId": "ghost", "sliceId": null}],
+        "edges": [],
+        "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+    });
+    let path = write_model(temp.path(), &serde_json::to_string_pretty(&model).unwrap());
+    let run = || {
+        let out = neo_cmd().args(["validate", "--ci"]).arg(&path).assert().code(2);
+        String::from_utf8_lossy(&out.get_output().stdout).to_string()
+    };
+    assert_eq!(run(), run(), "validate output must be byte-stable across runs");
+}
+
+#[test]
+fn validate_does_not_modify_file() {
+    // A linter must be read-only. An invalid file is byte-identical after the run.
+    let temp = tempfile::tempdir().unwrap();
+    let bad = r#"{"name":"demo","chapters":[],"entities":[],"slices":[],"nodes":[],"edges":[],"layout":{"nodePositions":{},"viewport":{"x":0,"y":0,"zoom":1}}}"#;
+    let path = write_model(temp.path(), bad);
+    let before = std::fs::read(&path).unwrap();
+    neo_cmd().args(["validate", "--ci"]).arg(&path).assert().code(2);
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(before, after, "validate must not modify the target file");
 }

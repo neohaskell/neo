@@ -6,4 +6,5 @@ pub mod new;
 pub mod run;
 pub mod skills;
 pub mod test;
+pub mod validate;
 pub mod watch_common;

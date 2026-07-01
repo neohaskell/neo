@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "neo", version, about = "The NeoHaskell CLI")]
@@ -86,16 +87,34 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: Option<InspectSubcommand>,
     },
+    /// Validate `event-model.json` against the schema + referential rules
+    #[command(long_about = "Validate the project's `event-model.json` (the event model the `neo ide` \
+                            authors) against the embedded JSON Schema and referential-integrity rules, \
+                            without launching the browser IDE. Reads `<cwd>/event-model.json` by default, \
+                            or the PATH you pass. Read-only — it never modifies the file.\n\n\
+                            Exit codes: 0 = valid; 1 = could not read the file (IO error / permissions); \
+                            2 = invalid (schema and/or referential errors); 3 = the file is not valid JSON; \
+                            4 = the file does not exist. A missing model is a failure, not a no-op. \
+                            Pass `--json` to emit the machine-readable validation result on stdout (the exit \
+                            code still mirrors the status), e.g. `neo validate --json | jq -e '.status == \"valid\"'`.")]
+    Validate {
+        /// Path to the event model file (defaults to `<cwd>/event-model.json`)
+        path: Option<PathBuf>,
+        /// Emit the validation result as JSON on stdout instead of human-readable lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Install shared NeoHaskell skills into your AI coding tools
     #[command(long_about = "Fetch the shared skill library from github.com/neohaskell/skills and \
                             install the skills into the right project-root folders for the AI coding \
-                            agents you use (Claude Code, OpenAI Codex, Kiro, Cursor, and the universal \
-                            AGENTS.md). Run `neo skills setup` for an interactive tool picker; in --ci \
+                            agents you use (Claude Code, OpenAI Codex, Kiro, Cursor). Run \
+                            `neo skills setup` for an interactive tool picker; in --ci \
                             mode it installs for every supported tool unless you pass `--tool <id>`. \
                             If the library ships a primer (neohaskell.md), it is also installed next to \
                             each tool's skills and wired in: Claude imports it from CLAUDE.md via an \
-                            `@`-import, Cursor gets a self-activating `.cursor/rules` rule, and the rest \
-                            inline it into a managed block in AGENTS.md; pass `--no-primer` to skip that.")]
+                            `@`-import, Cursor gets a self-activating `.cursor/rules` rule, and Codex \
+                            and Kiro inline it into a managed block in AGENTS.md; pass `--no-primer` \
+                            to skip that.")]
     Skills {
         #[command(subcommand)]
         subcommand: Option<SkillsSubcommand>,
@@ -129,7 +148,7 @@ pub enum InspectSubcommand {
 pub enum SkillsSubcommand {
     /// Fetch neohaskell/skills and install skills into your tools' folders
     Setup {
-        /// Install for this tool (repeatable): claude, codex, kiro, cursor, agents
+        /// Install for this tool (repeatable): claude, codex, kiro, cursor
         #[arg(long = "tool")]
         tools: Vec<String>,
         /// Install for every supported tool
@@ -261,6 +280,30 @@ mod tests {
         match cli.command {
             Some(Commands::Inspect { subcommand: Some(InspectSubcommand::Sync) }) => {}
             other => panic!("Expected Inspect Sync, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_parse_validate() {
+        let cli = Cli::try_parse_from(["neo", "validate"]).unwrap();
+        match cli.command {
+            Some(Commands::Validate { path, json }) => {
+                assert!(path.is_none());
+                assert!(!json);
+            }
+            _ => panic!("Expected Validate command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_validate_with_path_and_json() {
+        let cli = Cli::try_parse_from(["neo", "validate", "./model.json", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Validate { path, json }) => {
+                assert_eq!(path, Some(std::path::PathBuf::from("./model.json")));
+                assert!(json);
+            }
+            _ => panic!("Expected Validate command"),
         }
     }
 

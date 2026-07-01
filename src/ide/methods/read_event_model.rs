@@ -34,54 +34,69 @@ pub struct ReadEventModelResult {
     pub validation: ValidationOutcome,
 }
 
+/// Read `path` and validate it against the schema + referential rules.
+///
+/// The single source of truth shared by the IDE `workspace/readEventModel`
+/// handler below AND the `neo validate` CLI (`src/commands/validate.rs`), so the
+/// two can never disagree on what "valid / absent / invalid / malformed" means.
+///
+/// - Missing file → `Ok((None, NotFound))` — absence is deliberately NOT an IO
+///   error (a fresh project legitimately has no model yet).
+/// - Any other IO failure (permissions, path is a directory, …) → `Err(io_at)`.
+/// - Readable file → `Ok((Some(content), validate_event_model(&content)))`; the
+///   content is returned even when validation fails so callers can display it.
+pub fn read_and_validate(
+    path: &std::path::Path,
+) -> Result<(Option<String>, ValidationOutcome), NeoError> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let validation = validate::validate_event_model(&content);
+            Ok((Some(content), validation))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((None, ValidationOutcome::not_found()))
+        }
+        Err(e) => Err(NeoError::io_at(
+            "reading `event-model.json`",
+            path.to_path_buf(),
+            e,
+        )),
+    }
+}
+
 pub async fn handle(
     session: Session,
     _params: ReadEventModelParams,
 ) -> Result<ReadEventModelResult, NeoError> {
     let path = session.workspace.root.join(EVENT_MODEL_FILENAME);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let validation = validate::validate_event_model(&content);
-            match &validation {
-                ValidationOutcome::Valid => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        bytes = content.len(),
-                        "readEventModel: valid",
-                    );
-                }
-                ValidationOutcome::Invalid { errors } => {
-                    tracing::info!(
-                        path = %path.display(),
-                        error_count = errors.len(),
-                        "readEventModel: validation errors",
-                    );
-                }
-                ValidationOutcome::MalformedJson { parse_error } => {
-                    tracing::info!(
-                        path = %path.display(),
-                        parse_error = %parse_error,
-                        "readEventModel: file is malformed JSON",
-                    );
-                }
-                ValidationOutcome::NotFound => {
-                    // Cannot happen on this branch — read_to_string succeeded.
-                }
-            }
-            Ok(ReadEventModelResult {
-                content: Some(content),
-                validation,
-            })
+    let (content, validation) = read_and_validate(&path)?;
+    match &validation {
+        ValidationOutcome::Valid => {
+            tracing::debug!(
+                path = %path.display(),
+                bytes = content.as_deref().map(str::len).unwrap_or(0),
+                "readEventModel: valid",
+            );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        ValidationOutcome::Invalid { errors } => {
+            tracing::info!(
+                path = %path.display(),
+                error_count = errors.len(),
+                "readEventModel: validation errors",
+            );
+        }
+        ValidationOutcome::MalformedJson { parse_error } => {
+            tracing::info!(
+                path = %path.display(),
+                parse_error = %parse_error,
+                "readEventModel: file is malformed JSON",
+            );
+        }
+        ValidationOutcome::NotFound => {
             tracing::debug!(path = %path.display(), "readEventModel: file not found");
-            Ok(ReadEventModelResult {
-                content: None,
-                validation: ValidationOutcome::not_found(),
-            })
         }
-        Err(e) => Err(NeoError::io_at("reading `event-model.json`", path, e)),
     }
+    Ok(ReadEventModelResult { content, validation })
 }
 
 #[cfg(test)]

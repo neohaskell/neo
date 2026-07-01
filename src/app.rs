@@ -76,6 +76,9 @@ pub async fn dispatch(
         Some(Commands::Inspect { subcommand }) => {
             commands::inspect::run(subcommand)?;
         }
+        Some(Commands::Validate { path, json }) => {
+            commands::validate::run(path, json)?;
+        }
         Some(Commands::Skills { subcommand }) => {
             commands::skills::run(subcommand, output_mode).await?;
         }

@@ -86,6 +86,55 @@ fn e2e_inspect_sync_force_from_cli() {
 
 #[test]
 #[ignore]
+fn e2e_validate_missing_then_valid_then_invalid() {
+    // Prove the SHIPPED binary's `neo validate` exit-code contract end-to-end.
+    // No nix/cabal build needed — validate only reads JSON — so this is a fast
+    // CLI-surface scenario like `e2e_inspect_sync_force_from_cli`.
+    let sb = Sandbox::new("e2e_validate_missing_then_valid_then_invalid");
+    let proj = sb.path("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let model_path = proj.join("event-model.json");
+
+    // 1. Absent model → exit 4 (a missing model is a failure, not a no-op).
+    sb.neo("proj")
+        .arg("validate")
+        .assert()
+        .code(4)
+        .stdout(predicate::str::contains("no event-model.json"));
+
+    // 2. Valid model → exit 0.
+    std::fs::write(
+        &model_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "id": "m1", "name": "demo",
+            "chapters": [], "entities": [], "slices": [], "nodes": [], "edges": [],
+            "layout": { "nodePositions": {}, "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    sb.neo("proj")
+        .arg("validate")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ok] event-model.json is valid"));
+
+    // 3. Corrupt the file (unparseable) → exit 3, and the file is left untouched.
+    std::fs::write(&model_path, "{ not json").unwrap();
+    sb.neo("proj")
+        .arg("validate")
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("is not valid JSON"));
+    assert_eq!(
+        std::fs::read_to_string(&model_path).unwrap(),
+        "{ not json",
+        "validate must not modify the file it lints",
+    );
+}
+
+#[test]
+#[ignore]
 fn surface_help_lists_all_subcommands() {
     let sb = Sandbox::new("surface_help_lists_all_subcommands");
     sb.neo(".")
@@ -98,7 +147,8 @@ fn surface_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("run"))
         .stdout(predicate::str::contains("test"))
         .stdout(predicate::str::contains("lock"))
-        .stdout(predicate::str::contains("skills"));
+        .stdout(predicate::str::contains("skills"))
+        .stdout(predicate::str::contains("validate"));
 }
 
 #[test]
