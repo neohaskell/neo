@@ -365,6 +365,22 @@ async fn do_scaffold(config: ProjectConfig) -> miette::Result<()> {
             .map_err(|e| crate::errors::NeoError::io_at("writing `src/App.hs` to", &src_app, e))?;
     }
 
+    // Scaffold a working Hspec/QuickCheck example so `neo test` compiles and runs a
+    // real Haskell test out of the box — but only when the starter shipped no Haskell
+    // spec of its own (the starter's `tests/` already holds `.hurl` scenarios, so we
+    // gate on the absence of `*Spec.hs`, not the directory). Reconcile (below) writes
+    // the `tests/Spec.hs` hspec-discover driver and emits the `test-suite` stanza.
+    // Haskell specs and `.hurl` e2e scenarios share the one `tests/` directory.
+    if crate::reconcile::test_suite::other_modules(&project_path).is_empty() {
+        let test_dir = project_path.join("tests");
+        std::fs::create_dir_all(&test_dir)
+            .map_err(|e| crate::errors::NeoError::io_at("creating the `tests/` directory at", &test_dir, e))?;
+        let example_spec = test_dir.join("ExampleSpec.hs");
+        let example_content = "module ExampleSpec (spec) where\n\nimport Core\nimport Test\n\n\nspec :: Spec Unit\nspec = describe \"Example\" do\n  it \"runs a passing test\" \\_ -> do\n    (1 + 1 :: Int) |> shouldBe 2\n";
+        std::fs::write(&example_spec, example_content)
+            .map_err(|e| crate::errors::NeoError::io_at("writing `tests/ExampleSpec.hs` to", &example_spec, e))?;
+    }
+
     // Run reconciliation to generate .cabal, flake.nix, etc.
     // This ensures these files exist and can be tracked by Git
     let neo_config = crate::config::NeoConfig {

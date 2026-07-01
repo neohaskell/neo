@@ -8,6 +8,7 @@ pub mod dep_spec;
 pub mod flake;
 pub mod modules;
 pub mod resolve;
+pub mod test_suite;
 
 use std::path::Path;
 
@@ -34,7 +35,13 @@ pub async fn run<P: AsRef<Path>>(project_dir: P, config: &NeoConfig) -> miette::
     let resolved = resolve::resolve(config).await?;
     let modules = modules::discover(project_dir.join("src"));
 
-    cabal::generate(project_dir, &env, &resolved, &modules)?;
+    // Testing is built in by default: every project has a `test-suite` so `neo test`
+    // is always available. Guarantee the hspec-discover driver (`tests/Spec.hs`) so
+    // `main-is: Spec.hs` always resolves, then list every sibling spec as other-modules.
+    test_suite::ensure_driver(project_dir)?;
+    let test_modules = test_suite::other_modules(project_dir);
+
+    cabal::generate(project_dir, &env, &resolved, &modules, &test_modules)?;
     flake::generate(project_dir, &env, &resolved)?;
     cabal_project::generate(project_dir, &env, &resolved)?;
 
@@ -105,6 +112,61 @@ mod tests {
 
         let flake_content = fs::read_to_string(project_dir.join("flake.nix")).unwrap();
         assert!(flake_content.contains("description = \"A test project\""));
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_emits_test_suite_and_ensures_driver() {
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path();
+
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(project_dir.join("src/App.hs"), "").unwrap();
+        // A `tests/` with a spec but NO driver yet — reconcile must write the driver.
+        fs::create_dir_all(project_dir.join("tests")).unwrap();
+        fs::write(project_dir.join("tests/ExampleSpec.hs"), "").unwrap();
+
+        let config = fixture_config();
+        unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
+        run(project_dir, &config).await.unwrap();
+
+        // hspec-discover driver was created.
+        let driver = project_dir.join("tests/Spec.hs");
+        assert!(driver.exists(), "reconcile must create the tests/Spec.hs driver");
+        assert!(fs::read_to_string(&driver).unwrap().contains("hspec-discover"));
+
+        // Generated cabal carries the test-suite with the discovered spec.
+        let cabal = fs::read_to_string(project_dir.join("my-project.cabal")).unwrap();
+        assert!(cabal.contains("test-suite my-project-test"), "got:\n{}", cabal);
+        assert!(cabal.contains("main-is: Spec.hs"), "got:\n{}", cabal);
+        assert!(cabal.contains("ExampleSpec"), "got:\n{}", cabal);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_always_provides_test_suite_even_without_test_dir() {
+        // Testing is built in by default: a project with no `tests/` at all still gets
+        // the driver, the test-suite stanza, and `tests: True` — so `neo test` works.
+        let dir = tempdir().unwrap();
+        let project_dir = dir.path();
+
+        fs::create_dir_all(project_dir.join("src")).unwrap();
+        fs::write(project_dir.join("src/App.hs"), "").unwrap();
+
+        let config = fixture_config();
+        unsafe { std::env::set_var("NEO_SKIP_NETWORK", "1"); }
+        run(project_dir, &config).await.unwrap();
+
+        assert!(
+            project_dir.join("tests/Spec.hs").exists(),
+            "reconcile must create the hspec-discover driver even without a pre-existing tests/"
+        );
+        let cabal = fs::read_to_string(project_dir.join("my-project.cabal")).unwrap();
+        assert!(cabal.contains("test-suite my-project-test"), "got:\n{}", cabal);
+        let cabal_project = fs::read_to_string(project_dir.join("cabal.project")).unwrap();
+        assert!(
+            cabal_project.contains("package my-project") && cabal_project.contains("tests: True"),
+            "cabal.project must enable tests:\n{}",
+            cabal_project
+        );
     }
 
     #[tokio::test]

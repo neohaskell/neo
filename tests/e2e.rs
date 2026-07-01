@@ -186,6 +186,25 @@ fn new_ci_creates_full_project() {
         "cabal.project not generated"
     );
 
+    // A working Hspec/QuickCheck test-suite ships with every new project. Haskell
+    // specs live under `tests/` (alongside `.hurl`); reconcile writes the driver.
+    assert!(project.join("tests/Spec.hs").exists(), "tests/Spec.hs (hspec-discover driver) missing");
+    let cabal = std::fs::read_to_string(project.join("my-app.cabal")).unwrap();
+    assert!(
+        cabal.contains("test-suite my-app-test"),
+        "generated .cabal missing test-suite stanza:\n{}",
+        cabal
+    );
+    assert!(cabal.contains("main-is: Spec.hs"), "test-suite missing hspec-discover driver:\n{}", cabal);
+    assert!(cabal.contains("hs-source-dirs: tests"), "test-suite must source from tests/:\n{}", cabal);
+    // cabal.project must enable the suite in the plan so `cabal test all` resolves offline.
+    let cabal_project = std::fs::read_to_string(project.join("cabal.project")).unwrap();
+    assert!(
+        cabal_project.contains("package my-app") && cabal_project.contains("tests: True"),
+        "cabal.project must enable tests for the project package:\n{}",
+        cabal_project
+    );
+
     let flake = std::fs::read_to_string(project.join("flake.nix")).unwrap();
     assert!(
         !flake.contains("deadbeef"),
@@ -599,7 +618,16 @@ fn test_ci_no_hurl_runs_unit_only() {
         .timeout(Duration::from_secs(120))
         .assert()
         .success();
-    sb.neo("app")
+    // This scenario exercises the no-Hurl branch of `neo test` (the "No Hurl
+    // integration tests found" path), so it needs a project with no `.hurl` files.
+    // Haskell specs and Hurl share `tests/`, so remove only the starter's Hurl
+    // subdirectories — the Haskell suite (tests/Spec.hs + specs) must remain and run.
+    // The Hurl-present path is covered by `test_ci_with_hurl_discovers_and_runs_integration`
+    // and the full unit+Hurl flow by integration's `test_neo_test_ci`.
+    std::fs::remove_dir_all(sb.path("app/tests/integration")).ok();
+    std::fs::remove_dir_all(sb.path("app/tests/scenarios")).ok();
+    let assert = sb
+        .neo("app")
         .args(["test", "--ci"])
         .timeout(Duration::from_secs(1800))
         .assert()
@@ -607,6 +635,20 @@ fn test_ci_no_hurl_runs_unit_only() {
         .stdout(predicate::str::contains("Running unit tests"))
         .stdout(predicate::str::contains("Unit tests passed"))
         .stdout(predicate::str::contains("No Hurl integration tests found"));
+    // Prove the scaffolded Hspec suite actually compiled AND executed the example —
+    // not a vacuous 0-spec run. `neo test` passes `--test-show-details=direct`, so
+    // hspec's own summary streams through; check both streams (cabal splits output).
+    let out = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("1 example, 0 failures"),
+        "expected hspec to discover and run exactly the scaffolded ExampleSpec; combined output=`{}`",
+        combined
+    );
 }
 
 #[test]

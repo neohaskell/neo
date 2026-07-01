@@ -36,3 +36,12 @@ packages: {{ dep.path }}
 constraints:
   hasql < 1.10,
   opt-env-conf < 0.11
+
+-- Build this project's own test-suite as part of the plan so `cabal test all`
+-- resolves hspec / QuickCheck / quickcheck-instances from the pinned haskell.nix
+-- snapshot without needing a live Hackage index. Every NeoCLI project ships a
+-- test-suite by default, so this is always enabled. Scoped to this package so the
+-- source-repository-package deps (nhcore, nhintegrations) do NOT build their own
+-- (heavy, postgres-dependent) test-suites.
+package {{ name }}
+  tests: True

@@ -59,6 +59,30 @@ fn test_neo_new_ci() {
     assert!(project_path.join(".git").exists());
     assert!(project_path.join(".git/hooks/pre-commit").exists());
 
+    // A working Hspec test-suite is set up so `neo test` runs real Haskell tests.
+    // Haskell specs live under `tests/` alongside `.hurl` scenarios; reconcile always
+    // writes the hspec-discover driver `tests/Spec.hs`.
+    assert!(
+        project_path.join("tests/Spec.hs").exists(),
+        "hspec-discover driver tests/Spec.hs should be present"
+    );
+    let cabal = std::fs::read_to_string(project_path.join(format!("{}.cabal", project_name))).unwrap();
+    assert!(
+        cabal.contains(&format!("test-suite {}-test", project_name)),
+        "generated .cabal must declare a test-suite:\n{}",
+        cabal
+    );
+    assert!(cabal.contains("main-is: Spec.hs"), "test-suite must use the hspec-discover driver:\n{}", cabal);
+    assert!(cabal.contains("hs-source-dirs: tests"), "test-suite must source from tests/:\n{}", cabal);
+    assert!(cabal.contains("QuickCheck"), "test-suite must bundle QuickCheck:\n{}", cabal);
+    // cabal.project must enable the suite in the (haskell.nix) plan so it resolves offline.
+    let cabal_project = std::fs::read_to_string(project_path.join("cabal.project")).unwrap();
+    assert!(
+        cabal_project.contains(&format!("package {}", project_name)) && cabal_project.contains("tests: True"),
+        "cabal.project must enable tests for the project package:\n{}",
+        cabal_project
+    );
+
     // Verify neo.json content
     let config_content = std::fs::read_to_string(project_path.join("neo.json")).unwrap();
     assert!(config_content.contains(project_name));
@@ -130,6 +154,13 @@ fn test_neo_new_library_ci() {
         "library .cabal must keep the library stanza:\n{}",
         cabal
     );
+    // Library projects are testable too: the test-suite is emitted regardless of kind.
+    assert!(
+        cabal.contains(&format!("test-suite {}-test", project_name)),
+        "library .cabal must still declare a test-suite:\n{}",
+        cabal
+    );
+    assert!(project_path.join("tests/Spec.hs").exists(), "library project should get the tests/Spec.hs driver");
 }
 
 #[test]
@@ -266,6 +297,11 @@ fn test_neo_test_ci() {
 
     let project_path = temp.path().join(project_name);
 
+    // Full `neo test`: reconcile → compile+run the built-in Hspec suite → wait for
+    // the app to become ready (readiness poll, not a fixed sleep) → run the starter's
+    // Hurl scenarios. All must pass. (Requires the neo-starter fixes on `main`: the
+    // `counter-flow.hurl` `$.items[...]` jsonpath; before that this signals the
+    // starter↔upstream contract is broken — fix in neo-starter, per CLAUDE.md.)
     let mut cmd = neo_cmd();
     cmd.current_dir(&project_path)
         .arg("test")
@@ -273,7 +309,8 @@ fn test_neo_test_ci() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Reconciling project artifacts"))
-        .stdout(predicate::str::contains("Running unit tests"));
+        .stdout(predicate::str::contains("Running unit tests"))
+        .stdout(predicate::str::contains("Unit tests passed"));
 }
 
 #[test]
