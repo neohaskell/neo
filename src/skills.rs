@@ -36,12 +36,38 @@ pub enum Strategy {
     ManagedFile { path: &'static str },
 }
 
+/// How the always-on primer (`neohaskell.md`) reaches a tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimerWiring {
+    /// Copy the primer verbatim to `primer_dest`, then reference it with an
+    /// `@<path>` import in `instructions_file` (Claude Code resolves `@`-imports
+    /// in `CLAUDE.md`).
+    Import,
+    /// Copy the primer verbatim to `primer_dest`, then inline its body into a
+    /// managed block in `instructions_file`, for tools that read that file
+    /// wholesale and do not support `@`-imports (`AGENTS.md`).
+    Inline,
+    /// Render the primer as an always-apply Cursor `.mdc` rule at `primer_dest`.
+    /// The rule is self-activating (`alwaysApply: true`), so there is no
+    /// separate `instructions_file` wiring — Cursor reads `.cursor/rules/*.mdc`,
+    /// not `AGENTS.md`, so inlining there would never be seen.
+    CursorRule,
+}
+
 /// A supported AI coding agent and where its skills live in the project root.
 #[derive(Debug, Clone, Copy)]
 pub struct Tool {
     pub id: &'static str,
     pub display: &'static str,
     pub strategy: Strategy,
+    /// Project-root-relative path the primer file (`neohaskell.md`) is copied to
+    /// for this tool, co-located with its skills.
+    pub primer_dest: &'static str,
+    /// Project-root-relative global-instructions file the primer is wired into
+    /// via a managed block (`CLAUDE.md` for Claude, `AGENTS.md` for the rest).
+    pub instructions_file: &'static str,
+    /// How the primer is referenced from `instructions_file`.
+    pub primer_wiring: PrimerWiring,
 }
 
 impl Tool {
@@ -63,12 +89,21 @@ impl Tool {
 ///   - Codex installs to `.agents/skills` (plural), NOT `.codex/skills`.
 ///   - `.agents/skills` (Codex) is one char from `.agent/rules` (Antigravity,
 ///     not yet supported) — do not "fix" it.
+///
+/// The primer (`neohaskell.md`) is co-located with each tool's skills and wired
+/// into its instructions file: Claude imports it from `CLAUDE.md` via `@`; every
+/// other tool reads `AGENTS.md` wholesale, so the primer is inlined there.
 pub const SUPPORTED_TOOLS: &[Tool] = &[
-    Tool { id: "claude", display: "Claude Code", strategy: Strategy::FolderCopy { dir: ".claude/skills" } },
-    Tool { id: "codex", display: "OpenAI Codex CLI", strategy: Strategy::FolderCopy { dir: ".agents/skills" } },
-    Tool { id: "kiro", display: "Kiro (AWS)", strategy: Strategy::FolderCopy { dir: ".kiro/skills" } },
-    Tool { id: "cursor", display: "Cursor", strategy: Strategy::CursorRule { dir: ".cursor/rules" } },
-    Tool { id: "agents", display: "AGENTS.md (universal)", strategy: Strategy::ManagedFile { path: "AGENTS.md" } },
+    Tool { id: "claude", display: "Claude Code", strategy: Strategy::FolderCopy { dir: ".claude/skills" },
+           primer_dest: ".claude/neohaskell.md", instructions_file: "CLAUDE.md", primer_wiring: PrimerWiring::Import },
+    Tool { id: "codex", display: "OpenAI Codex CLI", strategy: Strategy::FolderCopy { dir: ".agents/skills" },
+           primer_dest: ".agents/neohaskell.md", instructions_file: "AGENTS.md", primer_wiring: PrimerWiring::Inline },
+    Tool { id: "kiro", display: "Kiro (AWS)", strategy: Strategy::FolderCopy { dir: ".kiro/skills" },
+           primer_dest: ".kiro/neohaskell.md", instructions_file: "AGENTS.md", primer_wiring: PrimerWiring::Inline },
+    Tool { id: "cursor", display: "Cursor", strategy: Strategy::CursorRule { dir: ".cursor/rules" },
+           primer_dest: ".cursor/rules/neohaskell.mdc", instructions_file: "", primer_wiring: PrimerWiring::CursorRule },
+    Tool { id: "agents", display: "AGENTS.md (universal)", strategy: Strategy::ManagedFile { path: "AGENTS.md" },
+           primer_dest: ".agents/neohaskell.md", instructions_file: "AGENTS.md", primer_wiring: PrimerWiring::Inline },
 ];
 
 /// Comma-separated list of valid `--tool` ids, for error help text.
@@ -605,6 +640,249 @@ fn walkdir_io(e: walkdir::Error, root: &Path) -> NeoError {
 }
 
 // ---------------------------------------------------------------------------
+// Primer (`neohaskell.md`): always-on file + managed `@`-import block
+// ---------------------------------------------------------------------------
+
+/// Name of the primer file at the root of a `neohaskell/skills` checkout.
+pub const PRIMER_SOURCE: &str = "neohaskell.md";
+
+/// Sentinels delimiting the auto-managed primer block. Deliberately distinct
+/// from [`AGENTS_BEGIN`]/[`AGENTS_END`] so the primer block and the universal
+/// skills-inline block coexist in the same `AGENTS.md` without clobbering.
+pub const PRIMER_BEGIN: &str = "<!-- BEGIN neohaskell-skills -->";
+pub const PRIMER_END: &str = "<!-- END neohaskell-skills -->";
+
+/// Read `<checkout>/neohaskell.md`, returning `None` when the primer is absent
+/// (older skills repos ship no primer — that is a clean skip, not an error).
+pub fn read_primer(checkout: &Path) -> miette::Result<Option<String>> {
+    read_to_string_opt(&checkout.join(PRIMER_SOURCE))
+}
+
+/// Render the primer as an always-apply Cursor `.mdc` rule (frontmatter that
+/// forces the rule on in every request, followed by the primer body).
+pub fn render_primer_mdc(primer_body: &str) -> String {
+    format!(
+        "---\ndescription: NeoHaskell primer — read before working in this project\nglobs:\nalwaysApply: true\n---\n\n{}\n",
+        primer_body.trim_end(),
+    )
+}
+
+fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = haystack[from..].find(needle) {
+        let at = from + i;
+        out.push(at);
+        from = at + needle.len();
+    }
+    out
+}
+
+/// Result of upserting the primer block into an instructions file.
+pub struct PrimerUpsert {
+    /// The file content after the operation. Equals the input byte-for-byte when
+    /// the markers are malformed (the file is deliberately left untouched).
+    pub content: String,
+    /// Non-fatal warnings (malformed markers, extra marker pairs).
+    pub warnings: Vec<String>,
+}
+
+/// Insert or replace the primer block (delimited by [`PRIMER_BEGIN`]/
+/// [`PRIMER_END`]) in `existing`, preserving everything outside the markers
+/// byte-for-byte. Idempotent: applying it to its own output is a fixed point.
+///
+/// - both markers present (BEGIN before END): replace the region between them;
+/// - neither present: append the block (a leading blank line when the file is
+///   non-empty), creating the file from empty input;
+/// - malformed (only one marker present, or END before BEGIN): leave the file
+///   untouched and warn;
+/// - multiple well-formed pairs: operate on the first, warn about the rest.
+pub fn upsert_primer_block(existing: &str, block: &str) -> PrimerUpsert {
+    let block = block.trim_end_matches('\n');
+    let begins = find_all(existing, PRIMER_BEGIN);
+    let ends = find_all(existing, PRIMER_END);
+
+    // Malformed: unbalanced marker counts, or the first END precedes the first
+    // BEGIN. Either way we refuse to guess — leave the file exactly as-is.
+    let malformed = begins.len() != ends.len()
+        || matches!((begins.first(), ends.first()), (Some(&b), Some(&e)) if e < b);
+    if malformed {
+        return PrimerUpsert {
+            content: existing.to_string(),
+            warnings: vec![format!(
+                "the primer markers in the target file are malformed (unbalanced `{PRIMER_BEGIN}` / `{PRIMER_END}`, or END before BEGIN) — left the file untouched. Remove the stray marker (or restore the matching one), then re-run `neo skills setup`."
+            )],
+        };
+    }
+
+    if begins.is_empty() {
+        // Append a fresh block.
+        let mut out = String::from(existing);
+        if !existing.is_empty() {
+            if !existing.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str(block);
+        out.push('\n');
+        return PrimerUpsert { content: out, warnings: Vec::new() };
+    }
+
+    // Replace the first pair; the closing END is the first one after the BEGIN.
+    let start = begins[0];
+    let end_at = ends
+        .iter()
+        .copied()
+        .find(|&e| e > start)
+        .expect("balanced, non-inverted markers guarantee a closing END");
+    let end = end_at + PRIMER_END.len();
+    let mut out = String::new();
+    out.push_str(&existing[..start]);
+    out.push_str(block);
+    out.push_str(&existing[end..]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+
+    let mut warnings = Vec::new();
+    if begins.len() > 1 {
+        warnings.push(format!(
+            "found {} primer blocks (`{PRIMER_BEGIN}`) in the target file — updated the first and left the rest untouched. Delete the extra block(s) to silence this warning.",
+            begins.len()
+        ));
+    }
+    PrimerUpsert { content: out, warnings }
+}
+
+/// A primer file copy: `neohaskell.md` co-located with a tool's skills.
+#[derive(Debug, Clone)]
+pub struct PrimerFileItem {
+    pub dest: PathBuf,
+    pub action: Action,
+    pub content: String,
+}
+
+/// A primer wiring edit: the managed `@`-import (or inlined) block in a tool's
+/// instructions file. Carries the *block* (not a precomputed whole-file body) so
+/// [`apply_primer_wire`] re-upserts against the live file — the same `AGENTS.md`
+/// is also written by the universal skills block, and a stale precomputed body
+/// would clobber it depending on write order.
+#[derive(Debug, Clone)]
+pub struct PrimerWireItem {
+    pub dest: PathBuf,
+    /// Plan-time action estimate (against the file as it is on disk now), used
+    /// for reporting; the authoritative write decision is made at apply time.
+    pub action: Action,
+    /// The rendered block (markers + inner) to upsert into `dest`.
+    pub block: String,
+    /// Short label for the plan line (`@import` or `inline`).
+    pub label: &'static str,
+    /// Non-fatal marker warnings surfaced by [`upsert_primer_block`].
+    pub warnings: Vec<String>,
+}
+
+/// The full primer plan: the file copies plus the instructions-file wirings.
+#[derive(Debug, Clone)]
+pub struct PrimerPlan {
+    pub files: Vec<PrimerFileItem>,
+    pub wires: Vec<PrimerWireItem>,
+}
+
+impl PrimerPlan {
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty() && self.wires.is_empty()
+    }
+}
+
+/// Compute the primer plan for the chosen tools against `project_root`. Pure:
+/// classifies each file/wire as Create/Overwrite/Skip but writes nothing.
+/// Primer file installs are de-duplicated by destination; wirings are
+/// de-duplicated by instructions file (the first tool touching it wins).
+pub fn build_primer_plan(
+    project_root: &Path,
+    tools: &[&Tool],
+    primer_body: &str,
+) -> miette::Result<PrimerPlan> {
+    let mut files: Vec<PrimerFileItem> = Vec::new();
+    let mut seen_files: BTreeSet<PathBuf> = BTreeSet::new();
+    for tool in tools {
+        let dest = project_root.join(tool.primer_dest);
+        if !seen_files.insert(dest.clone()) {
+            continue;
+        }
+        // Cursor gets the primer as an always-apply `.mdc` rule; everyone else
+        // gets a verbatim copy of the primer markdown.
+        let content = match tool.primer_wiring {
+            PrimerWiring::CursorRule => render_primer_mdc(primer_body),
+            PrimerWiring::Import | PrimerWiring::Inline => primer_body.to_string(),
+        };
+        let action = file_action(&dest, &content)?;
+        files.push(PrimerFileItem { dest, action, content });
+    }
+
+    let mut wires: Vec<PrimerWireItem> = Vec::new();
+    let mut seen_wires: BTreeSet<PathBuf> = BTreeSet::new();
+    for tool in tools {
+        // Cursor's `.mdc` rule is self-activating — no instructions-file wiring.
+        let (inner, label) = match tool.primer_wiring {
+            PrimerWiring::Import => (format!("@{}", tool.primer_dest), "@import"),
+            PrimerWiring::Inline => (primer_body.trim_end().to_string(), "inline"),
+            PrimerWiring::CursorRule => continue,
+        };
+        let dest = project_root.join(tool.instructions_file);
+        if !seen_wires.insert(dest.clone()) {
+            continue;
+        }
+        let block = format!("{PRIMER_BEGIN}\n{inner}\n{PRIMER_END}");
+        let existing = read_to_string_opt(&dest)?;
+        let up = upsert_primer_block(existing.as_deref().unwrap_or(""), &block);
+        let action = match &existing {
+            None => Action::Create,
+            Some(e) if *e == up.content => Action::Skip,
+            Some(_) => Action::Overwrite,
+        };
+        wires.push(PrimerWireItem { dest, action, block, label, warnings: up.warnings });
+    }
+
+    Ok(PrimerPlan { files, wires })
+}
+
+/// Write one primer file copy. No-op for Skip.
+pub fn apply_primer_file(item: &PrimerFileItem) -> miette::Result<()> {
+    if item.action == Action::Skip {
+        return Ok(());
+    }
+    if let Some(parent) = item.dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| NeoError::io_at("creating the primer destination directory at", parent, e))?;
+    }
+    std::fs::write(&item.dest, &item.content)
+        .map_err(|e| NeoError::io_at("writing the primer file to", &item.dest, e))?;
+    Ok(())
+}
+
+/// Write one primer wiring edit by re-upserting the block against the file's
+/// *current* content, so it never clobbers a co-resident block (e.g. the
+/// universal skills block in `AGENTS.md`) regardless of write order. Writes only
+/// when the result differs; a no-op when the block is already present unchanged
+/// or the markers are malformed (left untouched).
+pub fn apply_primer_wire(item: &PrimerWireItem) -> miette::Result<()> {
+    let existing = read_to_string_opt(&item.dest)?.unwrap_or_default();
+    let up = upsert_primer_block(&existing, &item.block);
+    if up.content == existing {
+        return Ok(());
+    }
+    if let Some(parent) = item.dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| NeoError::io_at("creating the directory for the instructions file at", parent, e))?;
+    }
+    std::fs::write(&item.dest, &up.content)
+        .map_err(|e| NeoError::io_at("writing the primer import into", &item.dest, e))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -912,5 +1190,196 @@ mod tests {
         // FolderCopy preserves the bundled script; CursorRule cannot.
         assert!(root.path().join(".claude/skills/foo/scripts/run.sh").exists());
         assert!(root.path().join(".cursor/rules/foo.mdc").exists());
+    }
+
+    // ---- primer: source + tool table ----
+
+    #[test]
+    fn read_primer_absent_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_primer(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn read_primer_present_returns_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("neohaskell.md"), "# Primer\nbody\n").unwrap();
+        assert_eq!(read_primer(dir.path()).unwrap().unwrap(), "# Primer\nbody\n");
+    }
+
+    #[test]
+    fn primer_tool_table_exact() {
+        let by = |id: &str| SUPPORTED_TOOLS.iter().find(|t| t.id == id).unwrap();
+        // Primer files co-locate with each tool's skills; wiring targets CLAUDE.md
+        // (import) for claude and AGENTS.md (inline) for everyone else.
+        assert_eq!(by("claude").primer_dest, ".claude/neohaskell.md");
+        assert_eq!(by("claude").instructions_file, "CLAUDE.md");
+        assert_eq!(by("claude").primer_wiring, PrimerWiring::Import);
+        assert_eq!(by("codex").primer_dest, ".agents/neohaskell.md");
+        assert_eq!(by("codex").instructions_file, "AGENTS.md");
+        assert_eq!(by("codex").primer_wiring, PrimerWiring::Inline);
+        assert_eq!(by("kiro").primer_dest, ".kiro/neohaskell.md");
+        // Cursor reads `.cursor/rules/*.mdc`, so the primer is a self-activating
+        // rule there, NOT an AGENTS.md inline.
+        assert_eq!(by("cursor").primer_dest, ".cursor/rules/neohaskell.mdc");
+        assert_eq!(by("cursor").primer_wiring, PrimerWiring::CursorRule);
+        assert_eq!(by("agents").primer_dest, ".agents/neohaskell.md");
+    }
+
+    #[test]
+    fn render_primer_mdc_is_always_apply() {
+        let out = render_primer_mdc("# Primer\n\nStart here.");
+        assert!(out.starts_with("---\ndescription: NeoHaskell primer"));
+        assert!(out.contains("alwaysApply: true"));
+        assert!(out.contains("Start here."));
+    }
+
+    #[test]
+    fn build_primer_plan_cursor_is_mdc_rule_with_no_wire() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = resolve_tools(&["cursor".into()]).unwrap();
+        let plan = build_primer_plan(root.path(), &tools, "# Primer\nbody\n").unwrap();
+        // One file (the .mdc rule), zero wires (self-activating).
+        assert_eq!(plan.files.len(), 1);
+        assert!(plan.wires.is_empty(), "cursor primer must not wire into any instructions file");
+        assert!(plan.files[0].dest.ends_with(".cursor/rules/neohaskell.mdc"));
+        assert!(plan.files[0].content.contains("alwaysApply: true"));
+        apply_primer_file(&plan.files[0]).unwrap();
+        assert!(root.path().join(".cursor/rules/neohaskell.mdc").exists());
+        // No AGENTS.md was created for cursor.
+        assert!(!root.path().join("AGENTS.md").exists());
+    }
+
+    // ---- primer: managed-block upsert ----
+
+    #[test]
+    fn primer_block_append_then_idempotent() {
+        let block = format!("{PRIMER_BEGIN}\n@.claude/neohaskell.md\n{PRIMER_END}");
+        let base = "# CLAUDE.md\n\nProject rules.\n";
+        let once = upsert_primer_block(base, &block);
+        assert!(once.warnings.is_empty());
+        assert!(once.content.contains("# CLAUDE.md"));
+        assert!(once.content.contains("Project rules."));
+        assert!(once.content.contains(PRIMER_BEGIN));
+        assert!(once.content.contains("@.claude/neohaskell.md"));
+        // Idempotent: re-applying to its own output is a fixed point.
+        let twice = upsert_primer_block(&once.content, &block);
+        assert_eq!(once.content, twice.content);
+        assert!(twice.warnings.is_empty());
+    }
+
+    #[test]
+    fn primer_block_replaces_in_place_and_preserves_surroundings() {
+        let v1 = format!("{PRIMER_BEGIN}\n@old/path.md\n{PRIMER_END}");
+        let v2 = format!("{PRIMER_BEGIN}\n@new/path.md\n{PRIMER_END}");
+        let start = upsert_primer_block("TOP\n", &v1).content;
+        let with_tail = format!("{start}\nBOTTOM\n");
+        let out = upsert_primer_block(&with_tail, &v2);
+        assert!(out.content.starts_with("TOP\n"));
+        assert!(out.content.contains("BOTTOM"));
+        assert!(out.content.contains("@new/path.md"));
+        assert!(!out.content.contains("@old/path.md"), "old block must be replaced: {}", out.content);
+    }
+
+    #[test]
+    fn primer_block_malformed_markers_left_untouched_with_warning() {
+        // Only a BEGIN, no END.
+        let existing = "# CLAUDE.md\n\n<!-- BEGIN neohaskell-skills -->\n@x\n";
+        let block = format!("{PRIMER_BEGIN}\n@y\n{PRIMER_END}");
+        let out = upsert_primer_block(existing, &block);
+        assert_eq!(out.content, existing, "malformed markers must not touch the file");
+        assert!(!out.warnings.is_empty(), "must warn about malformed markers");
+    }
+
+    #[test]
+    fn primer_block_end_before_begin_is_malformed() {
+        let existing = format!("{PRIMER_END}\nstuff\n{PRIMER_BEGIN}\n");
+        let block = format!("{PRIMER_BEGIN}\n@y\n{PRIMER_END}");
+        let out = upsert_primer_block(&existing, &block);
+        assert_eq!(out.content, existing);
+        assert!(!out.warnings.is_empty());
+    }
+
+    #[test]
+    fn primer_block_multiple_pairs_updates_first_warns_rest() {
+        let existing = format!(
+            "{PRIMER_BEGIN}\n@one\n{PRIMER_END}\nmid\n{PRIMER_BEGIN}\n@two\n{PRIMER_END}\n"
+        );
+        let block = format!("{PRIMER_BEGIN}\n@new\n{PRIMER_END}");
+        let out = upsert_primer_block(&existing, &block);
+        assert!(out.content.contains("@new"), "first block updated");
+        assert!(out.content.contains("@two"), "trailing block preserved");
+        assert!(out.warnings.iter().any(|w| w.contains("primer blocks")), "must warn: {:?}", out.warnings);
+    }
+
+    // ---- primer: plan + apply ----
+
+    #[test]
+    fn build_primer_plan_create_skip_overwrite_and_coexists_with_skills_block() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = resolve_tools(&["claude".into(), "codex".into(), "agents".into()]).unwrap();
+        let body = "# Primer\nStart here.\n";
+
+        // First run: primer file + wire are Create.
+        let plan = build_primer_plan(root.path(), &tools, body).unwrap();
+        assert!(plan.files.iter().all(|f| f.action == Action::Create));
+        assert!(plan.wires.iter().all(|w| w.action == Action::Create));
+        // codex + agents share `.agents/neohaskell.md` → deduped to one file item;
+        // claude adds `.claude/neohaskell.md`. Two distinct files.
+        assert_eq!(plan.files.len(), 2, "primer file installs deduped by dest");
+        // CLAUDE.md (claude) + AGENTS.md (codex+agents deduped) → two wires.
+        assert_eq!(plan.wires.len(), 2, "wires deduped by instructions file");
+
+        // Pre-seed AGENTS.md with the existing universal skills-inline block, then
+        // apply — the primer block must coexist, not clobber it.
+        let skills_block = render_agents_block(&[Skill {
+            name: "s".into(), description: "d".into(), dir: PathBuf::from("/"),
+            body: "b".into(), has_bundled_files: false,
+        }]);
+        let seeded = upsert_managed_block("", &skills_block);
+        std::fs::write(root.path().join("AGENTS.md"), &seeded).unwrap();
+
+        let plan = build_primer_plan(root.path(), &tools, body).unwrap();
+        for f in &plan.files { apply_primer_file(f).unwrap(); }
+        for w in &plan.wires { apply_primer_wire(w).unwrap(); }
+
+        assert!(root.path().join(".claude/neohaskell.md").exists());
+        assert!(root.path().join(".agents/neohaskell.md").exists());
+        let claude_md = std::fs::read_to_string(root.path().join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("@.claude/neohaskell.md"), "claude wires via @import: {claude_md}");
+        let agents_md = std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains(AGENTS_BEGIN), "existing skills block preserved");
+        assert!(agents_md.contains(PRIMER_BEGIN), "primer block added");
+        assert!(agents_md.contains("Start here."), "AGENTS.md inlines the primer body");
+
+        // Second run: everything unchanged → all Skip (idempotent).
+        let plan2 = build_primer_plan(root.path(), &tools, body).unwrap();
+        assert!(plan2.files.iter().all(|f| f.action == Action::Skip), "files skip");
+        assert!(plan2.wires.iter().all(|w| w.action == Action::Skip), "wires skip");
+
+        // Primer body changes → file Overwrite + wire Overwrite for AGENTS.md.
+        let plan3 = build_primer_plan(root.path(), &tools, "# Primer v2\nNew guidance.\n").unwrap();
+        assert!(plan3.files.iter().any(|f| f.action == Action::Overwrite));
+        assert!(plan3.wires.iter().any(|w| w.action == Action::Overwrite));
+    }
+
+    #[test]
+    fn primer_file_overwrite_and_skip_honored_on_apply() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = resolve_tools(&["claude".into()]).unwrap();
+        let f = &build_primer_plan(root.path(), &tools, "v1\n").unwrap().files[0];
+        apply_primer_file(f).unwrap();
+        assert_eq!(std::fs::read_to_string(root.path().join(".claude/neohaskell.md")).unwrap(), "v1\n");
+
+        // A Skip item must not write.
+        let plan = build_primer_plan(root.path(), &tools, "v1\n").unwrap();
+        assert_eq!(plan.files[0].action, Action::Skip);
+        std::fs::write(root.path().join(".claude/neohaskell.md"), "tampered").unwrap();
+        apply_primer_file(&plan.files[0]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join(".claude/neohaskell.md")).unwrap(),
+            "tampered",
+            "Skip must not overwrite"
+        );
     }
 }

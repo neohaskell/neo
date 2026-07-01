@@ -1182,25 +1182,32 @@ async fn ide_initialize_against_release_binary() {
 
 #[test]
 #[ignore]
-fn skills_setup_real_clone_no_skills_yet() {
+fn skills_setup_real_clone_installs_skills_and_primer() {
     // The shipped binary must really clone github.com/neohaskell/skills into the
-    // per-user cache (under the sandbox HOME). The upstream repo is currently an
-    // empty scaffold (LICENSE + a bare README, no `skills/` tree), so the correct
-    // behavior is a clean "nothing to install" exit — not an error. This scenario
-    // auto-upgrades to a real install assertion once skills land upstream.
-    let sb = Sandbox::new("skills_setup_real_clone_no_skills_yet");
+    // per-user cache (under the sandbox HOME) and install what it finds. Upstream
+    // now ships a populated `skills/` tree plus a top-level `neohaskell.md` primer,
+    // so a real install is the correct outcome.
+    let sb = Sandbox::new("skills_setup_real_clone_installs_skills_and_primer");
     sb.neo("proj")
         .args(["skills", "setup", "--ci", "--all-tools"])
         .timeout(Duration::from_secs(120))
         .assert()
         .success()
-        .stdout(predicate::str::contains("no skills found"));
+        .stdout(predicate::str::contains("[ok] installed"));
 
-    // A real clone landed in the cache even though there were no skills to copy.
+    // A real clone landed in the cache.
     let checkout = sb.path("home/.neo/skills-cache/neohaskell-skills");
     assert!(checkout.exists(), "expected the skills repo to be cloned into the cache");
-    // No tool folders were created in the project (nothing to install).
-    assert!(!sb.path("proj/.claude").exists());
+
+    // At least one skill folder was installed for Claude.
+    assert!(sb.path("proj/.claude/skills").is_dir(), "skills installed for claude");
+
+    // The primer shipped upstream → installed next to the skills and wired into
+    // CLAUDE.md via an `@`-import inside the managed block.
+    assert!(sb.path("proj/.claude/neohaskell.md").exists(), "primer file installed");
+    let claude_md = std::fs::read_to_string(sb.path("proj/CLAUDE.md")).unwrap();
+    assert!(claude_md.contains("<!-- BEGIN neohaskell-skills -->"), "primer block in CLAUDE.md");
+    assert!(claude_md.contains("@.claude/neohaskell.md"), "primer @import wired");
 }
 
 // =====================================================

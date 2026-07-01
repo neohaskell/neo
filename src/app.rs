@@ -266,6 +266,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 refresh: false,
+                no_primer: false,
             }),
         });
         let mut output_mode = OutputMode::Ci;
@@ -282,6 +283,10 @@ mod tests {
 
         assert!(result.is_ok(), "dispatch skills failed: {result:?}");
         assert!(temp.path().join(".claude/skills/sample-skill/SKILL.md").exists());
+        // The primer ships with the offline stub: installed + wired into CLAUDE.md.
+        assert!(temp.path().join(".claude/neohaskell.md").exists());
+        let claude_md = std::fs::read_to_string(temp.path().join("CLAUDE.md")).unwrap();
+        assert!(claude_md.contains("@.claude/neohaskell.md"));
     }
 
     #[tokio::test]

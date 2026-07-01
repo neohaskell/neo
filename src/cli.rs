@@ -91,7 +91,11 @@ pub enum Commands {
                             install the skills into the right project-root folders for the AI coding \
                             agents you use (Claude Code, OpenAI Codex, Kiro, Cursor, and the universal \
                             AGENTS.md). Run `neo skills setup` for an interactive tool picker; in --ci \
-                            mode it installs for every supported tool unless you pass `--tool <id>`.")]
+                            mode it installs for every supported tool unless you pass `--tool <id>`. \
+                            If the library ships a primer (neohaskell.md), it is also installed next to \
+                            each tool's skills and wired in: Claude imports it from CLAUDE.md via an \
+                            `@`-import, Cursor gets a self-activating `.cursor/rules` rule, and the rest \
+                            inline it into a managed block in AGENTS.md; pass `--no-primer` to skip that.")]
     Skills {
         #[command(subcommand)]
         subcommand: Option<SkillsSubcommand>,
@@ -143,6 +147,9 @@ pub enum SkillsSubcommand {
         /// Re-clone the skills library instead of reusing the cached copy
         #[arg(long)]
         refresh: bool,
+        /// Skip the always-on primer (neohaskell.md) and its instructions-file wiring
+        #[arg(long)]
+        no_primer: bool,
     },
 }
 
@@ -263,12 +270,12 @@ mod tests {
             "neo", "skills", "setup",
             "--tool", "claude", "--tool", "cursor",
             "--skill", "foo",
-            "--force", "--dry-run", "--refresh",
+            "--force", "--dry-run", "--refresh", "--no-primer",
         ])
         .unwrap();
         match cli.command {
             Some(Commands::Skills {
-                subcommand: Some(SkillsSubcommand::Setup { tools, all_tools, skills, force, dry_run, refresh }),
+                subcommand: Some(SkillsSubcommand::Setup { tools, all_tools, skills, force, dry_run, refresh, no_primer }),
             }) => {
                 assert_eq!(tools, vec!["claude".to_string(), "cursor".to_string()]);
                 assert!(!all_tools);
@@ -276,6 +283,7 @@ mod tests {
                 assert!(force);
                 assert!(dry_run);
                 assert!(refresh);
+                assert!(no_primer);
             }
             _ => panic!("Expected Skills Setup command"),
         }

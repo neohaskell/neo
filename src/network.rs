@@ -432,6 +432,15 @@ fn write_skills_stub(checkout: &Path) -> miette::Result<()> {
         "---\nname: sample-skill\ndescription: An offline stub skill used when NEO_SKIP_NETWORK is set.\n---\n\n# Sample skill\n\nThis is a placeholder skill body for offline runs.\n",
     )
     .map_err(|e| NeoError::io_at("writing the offline-stub `SKILL.md` to", &skill_md, e))?;
+
+    // Ship a stub primer so `neo skills setup` exercises the primer install +
+    // wiring offline (mirrors the real repo's top-level `neohaskell.md`).
+    let primer = checkout.join("neohaskell.md");
+    std::fs::write(
+        &primer,
+        "# NeoHaskell primer (offline stub)\n\nThis is NeoHaskell, not vanilla Haskell. Start from the neohaskell-feature-pipeline skill.\n",
+    )
+    .map_err(|e| NeoError::io_at("writing the offline-stub `neohaskell.md` to", &primer, e))?;
     Ok(())
 }
 
