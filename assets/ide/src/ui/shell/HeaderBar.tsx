@@ -16,6 +16,8 @@ interface HeaderBarProps {
   /** Tidy/Heal mutate the model; disabled when a non-model lens is showing
    *  (no visual feedback there). */
   modelActive: boolean
+  collaboration?: { role: 'host' | 'join'; peerCount: number } | null
+  readOnly?: boolean
 }
 
 /**
@@ -33,6 +35,8 @@ export function HeaderBar({
   healing,
   relayouting,
   modelActive,
+  collaboration,
+  readOnly = false,
 }: HeaderBarProps) {
   return (
     <header className={classes.header} data-testid="header-bar">
@@ -46,19 +50,26 @@ export function HeaderBar({
         )}
       </Group>
 
+      {collaboration && (
+        <div className={classes.collaboration} data-testid="collaboration-status">
+          <span className={classes.statusDot} />
+          <span>{collaboration.role === 'host' ? 'HOSTING' : 'JOINED'} · {collaboration.peerCount} PEER{collaboration.peerCount === 1 ? '' : 'S'} · MOVE SYNC</span>
+        </div>
+      )}
+
       <Group gap={6} wrap="nowrap">
         <Tooltip label={<Group gap={6}>Command palette <Kbd>⌘K</Kbd></Group>}>
           <Button variant="subtle" color="gray" size="xs" onClick={() => spotlight.open()}>⌘K</Button>
         </Tooltip>
-        <Button variant="subtle" color="gray" size="xs" onClick={onNew}>New</Button>
-        <Button variant="subtle" color="gray" size="xs" onClick={onOpen}>Open</Button>
+        <Button variant="subtle" color="gray" size="xs" onClick={onNew} disabled={readOnly}>New</Button>
+        <Button variant="subtle" color="gray" size="xs" onClick={onOpen} disabled={readOnly}>Open</Button>
         <Button
           variant="light"
           size="xs"
           color="emQuery"
           leftSection={<IconWand size={14} />}
           onClick={onRelayout}
-          disabled={relayouting || healing || !modelActive}
+          disabled={readOnly || relayouting || healing || !modelActive}
           title="Order slices and chapters left-to-right by the event-modeling wave, and clean up positions — no AI, no structural changes."
         >
           {relayouting ? 'Tidying…' : 'Tidy by flow'}
@@ -68,7 +79,7 @@ export function HeaderBar({
           color="emFeature"
           leftSection={<IconSparkles size={14} />}
           onClick={onHeal}
-          disabled={healing || relayouting || !modelActive}
+          disabled={readOnly || healing || relayouting || !modelActive}
           title="Ask Claude to improve the model (fix layout, add inferred edges, etc.)"
         >
           {healing ? 'Healing…' : 'Heal with AI'}

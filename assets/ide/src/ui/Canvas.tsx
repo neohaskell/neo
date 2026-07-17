@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useState, useEffect, useRef, type MouseEvent as ReactMouseEvent } from 'react'
+import { useMemo, useCallback, useState, useEffect, useRef, type MouseEvent as ReactMouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import {
   ReactFlow,
   Background,
@@ -15,6 +15,7 @@ import {
   applyEdgeChanges,
   useReactFlow,
   useStore,
+  ViewportPortal,
 } from '@xyflow/react'
 import { useComputedColorScheme, Menu } from '@mantine/core'
 import '@xyflow/react/dist/style.css'
@@ -37,6 +38,8 @@ import {
 } from './featurePages'
 import { traceFromNode, type Trace } from './trace'
 import type { EventModel, NodeType } from '../model/types'
+import type { CollabPresence, CursorPosition } from '../ipc/collab'
+import { RemoteCursor } from './canvas/RemoteCursor'
 
 interface CanvasProps {
   model: EventModel
@@ -93,6 +96,9 @@ interface CanvasProps {
    *  reload such as "Tidy by flow", which moves nodes while React Flow's
    *  mount-only `fitView` does not re-run, or after switching feature). */
   fitSignal?: number
+  remotePresences?: CollabPresence[]
+  onPresenceChange?: (cursor: CursorPosition | null, selectedNodeIds: string[]) => void
+  collaborationMoveOnly?: boolean
 }
 
 /** Node types that are visual background (lanes/columns/bands) — excluded
@@ -264,6 +270,9 @@ export function Canvas({
   flashingSliceId,
   flashingEntityId,
   fitSignal,
+  remotePresences = [],
+  onPresenceChange,
+  collaborationMoveOnly = false,
 }: CanvasProps) {
   const reactFlow = useReactFlow()
   const colorScheme = useComputedColorScheme('dark')
@@ -366,14 +375,22 @@ export function Canvas({
     return ids
   }, [featureMode, model.nodes, nodeSubmodel, featureFid])
 
-  // Feature-mode positions come SOLELY from the deterministic grid — it is the
-  // single source of truth for node x/y, so every node always follows its slice
-  // column when a slice is pushed / resized / reordered. (Legacy per-feature
-  // `bySubmodel` overrides are intentionally ignored; see `handleFeatureNodeMove`.)
+  // Normally feature-mode positions come solely from the deterministic grid.
+  // The move-only collaboration slice freezes structural changes, so it uses
+  // canonical persisted node positions instead; otherwise a committed move
+  // would immediately snap back to its deterministic grid cell.
   const featurePositions = useMemo(() => {
     if (!featureMode || !featureGrid) return null
+    if (collaborationMoveOnly) {
+      return new Map(
+        [...featureGrid.positions].map(([nodeId, fallback]) => [
+          nodeId,
+          model.layout.nodePositions[nodeId] ?? fallback,
+        ]),
+      )
+    }
     return new Map(featureGrid.positions)
-  }, [featureMode, featureGrid])
+  }, [featureMode, featureGrid, collaborationMoveOnly, model.layout.nodePositions])
 
   const domainNodes = useMemo(() => {
     if (featureMode && featurePositions && featureMemberIds) {
@@ -698,7 +715,9 @@ export function Canvas({
           }
         } else if (!change.dragging && change.position) {
           // Node was dropped.
-          if (featureModeRef.current) {
+          if (collaborationMoveOnly) {
+            onPositionChange?.(change.id, change.position.x, change.position.y)
+          } else if (featureModeRef.current) {
             // Feature mode: re-assign the node to the slice column / entity lane
             // it landed on; the deterministic grid then snaps it into that cell,
             // so it stays glued to its slice. Clamp to the NEAREST slice (a
@@ -733,7 +752,7 @@ export function Canvas({
         }
       }
     },
-    [onPositionChange, onAssignNodeToSlice, onAssignNodeToEntity, onFeatureNodeMove, onChapterSliceRange, model.nodes, model.slices, nodes],
+    [collaborationMoveOnly, onPositionChange, onAssignNodeToSlice, onAssignNodeToEntity, onFeatureNodeMove, onChapterSliceRange, model.nodes, model.slices, nodes],
   )
 
   const handleConnect: OnConnect = useCallback(
@@ -902,10 +921,22 @@ export function Canvas({
   // ── Trace: highlight the selected node's direct outgoing edges ──
   const trace = useMemo(() => traceFromNode(model, selectedNodeId), [model, selectedNodeId])
   const traceActive = selectedNodeId !== null
+  const cursorRef = useRef<CursorPosition | null>(null)
+  const lastPresenceSentRef = useRef(0)
   const handleSelectionChange = useCallback(({ nodes: sel }: { nodes: Node[] }) => {
-    const domain = sel.find((n) => !n.id.startsWith('__'))
-    setSelectedNodeId(domain ? domain.id : null)
-  }, [])
+    const selectedIds = sel.filter((node) => !node.id.startsWith('__')).map((node) => node.id)
+    setSelectedNodeId(selectedIds[0] ?? null)
+    onPresenceChange?.(cursorRef.current, selectedIds)
+  }, [onPresenceChange])
+  const handlePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!onPresenceChange) return
+    const now = Date.now()
+    if (now - lastPresenceSentRef.current < 50) return
+    lastPresenceSentRef.current = now
+    const cursor = reactFlow.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+    cursorRef.current = cursor
+    onPresenceChange(cursor, selectedNodeId ? [selectedNodeId] : [])
+  }, [onPresenceChange, reactFlow, selectedNodeId])
   const displayNodes = useMemo(
     () => applyTraceToNodes(nodes, trace, traceActive),
     [nodes, trace, traceActive],
@@ -930,7 +961,7 @@ export function Canvas({
   }, [focusRequest, reactFlow])
 
   return (
-    <div data-testid="canvas" style={{ width: '100%', height: '100%' }} onDoubleClick={handleDoubleClick}>
+    <div data-testid="canvas" style={{ width: '100%', height: '100%' }} onDoubleClick={collaborationMoveOnly ? undefined : handleDoubleClick} onPointerMove={handlePointerMove}>
       <ReactFlow
         colorMode={colorScheme}
         nodes={displayNodes}
@@ -938,16 +969,18 @@ export function Canvas({
         nodeTypes={nodeTypes}
         onNodesChange={handleNodesChange}
         onEdgesChange={handleEdgesChange}
-        onConnect={handleConnect}
-        onConnectEnd={handleConnectEnd}
-        onNodesDelete={handleNodesDelete}
-        onEdgesDelete={handleEdgesDelete}
+        onConnect={collaborationMoveOnly ? undefined : handleConnect}
+        onConnectEnd={collaborationMoveOnly ? undefined : handleConnectEnd}
+        onNodesDelete={collaborationMoveOnly ? undefined : handleNodesDelete}
+        onEdgesDelete={collaborationMoveOnly ? undefined : handleEdgesDelete}
         onPaneClick={handlePaneClick}
-        onPaneContextMenu={handlePaneContextMenu}
-        onNodeContextMenu={handleNodeContextMenu}
+        onPaneContextMenu={collaborationMoveOnly ? undefined : handlePaneContextMenu}
+        onNodeContextMenu={collaborationMoveOnly ? undefined : handleNodeContextMenu}
         onSelectionChange={handleSelectionChange}
         connectionMode={ConnectionMode.Loose}
-        deleteKeyCode="Backspace"
+        deleteKeyCode={collaborationMoveOnly ? null : 'Backspace'}
+        nodesConnectable={!collaborationMoveOnly}
+        nodesDraggable
         zoomOnDoubleClick={false}
         fitView
         // Allow zooming further out than React Flow's 0.5 default so a large
@@ -958,9 +991,14 @@ export function Canvas({
       >
         <Background />
         <Controls />
+        <ViewportPortal>
+          {remotePresences.map((presence) => (
+            <RemoteCursor key={presence.actorId} presence={presence} />
+          ))}
+        </ViewportPortal>
       </ReactFlow>
 
-      <CanvasMenu opened={menu.kind !== 'none'} x={menu.kind === 'none' ? 0 : menu.x} y={menu.kind === 'none' ? 0 : menu.y} onClose={closeMenu}>
+      <CanvasMenu opened={!collaborationMoveOnly && menu.kind !== 'none'} x={menu.kind === 'none' ? 0 : menu.x} y={menu.kind === 'none' ? 0 : menu.y} onClose={closeMenu}>
         {menu.kind === 'pane' && (
           <>
             <Menu.Label>Add here</Menu.Label>

@@ -34,11 +34,27 @@ import {
   type ValidationError,
 } from './ipc/eventModel'
 import { StatusBar } from './ipc/StatusBar'
+import {
+  collabStatus,
+  submitMove,
+  updatePresence,
+  type CollabNotification,
+  type CollabEvent,
+  type CollabPresence,
+  type CollabStatus,
+} from './ipc/collab'
 import { useAutosave } from './io/useAutosave'
 import { validate, countIssues, type Issue } from './model/validate'
 import { ProblemsPanel } from './ui/ProblemsPanel'
 
 const CLIENT_INFO = { name: 'neoide-frontend', version: '0.0.1' }
+const CURSOR_COLORS = ['#1971c2', '#2b8a3e', '#c92a2a', '#e67700', '#6741d9', '#0c8599']
+
+function actorColor(actorId: string): string {
+  let hash = 0
+  for (const char of actorId) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
+  return CURSOR_COLORS[hash % CURSOR_COLORS.length]
+}
 
 // Transient status messages now go through Mantine's notification system
 // (replaces the old bespoke <Toast>). Auto-dismisses; bottom-center per main.tsx.
@@ -119,6 +135,35 @@ function App() {
   const [fitSignal, setFitSignal] = useState<number | undefined>(undefined)
   const [healLog, setHealLog] = useState<HealLogLine[]>([])
   const clientRef = useRef<IdeClient | null>(null)
+  const [collab, setCollab] = useState<CollabStatus | null>(null)
+  const collabRef = useRef<CollabStatus | null>(null)
+  collabRef.current = collab
+  const revisionRef = useRef(0)
+  const snapshotReadyRef = useRef(false)
+  const repairInFlightRef = useRef(false)
+  const pendingEventsRef = useRef<CollabEvent[]>([])
+  const localPresenceRef = useRef<CollabPresence | null>(null)
+  const [remotePresences, setRemotePresences] = useState<Map<string, CollabPresence>>(new Map())
+
+  const requestCollabRepair = useCallback((client: IdeClient) => {
+    if (repairInFlightRef.current) return
+    repairInFlightRef.current = true
+    snapshotReadyRef.current = false
+    void collabStatus(client)
+      .then((result) => {
+        if (!result.ok) {
+          snapshotReadyRef.current = true
+          notify(`Collaboration repair failed: ${result.error.message}`)
+        }
+      })
+      .catch(() => {
+        snapshotReadyRef.current = true
+        notify('Collaboration repair failed: connection error')
+      })
+      .finally(() => {
+        repairInFlightRef.current = false
+      })
+  }, [])
 
   // Keep the active feature valid: when the model has features but the current
   // selection no longer exists (deleted, or Ungrouped emptied), fall back to
@@ -146,7 +191,9 @@ function App() {
   }, [])
   const { saveState, flushNow } = useAutosave({
     model,
-    dirty,
+    // The host runtime is the sole writer while collaborating. Browser
+    // autosave would bypass sequencing and could overwrite remote commits.
+    dirty: dirty && collab?.enabled !== true,
     connOpen,
     write: writeFn,
     onSaved: () => setDirty(false),
@@ -296,11 +343,6 @@ function App() {
     const client = new IdeClient()
     clientRef.current = client
     const unsubscribe = client.onState(setConn)
-    // The Rust background sync rewrites `event-model.json` whenever source code
-    // changes the schema, then broadcasts a `$/eventModelChanged` notification.
-    // Fields are source-owned/read-only, so the IDE adopts the on-disk model on
-    // every such push: re-read and replace the in-memory store (same load path
-    // as the initial read — parse → auto-layout → band reflow → loadModel).
     const unsubscribeChanged = client.onNotification(
       '$/eventModelChanged',
       () => {
@@ -310,6 +352,87 @@ function App() {
         })()
       },
     )
+    const unsubscribeCollab = client.onNotification('$/collab', (params: unknown) => {
+      const notification = params as CollabNotification
+      switch (notification.type) {
+        case 'snapshot':
+          if (snapshotReadyRef.current && notification.sequence < revisionRef.current) return
+          revisionRef.current = notification.sequence
+          applyReadResult({
+            ok: true,
+            result: {
+              content: notification.content,
+              validation: { status: 'valid' },
+            },
+          })
+          snapshotReadyRef.current = true
+          const pendingEvents = [
+            ...new Map(
+              pendingEventsRef.current
+                .filter((event) => event.sequence > notification.sequence)
+                .map((event) => [event.sequence, event]),
+            ).values(),
+          ].sort((left, right) => left.sequence - right.sequence)
+          let expectedSequence = notification.sequence + 1
+          if (pendingEvents.some((event) => event.sequence !== expectedSequence++)) {
+            pendingEventsRef.current = pendingEvents
+            requestCollabRepair(client)
+            setDirty(false)
+            return
+          }
+          for (const pending of pendingEvents) {
+            const operation = pending.command.operation
+            dispatch({ type: 'updatePosition', nodeId: operation.nodeId, x: operation.x, y: operation.y })
+            revisionRef.current = pending.sequence
+          }
+          pendingEventsRef.current = []
+          setDirty(false)
+          return
+        case 'event': {
+          if (!snapshotReadyRef.current) {
+            pendingEventsRef.current.push(notification.event)
+            requestCollabRepair(client)
+            return
+          }
+          if (notification.event.sequence <= revisionRef.current) return
+          if (notification.event.sequence > revisionRef.current + 1) {
+            pendingEventsRef.current.push(notification.event)
+            requestCollabRepair(client)
+            return
+          }
+          revisionRef.current = notification.event.sequence
+          const operation = notification.event.command.operation
+          if (operation.type === 'moveNode') {
+            dispatch({
+              type: 'updatePosition',
+              nodeId: operation.nodeId,
+              x: operation.x,
+              y: operation.y,
+            })
+          }
+          return
+        }
+        case 'commandRejected':
+          notify(`Collaboration move rejected: ${notification.reason}`)
+          requestCollabRepair(client)
+          return
+        case 'presence':
+          setRemotePresences((current) => {
+            const next = new Map(current)
+            next.set(notification.presence.actorId, notification.presence)
+            return next
+          })
+          return
+        case 'peerCount':
+          setCollab((current) =>
+            current ? { ...current, peerCount: notification.count } : current,
+          )
+          return
+        case 'repairRequired':
+          requestCollabRepair(client)
+          return
+      }
+    })
     ;(async () => {
       const initRes = await initialize(client, CLIENT_INFO)
       if (!initRes.ok) {
@@ -317,16 +440,57 @@ function App() {
         return
       }
       setInit(initRes.result)
-      const readRes = await readEventModel(client)
-      applyReadResult(readRes)
+      let status: Awaited<ReturnType<typeof collabStatus>> | null = null
+      try {
+        status = await collabStatus(client)
+      } catch {
+        // Older test doubles/backends may not expose collaboration yet.
+      }
+      if (status?.ok) {
+        setCollab(status.result)
+        if (!status.result.enabled) snapshotReadyRef.current = true
+      } else {
+        snapshotReadyRef.current = true
+      }
+      if (!status?.ok || !status.result.enabled) {
+        const readRes = await readEventModel(client)
+        applyReadResult(readRes)
+      }
     })()
     return () => {
       unsubscribe()
       unsubscribeChanged()
+      unsubscribeCollab()
       client.close()
       clientRef.current = null
     }
-  }, [applyReadResult])
+  }, [applyReadResult, requestCollabRepair])
+
+  useEffect(() => {
+    if (!collab?.enabled) return
+    const timer = window.setInterval(() => {
+      const cutoff = Date.now() - 15_000
+      setRemotePresences((current) => {
+        const next = new Map([...current].filter(([, presence]) => presence.updatedAtMs >= cutoff))
+        return next.size === current.size ? current : next
+      })
+    }, 2_000)
+    return () => window.clearInterval(timer)
+  }, [collab?.enabled])
+
+  useEffect(() => {
+    if (!collab?.enabled) return
+    const timer = window.setInterval(() => {
+      const client = clientRef.current
+      const presence = localPresenceRef.current
+      if (client && presence) {
+        const heartbeat = { ...presence, updatedAtMs: Date.now() }
+        localPresenceRef.current = heartbeat
+        void updatePresence(client, heartbeat)
+      }
+    }, 5_000)
+    return () => window.clearInterval(timer)
+  }, [collab?.enabled])
 
   const handleHealAccept = useCallback(async () => {
     const client = clientRef.current
@@ -650,9 +814,31 @@ function App() {
   const handlePositionChange = useCallback(
     (nodeId: string, x: number, y: number) => {
       dispatch({ type: 'updatePosition', nodeId, x, y })
-      markDirty()
+      const activeCollab = collabRef.current
+      const client = clientRef.current
+      if (activeCollab?.enabled && activeCollab.actorId && client) {
+        const commandId =
+          typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `${activeCollab.actorId}-${Date.now()}-${Math.random()}`
+        void submitMove(client, {
+          commandId,
+          actorId: activeCollab.actorId,
+          baseRevision: revisionRef.current,
+          nodeId,
+          x,
+          y,
+        }).then((result) => {
+          if (!result.ok) {
+            notify(`Collaboration move failed: ${result.error.message}`)
+            requestCollabRepair(client)
+          }
+        })
+      } else {
+        markDirty()
+      }
     },
-    [markDirty],
+    [markDirty, requestCollabRepair],
   )
 
   const handleConnect = useCallback(
@@ -898,6 +1084,32 @@ function App() {
     applyReadResult(res)
   }, [flushNow, applyReadResult])
 
+  const handlePresenceChange = useCallback(
+    (cursor: { x: number; y: number } | null, selectedNodeIds: string[]) => {
+      const activeCollab = collabRef.current
+      const client = clientRef.current
+      if (!activeCollab?.enabled || !activeCollab.actorId || !client) return
+      const presence: CollabPresence = {
+        actorId: activeCollab.actorId,
+        displayName: activeCollab.role === 'host' ? 'Host' : 'Collaborator',
+        color: actorColor(activeCollab.actorId),
+        activeFeatureId,
+        cursor,
+        selectedNodeIds,
+        updatedAtMs: Date.now(),
+      }
+      localPresenceRef.current = presence
+      void updatePresence(client, presence)
+    },
+    [activeFeatureId],
+  )
+
+  const visibleRemotePresences = useMemo(
+    () => [...remotePresences.values()].filter((presence) => presence.activeFeatureId === activeFeatureId),
+    [remotePresences, activeFeatureId],
+  )
+  const collaborationMoveOnly = collab?.enabled === true
+
   return (
     <ModelContext.Provider value={{ model, dispatch }}>
       <ReactFlowProvider>
@@ -912,6 +1124,8 @@ function App() {
             healing={healing}
             relayouting={relayouting}
             modelActive={lens === 'model'}
+            collaboration={collab?.enabled && collab.role ? { role: collab.role, peerCount: collab.peerCount } : null}
+            readOnly={collaborationMoveOnly}
           />
           <Flex flex={1} mih={0}>
             <Box flex={1} mih={0}>
@@ -924,7 +1138,7 @@ function App() {
                       submodels={model.submodels}
                       activeFeatureId={activeFeatureId}
                       hasUngrouped={hasUngrouped}
-                      busy={relayouting || healing}
+                      busy={relayouting || healing || collaborationMoveOnly}
                       onSelectFeature={handleSelectFeature}
                       onReorder={handleReorderChapters}
                       onMoveSlice={handleMoveSlice}
@@ -943,6 +1157,9 @@ function App() {
                         onNavigateToFeature={handleSelectFeature}
                         focusRequest={focusRequest ?? undefined}
                         onPositionChange={handlePositionChange}
+                        remotePresences={visibleRemotePresences}
+                        onPresenceChange={collab?.enabled ? handlePresenceChange : undefined}
+                        collaborationMoveOnly={collaborationMoveOnly}
                         onConnect={handleConnect}
                         onNodesDelete={handleNodesDelete}
                         onEdgesDelete={handleEdgesDelete}
@@ -995,21 +1212,23 @@ function App() {
           />
         </Flex>
       </ReactFlowProvider>
-      <CommandPalette
-        onNew={handleNew}
-        onOpen={handleOpen}
-        onRelayout={handleRelayout}
-        onHeal={handleManualHeal}
-        onAddEvent={handleAddEvent}
-        onAddCommand={handleAddCommand}
-        onAddQuery={handleAddQuery}
-        onAddIntegration={handleAddIntegration}
-        onAddUIPlaceholder={handleAddUIPlaceholder}
-        onAddEntity={handleAddEntity}
-        onAddSlice={handleAddSlice}
-        onAddChapter={handleAddChapter}
-        onSelectLens={setLens}
-      />
+      {!collaborationMoveOnly && (
+        <CommandPalette
+          onNew={handleNew}
+          onOpen={handleOpen}
+          onRelayout={handleRelayout}
+          onHeal={handleManualHeal}
+          onAddEvent={handleAddEvent}
+          onAddCommand={handleAddCommand}
+          onAddQuery={handleAddQuery}
+          onAddIntegration={handleAddIntegration}
+          onAddUIPlaceholder={handleAddUIPlaceholder}
+          onAddEntity={handleAddEntity}
+          onAddSlice={handleAddSlice}
+          onAddChapter={handleAddChapter}
+          onSelectLens={setLens}
+        />
+      )}
       {pendingInvalid && !healing && (
         <InvalidModelModal
           errors={pendingInvalid.errors}

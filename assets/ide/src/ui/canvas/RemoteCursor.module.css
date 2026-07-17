@@ -1,0 +1,29 @@
+.cursor {
+  position: absolute;
+  pointer-events: none;
+  z-index: 20;
+  transform-origin: 0 0;
+}
+
+.pointer {
+  display: block;
+  width: 0;
+  height: 0;
+  border-top: 12px solid var(--cursor-color);
+  border-right: 8px solid transparent;
+}
+
+.label {
+  display: block;
+  width: max-content;
+  max-width: 160px;
+  margin: -2px 0 0 8px;
+  padding: 2px 5px;
+  overflow: hidden;
+  color: #fff;
+  font: 500 10px/14px var(--mantine-font-family-monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--cursor-color);
+  border-radius: 2px;
+}

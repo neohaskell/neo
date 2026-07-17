@@ -7,3 +7,23 @@
   border-bottom: 1px solid var(--mantine-color-default-border);
   background: var(--mantine-color-body);
 }
+
+.collaboration {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  color: var(--mantine-color-dimmed);
+  font: 600 10px/14px var(--mantine-font-family-monospace);
+  letter-spacing: 0.04em;
+  border: 1px solid var(--mantine-color-default-border);
+  border-radius: 2px;
+}
+
+.statusDot {
+  width: 6px;
+  height: 6px;
+  background: var(--mantine-color-green-6);
+  border-radius: 50%;
+}
