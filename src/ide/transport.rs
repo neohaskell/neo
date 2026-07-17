@@ -26,17 +26,35 @@ pub trait Transport: Send + Sync + 'static {
 /// routing.
 pub struct LocalTransport {
     workspace: Arc<Workspace>,
+    collab: Option<Arc<crate::ide::collab::runtime::CollabRuntime>>,
 }
 
 impl LocalTransport {
+    #[cfg(test)]
     pub fn new(workspace: Workspace) -> Self {
-        Self { workspace: Arc::new(workspace) }
+        Self {
+            workspace: Arc::new(workspace),
+            collab: None,
+        }
+    }
+
+    pub fn with_collab(
+        workspace: Workspace,
+        collab: Option<Arc<crate::ide::collab::runtime::CollabRuntime>>,
+    ) -> Self {
+        Self {
+            workspace: Arc::new(workspace),
+            collab,
+        }
     }
 }
 
 impl Transport for LocalTransport {
     fn accept(&self) -> Result<Session, RpcError> {
-        Ok(Session::new(self.workspace.clone()))
+        Ok(Session::with_collab(
+            self.workspace.clone(),
+            self.collab.clone(),
+        ))
     }
 }
 

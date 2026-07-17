@@ -1,15 +1,17 @@
 use crate::errors::NeoError;
+use crate::ide::AppState;
+use crate::ide::collab::ShareTicket;
+use crate::ide::collab::runtime::CollabRuntime;
 use crate::ide::methods::register_all;
 use crate::ide::registry::MethodRegistry;
 use crate::ide::transport::LocalTransport;
 use crate::ide::workspace::Workspace;
-use crate::ide::AppState;
 use crate::output::OutputMode;
 use axum::{
-    http::{header, StatusCode, Uri},
+    Router,
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
 };
 use crossterm::style::Stylize;
 use rust_embed::RustEmbed;
@@ -23,25 +25,35 @@ use std::sync::Arc;
 #[folder = "assets/ide/dist/"]
 struct IdeAssets;
 
-pub async fn run(host: IpAddr, port: u16, output_mode: &mut OutputMode) -> miette::Result<()> {
+pub async fn run(
+    host: IpAddr,
+    port: u16,
+    share: bool,
+    join: Option<String>,
+    output_mode: &mut OutputMode,
+) -> miette::Result<()> {
     init_tracing();
 
     let addr = SocketAddr::new(host, port);
 
     let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|e| NeoError::IdeBind { host, port, source: e })?;
+        .map_err(|e| NeoError::IdeBind {
+            host,
+            port,
+            source: e,
+        })?;
 
-    let bound = listener
-        .local_addr()
-        .map_err(|e| NeoError::IdeBind { host, port, source: e })?;
+    let bound = listener.local_addr().map_err(|e| NeoError::IdeBind {
+        host,
+        port,
+        source: e,
+    })?;
 
     let browseable = browseable_url(host, bound);
     let bind_hint = host
         .is_unspecified()
         .then_some("reachable from any interface on this host");
-
-    print_startup(output_mode, &browseable, &bound.to_string(), bind_hint);
 
     // Mint the workspace from the cwd once at server boot — every WS
     // connection inherits the same `Arc<Workspace>` via the `LocalTransport`.
@@ -50,7 +62,28 @@ pub async fn run(host: IpAddr, port: u16, output_mode: &mut OutputMode) -> miett
     let cwd = std::env::current_dir().map_err(|e| NeoError::IdeServe { source: e })?;
     let workspace = Workspace::from_root(&cwd)?;
     let workspace_root = workspace.root.clone();
-    let transport = Arc::new(LocalTransport::new(workspace));
+    let (collab, share_ticket) = if share {
+        let (runtime, ticket) = CollabRuntime::host(workspace_root.join("event-model.json"))
+            .await
+            .map_err(|error| miette::miette!("could not start Iroh collaboration host: {error}"))?;
+        (Some(runtime), Some(ticket.serialize()))
+    } else if let Some(encoded) = join {
+        let ticket = ShareTicket::deserialize(&encoded)
+            .map_err(|error| miette::miette!("invalid Iroh collaboration ticket: {error}"))?;
+        (
+            Some(CollabRuntime::join(ticket).await.map_err(|error| {
+                miette::miette!("could not join Iroh collaboration room: {error}")
+            })?),
+            None,
+        )
+    } else {
+        (None, None)
+    };
+    print_startup(output_mode, &browseable, &bound.to_string(), bind_hint);
+    if let Some(ticket) = share_ticket {
+        print_share_ticket(output_mode, &ticket);
+    }
+    let transport = Arc::new(LocalTransport::with_collab(workspace, collab.clone()));
     let registry = register_all(MethodRegistry::new());
 
     // Background source watcher: on every `src/` change, re-sync
@@ -58,23 +91,44 @@ pub async fn run(host: IpAddr, port: u16, output_mode: &mut OutputMode) -> miett
     // client re-reads the model. Watching `src/` (not `event-model.json`) avoids
     // a feedback loop with autosave.
     let (model_changed_tx, _) = tokio::sync::broadcast::channel::<()>(16);
-    spawn_source_watcher(workspace_root, model_changed_tx.clone());
+    if collab.is_none() {
+        spawn_source_watcher(workspace_root, model_changed_tx.clone());
+    }
 
-    let state = AppState { registry, transport, model_changed_tx };
+    let state = AppState {
+        registry,
+        transport,
+        model_changed_tx,
+        collab: collab.clone(),
+    };
 
     let app = Router::new()
         .route("/ws", get(crate::ide::server::ws_upgrade))
         .with_state(state)
         .fallback(serve_asset);
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
-        .await
-        .map_err(|e| NeoError::IdeServe { source: e })?;
+        .await;
 
+    if let Some(collab) = collab {
+        collab.shutdown().await;
+    }
+    serve_result.map_err(|e| NeoError::IdeServe { source: e })?;
     print_shutdown(output_mode);
     Ok(())
+}
+
+fn print_share_ticket(output_mode: &OutputMode, ticket: &str) {
+    if output_mode.is_ci() {
+        println!("[info]   share-ticket  {ticket}");
+    } else {
+        println!("  {}", "Iroh collaboration enabled".cyan().bold());
+        println!("  Share this ticket with a trusted collaborator:");
+        println!("      {}", ticket.cyan());
+        println!();
+    }
 }
 
 /// Build the URL a human can click. When the bind host is unspecified
@@ -122,8 +176,7 @@ fn print_startup(output_mode: &OutputMode, url: &str, bind: &str, bind_hint: Opt
         println!("  Press {} to stop the server.", "Ctrl+C".bold());
         println!(
             "  {}",
-            "Server logs stream to stderr. Set RUST_LOG=neo=debug for verbose output."
-                .dark_grey()
+            "Server logs stream to stderr. Set RUST_LOG=neo=debug for verbose output.".dark_grey()
         );
         println!();
     }
@@ -142,8 +195,8 @@ fn print_startup(output_mode: &OutputMode, url: &str, bind: &str, bind_hint: Opt
 fn init_tracing() {
     use std::io::IsTerminal;
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("neo=info,warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("neo=info,warn"));
     let use_ansi = std::io::stderr().is_terminal();
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -166,10 +219,10 @@ fn spawn_source_watcher(root: std::path::PathBuf, changed_tx: crate::ide::ModelC
         let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(16);
         let mut watcher = match notify::RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
-                if let Ok(ev) = res {
-                    if ev.kind.is_modify() || ev.kind.is_create() || ev.kind.is_remove() {
-                        let _ = tx.blocking_send(());
-                    }
+                if let Ok(ev) = res
+                    && (ev.kind.is_modify() || ev.kind.is_create() || ev.kind.is_remove())
+                {
+                    let _ = tx.blocking_send(());
                 }
             },
             notify::Config::default(),

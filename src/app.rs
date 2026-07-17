@@ -70,8 +70,13 @@ pub async fn dispatch(
         Some(Commands::Lock(args)) => {
             commands::lock::run(args, output_mode).await?;
         }
-        Some(Commands::Ide { host, port }) => {
-            commands::ide::run(host, port, output_mode).await?;
+        Some(Commands::Ide {
+            host,
+            port,
+            share,
+            join,
+        }) => {
+            commands::ide::run(host, port, share, join, output_mode).await?;
         }
         Some(Commands::Inspect { subcommand }) => {
             commands::inspect::run(subcommand)?;
@@ -228,7 +233,12 @@ mod tests {
         // Keep `probe` alive across the dispatch call so the port stays bound.
 
         let host = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        let command = Some(Commands::Ide { host, port });
+        let command = Some(Commands::Ide {
+            host,
+            port,
+            share: false,
+            join: None,
+        });
         let mut output_mode = OutputMode::Ci;
         let update_status = std::sync::Arc::new(std::sync::Mutex::new(None));
         let result = dispatch(command, &mut output_mode, update_status).await;

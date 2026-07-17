@@ -8,6 +8,7 @@
 //! Public surface is `AppState` (the axum router state) and the `methods` /
 //! `server` entry points wired in by `commands/ide.rs`.
 
+pub mod collab;
 pub mod heal;
 pub mod methods;
 pub mod registry;
@@ -40,4 +41,5 @@ pub struct AppState {
     pub registry: MethodRegistry,
     pub transport: Arc<LocalTransport>,
     pub model_changed_tx: ModelChangedTx,
+    pub collab: Option<Arc<collab::runtime::CollabRuntime>>,
 }

@@ -59,6 +59,7 @@ pub type OutboundSender = tokio::sync::mpsc::UnboundedSender<OutboundMessage>;
 pub struct Session {
     pub id: SessionId,
     pub workspace: Arc<Workspace>,
+    pub collab: Option<Arc<crate::ide::collab::runtime::CollabRuntime>>,
     /// Channel into the per-connection WS sender. `None` for sessions
     /// minted outside a real connection (most unit tests). When `None`,
     /// `notify` silently drops — handlers can call it unconditionally.
@@ -77,9 +78,19 @@ impl Session {
         Self {
             id: SessionId::mint(),
             workspace,
+            collab: None,
             outbound_tx: None,
             heal_cancel: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_collab(
+        workspace: Arc<Workspace>,
+        collab: Option<Arc<crate::ide::collab::runtime::CollabRuntime>>,
+    ) -> Self {
+        let mut session = Self::new(workspace);
+        session.collab = collab;
+        session
     }
 
     /// Attach an outbound sink. Called by the transport at WS accept

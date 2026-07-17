@@ -61,6 +61,7 @@ async fn connection_loop(socket: WebSocket, session: crate::ide::session::Sessio
     // Subscribe to the background source-watcher's model-changed broadcast so
     // this client re-reads `event-model.json` after a code→model sync.
     let mut model_changed_rx = state.model_changed_tx.subscribe();
+    let mut collab_rx = state.collab.as_ref().map(|runtime| runtime.subscribe());
 
     loop {
         tokio::select! {
@@ -142,6 +143,42 @@ async fn connection_loop(socket: WebSocket, session: crate::ide::session::Sessio
                     Err(RecvError::Closed) => break,
                 }
             }
+
+            collab = receive_collab(&mut collab_rx) => {
+                if let Some(notification) = collab {
+                    match serde_json::to_value(notification) {
+                        Ok(params) => session.notify("$/collab", params),
+                        Err(error) => tracing::warn!(%error, "failed to serialise collaboration notification"),
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn receive_collab(
+    receiver: &mut Option<
+        tokio::sync::broadcast::Receiver<crate::ide::collab::runtime::Notification>,
+    >,
+) -> Option<crate::ide::collab::runtime::Notification> {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let Some(active) = receiver.as_mut() else {
+            std::future::pending::<()>().await;
+            unreachable!();
+        };
+        match active.recv().await {
+            Ok(notification) => return Some(notification),
+            Err(RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    skipped,
+                    "collaboration client lagged; requesting snapshot repair"
+                );
+                return Some(crate::ide::collab::runtime::Notification::RepairRequired);
+            }
+            Err(RecvError::Closed) => {
+                *receiver = None;
+            }
         }
     }
 }
@@ -203,7 +240,12 @@ mod tests {
         let session = transport.accept().unwrap();
         let registry = register_all(MethodRegistry::new());
         let (model_changed_tx, _) = tokio::sync::broadcast::channel(16);
-        let state = AppState { registry, transport: Arc::new(transport), model_changed_tx };
+        let state = AppState {
+            registry,
+            transport: Arc::new(transport),
+            model_changed_tx,
+            collab: None,
+        };
         (state, session)
     }
 

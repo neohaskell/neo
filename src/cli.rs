@@ -75,20 +75,29 @@ pub enum Commands {
         /// TCP port to bind
         #[arg(long, default_value_t = 2323)]
         port: u16,
+        /// Share this workspace through an encrypted Iroh collaboration room.
+        #[arg(long, conflicts_with = "join")]
+        share: bool,
+        /// Join an Iroh collaboration room and serve its board on localhost.
+        #[arg(long, value_name = "TICKET", conflicts_with = "share")]
+        join: Option<String>,
     },
     /// Inspect a NeoHaskell project's domain layout (commands, events, queries, integrations)
-    #[command(long_about = "Print a structured view of the project's NeoHaskell domains. \
+    #[command(
+        long_about = "Print a structured view of the project's NeoHaskell domains. \
                             By default emits everything as a single JSON document on stdout; \
                             use a subcommand to filter (e.g. `neo inspect commands` for just \
                             the command table). The heal flow for `event-model.json` uses the \
                             same data internally — running this command shows you exactly what \
-                            the AI agent sees.")]
+                            the AI agent sees."
+    )]
     Inspect {
         #[command(subcommand)]
         subcommand: Option<InspectSubcommand>,
     },
     /// Validate `event-model.json` against the schema + referential rules
-    #[command(long_about = "Validate the project's `event-model.json` (the event model the `neo ide` \
+    #[command(
+        long_about = "Validate the project's `event-model.json` (the event model the `neo ide` \
                             authors) against the embedded JSON Schema and referential-integrity rules, \
                             without launching the browser IDE. Reads `<cwd>/event-model.json` by default, \
                             or the PATH you pass. Read-only — it never modifies the file.\n\n\
@@ -370,8 +379,11 @@ mod tests {
     fn test_parse_ide_defaults_to_loopback_and_2323() {
         let cli = Cli::try_parse_from(["neo", "ide"]).unwrap();
         match cli.command {
-            Some(Commands::Ide { host, port }) => {
-                assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+            Some(Commands::Ide { host, port, .. }) => {
+                assert_eq!(
+                    host,
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1))
+                );
                 assert_eq!(port, 2323);
             }
             _ => panic!("Expected Ide command"),
@@ -382,7 +394,7 @@ mod tests {
     fn test_parse_ide_custom_port() {
         let cli = Cli::try_parse_from(["neo", "ide", "--port", "8080"]).unwrap();
         match cli.command {
-            Some(Commands::Ide { host, port }) => {
+            Some(Commands::Ide { host, port, .. }) => {
                 assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
                 assert_eq!(port, 8080);
             }
@@ -391,10 +403,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ide_share_mode() {
+        let cli = Cli::try_parse_from(["neo", "ide", "--share"]).unwrap();
+        match cli.command {
+            Some(Commands::Ide { share, join, .. }) => {
+                assert!(share);
+                assert!(join.is_none());
+            }
+            _ => panic!("Expected Ide command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ide_join_mode() {
+        let cli = Cli::try_parse_from(["neo", "ide", "--join", "neoide-ticket"]).unwrap();
+        match cli.command {
+            Some(Commands::Ide { share, join, .. }) => {
+                assert!(!share);
+                assert_eq!(join.as_deref(), Some("neoide-ticket"));
+            }
+            _ => panic!("Expected Ide command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ide_rejects_share_and_join_together() {
+        let result = Cli::try_parse_from(["neo", "ide", "--share", "--join", "ticket"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_parse_ide_custom_host_any_v4() {
         let cli = Cli::try_parse_from(["neo", "ide", "--host", "0.0.0.0"]).unwrap();
         match cli.command {
-            Some(Commands::Ide { host, port }) => {
+            Some(Commands::Ide { host, port, .. }) => {
                 assert_eq!(host, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                 assert_eq!(port, 2323);
             }
@@ -406,7 +448,7 @@ mod tests {
     fn test_parse_ide_custom_host_v6() {
         let cli = Cli::try_parse_from(["neo", "ide", "--host", "::1", "--port", "9000"]).unwrap();
         match cli.command {
-            Some(Commands::Ide { host, port }) => {
+            Some(Commands::Ide { host, port, .. }) => {
                 assert_eq!(host, std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
                 assert_eq!(port, 9000);
             }

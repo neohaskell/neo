@@ -11,6 +11,9 @@
 //! the foundation is wrong — push back instead of patching.
 
 pub mod cancel_heal_event_model;
+pub mod collab_presence;
+pub mod collab_status;
+pub mod collab_submit;
 pub mod heal_event_model;
 pub mod initialize;
 pub mod read_event_model;
@@ -22,6 +25,9 @@ use crate::ide::registry::MethodRegistry;
 pub fn register_all(registry: MethodRegistry) -> MethodRegistry {
     registry
         .register("initialize", initialize::handle)
+        .register("collab/status", collab_status::handle)
+        .register("collab/submit", collab_submit::handle)
+        .register("collab/updatePresence", collab_presence::handle)
         .register("workspace/readEventModel", read_event_model::handle)
         .register("workspace/writeEventModel", write_event_model::handle)
         .register("workspace/healEventModel", heal_event_model::handle)

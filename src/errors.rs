@@ -169,20 +169,33 @@ pub enum NeoError {
     #[diagnostic(
         code(neo::ide::serve),
         url(docsrs),
-        help("The embedded axum server returned an unexpected I/O error mid-flight. This is a bug in `neo`. \
+        help(
+            "The embedded axum server returned an unexpected I/O error mid-flight. This is a bug in `neo`. \
               Re-run with `--verbose` to capture details, then file an issue at \
-              https://github.com/NeoHaskell/neo/issues with the full output.")
+              https://github.com/NeoHaskell/neo/issues with the full output."
+        )
     )]
     IdeServe {
         #[source]
         source: std::io::Error,
     },
 
+    #[error("Neo IDE collaboration failed: {reason}")]
+    #[diagnostic(
+        code(neo::ide::collaboration),
+        help(
+            "Check that the share ticket is current and that both peers can reach an Iroh relay, then retry."
+        )
+    )]
+    IdeCollaboration { reason: String },
+
     #[error("Healing `event-model.json` aborted: `claude` is not on PATH")]
     #[diagnostic(
         code(neo::ide::healing::claude_missing),
         url(docsrs),
-        help("Install Claude Code: `npm install -g @anthropic-ai/claude-code` (requires Node 18+). After install, run `which claude` to confirm it is on PATH; if it still is not, open a new shell or check your PATH order. Healing shells out to the same `claude` CLI you use interactively — there is no fallback. Once `which claude` prints a path, click Heal again in the IDE.")
+        help(
+            "Install Claude Code: `npm install -g @anthropic-ai/claude-code` (requires Node 18+). After install, run `which claude` to confirm it is on PATH; if it still is not, open a new shell or check your PATH order. Healing shells out to the same `claude` CLI you use interactively — there is no fallback. Once `which claude` prints a path, click Heal again in the IDE."
+        )
     )]
     HealingClaudeMissing,
 
